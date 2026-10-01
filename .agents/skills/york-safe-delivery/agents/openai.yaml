@@ -1,0 +1,6 @@
+interface:
+  display_name: "代码审核与交付"
+  short_description: "准备 IDEA 审核代码，完成获准 Git 交付并切换本地任务分支。"
+  default_prompt: "使用 $york-safe-delivery 完成 IDEA 审核和获准 Git 交付；推送后切换本地任务分支，查看一次 git status，保留其他改动。"
+policy:
+  allow_implicit_invocation: true

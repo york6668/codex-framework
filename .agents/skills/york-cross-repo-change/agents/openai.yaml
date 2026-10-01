@@ -1,0 +1,6 @@
+interface:
+  display_name: "跨仓契约变更"
+  short_description: "追踪真实生产消费链，调整公共契约与兼容顺序并验证跨仓结果。"
+  default_prompt: "使用 $york-cross-repo-change 核对实际生产消费链，设计本次契约变化的兼容顺序与组合验收。"
+policy:
+  allow_implicit_invocation: true

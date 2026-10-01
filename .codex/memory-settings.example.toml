@@ -1,0 +1,6 @@
+# 可选参考片段。同步工具不修改 config.toml；按目标客户端实际支持配置。
+[features]
+memories = true
+
+[memories]
+disable_on_external_context = false

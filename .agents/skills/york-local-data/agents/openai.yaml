@@ -1,0 +1,6 @@
+interface:
+  display_name: "本地调试数据"
+  short_description: "复用已有数据工具，按业务对象准备本地数据并核对同步范围与结果。"
+  default_prompt: "使用 $york-local-data 为当前本地调试选择所需数据，并核验实际目标、同步结果和恢复路径。"
+policy:
+  allow_implicit_invocation: true

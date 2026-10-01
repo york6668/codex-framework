@@ -1,0 +1,6 @@
+interface:
+  display_name: "Java 本机验证"
+  short_description: "复用本机 Java 测试入口与依赖，执行真实断言并报告实际用例结果。"
+  default_prompt: "使用 $york-java-test 选择现有 Java 测试入口，执行当前改动需要的断言并核对实际测试数量。"
+policy:
+  allow_implicit_invocation: true

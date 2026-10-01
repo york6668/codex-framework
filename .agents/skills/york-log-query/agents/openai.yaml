@@ -1,0 +1,6 @@
+interface:
+  display_name: "日志、后台与数据库查询"
+  short_description: "复用日志与后台入口，通过 DataGrip 只读查询线上数据，按需将结果复制到本地工作站或测试环境。"
+  default_prompt: "使用 $york-log-query 查询本次日志、后台参数或线上数据库记录；线上数据库仅通过 DataGrip 只读访问，按需将查询结果复制到本地工作站或测试环境，并核对源端、目标和数据范围。"
+policy:
+  allow_implicit_invocation: true

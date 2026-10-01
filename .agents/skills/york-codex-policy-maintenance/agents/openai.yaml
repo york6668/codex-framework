@@ -1,0 +1,6 @@
+interface:
+  display_name: "York 规范维护"
+  short_description: "维护用户偏好与可选方法，清理重复流程和自建门禁。"
+  default_prompt: "使用 $york-codex-policy-maintenance 直接修正有关偏好和方法，不引入强制审计或交接流程。"
+policy:
+  allow_implicit_invocation: true

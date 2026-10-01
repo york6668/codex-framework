@@ -1,0 +1,6 @@
+interface:
+  display_name: "Codex 工作站"
+  short_description: "复用和维护持久本机工具与服务，按任务补齐能力并保护共享资源。"
+  default_prompt: "使用 $york-workstation 发现已有本机资源，并为当前任务准备和核验所需能力。"
+policy:
+  allow_implicit_invocation: true

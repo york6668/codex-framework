@@ -1,0 +1,6 @@
+interface:
+  display_name: "三方资料发现与读取"
+  short_description: "发现相关三方资料，读取适用内容，并按当前问题判断证据与缺口。"
+  default_prompt: "使用 $york-provider-docs 为当前问题寻找和读取适用的三方资料，自主选择查询范围，并说明支撑结论的依据。"
+policy:
+  allow_implicit_invocation: true

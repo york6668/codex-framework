@@ -1,0 +1,25 @@
+version: 5
+maintenance_owner: CODEX_MODEL
+entry:
+  file: codex:AGENTS.md
+domains:
+  global-entry:
+    file: codex:AGENTS.md
+  codex-policy-maintenance:
+    file: skills:york-codex-policy-maintenance/references/policy.md
+  safe-delivery:
+    file: skills:york-safe-delivery/references/policy.md
+  workstation:
+    file: skills:york-workstation/SKILL.md
+  local-data:
+    file: skills:york-local-data/SKILL.md
+  provider-docs:
+    file: skills:york-provider-docs/SKILL.md
+  log-query:
+    file: skills:york-log-query/SKILL.md
+  java-test:
+    file: skills:york-java-test/SKILL.md
+  cross-repo-change:
+    file: skills:york-cross-repo-change/SKILL.md
+  task-alignment:
+    file: skills:york-task-alignment/SKILL.md
