@@ -89,16 +89,24 @@ def write_file(path, value):
             os.unlink(temporary)
 
 
-def git(repo, *args, optional=False):
+def git(repo, *args, optional=False, timeout=60):
     env = dict(os.environ, GIT_TERMINAL_PROMPT="0")
+    env["GCM_INTERACTIVE"] = "never"
+    env.setdefault("GIT_SSH_COMMAND", "ssh -o BatchMode=yes -o ConnectTimeout=5 "
+                   "-o StrictHostKeyChecking=yes -o UpdateHostKeys=no")
     try:
         result = subprocess.run(["git", "-C", str(repo), *args], env=env,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                text=True, timeout=60)
+                                text=True, timeout=timeout)
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise SyncError("Git 操作未完成；没有应用本机文件") from exc
     if result.returncode and not optional:
-        raise SyncError("Git " + args[0] + " 失败: " + result.stderr.strip())
+        error = result.stderr.lower()
+        reason = ("认证不可用" if any(s in error for s in
+                  ("username", "authentication", "permission denied", "credential"))
+                  else "SSH 主机信任缺失" if "host key" in error
+                  else "网络、仓库或工作区不可用")
+        raise SyncError("Git " + args[0] + " 失败：" + reason)
     return result.stdout.strip() if result.returncode == 0 else None
 
 
@@ -153,10 +161,10 @@ class Framework:
                 raise SyncError("共享源缺少入口文件: " + ", ".join(sorted(missing)))
         return files
 
-    def load_state(self):
+    def read_state(self):
         raw = read_file(safe_path(self.codex_home, "framework-sync/state.json"))
         if raw is None:
-            return {}
+            return {"version": 1, "source": REMOTE, "base": {}}
         try:
             state = json.loads(raw)
             if state["version"] != 1 or state["source"] != REMOTE:
@@ -164,17 +172,28 @@ class Framework:
             values = state["base"]
             if not isinstance(values, dict) or not all(allowed(n) for n in values):
                 raise ValueError("状态包含非框架文件")
-            return {n: base64.b64decode(v, validate=True) if v is not None else None
-                    for n, v in values.items()}
+            for value in values.values():
+                if value is not None:
+                    base64.b64decode(value, validate=True)
+            if not isinstance(state.get("sync", {}), dict):
+                raise ValueError("同步状态格式错误")
+            return state
         except (KeyError, TypeError, ValueError) as exc:
             raise SyncError("无法读取框架同步基线；未覆盖文件") from exc
 
-    def save_state(self, values):
+    def load_state(self):
+        return {n: base64.b64decode(v) if v is not None else None
+                for n, v in self.read_state()["base"].items()}
+
+    def save_state(self, values, sync=None):
         if not all(allowed(n) for n in values):
             raise SyncError("基线包含非框架文件")
-        state = {"version": 1, "source": REMOTE, "base": {
+        state = self.read_state()
+        state["base"] = {
             n: base64.b64encode(v).decode("ascii") if v is not None else None
-            for n, v in sorted(values.items())}}
+            for n, v in sorted(values.items())}
+        if sync is not None:
+            state["sync"] = sync
         destination = safe_path(self.codex_home, "framework-sync/state.json")
         encoded = (json.dumps(state, ensure_ascii=False, indent=2) + "\n").encode()
         if read_file(destination) != encoded:
@@ -191,11 +210,14 @@ class Framework:
                 raise SyncError("本设备已有框架同步操作；请等该操作结束") from exc
             yield
 
-    def reconcile(self, apply=False, export=False):
-        manager = self.lock() if apply else contextlib.nullcontext()
+    def reconcile(self, apply=False, export=False, source=None, _locked=False):
+        manager = self.lock() if apply and not _locked else contextlib.nullcontext()
         with manager:
             base = self.load_state()
-            source = self.collect()
+            source = self.collect() if source is None else source
+            required = set(DOCUMENTS) | {".agents/skills/" + s + "/SKILL.md" for s in SKILLS}
+            if required - source.keys() or not all(allowed(n) for n in source):
+                raise SyncError("共享源不完整或包含范围外文件")
             if export and not base:
                 raise SyncError("请先安装并核对框架，再导出本机修改")
             local = self.collect(local=True) if export else {}
@@ -263,21 +285,40 @@ def report(results):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--repo", type=Path, default=Path(__file__).resolve().parent.parent)
+    parser.add_argument("--repo", type=Path)
     parser.add_argument("--home", type=Path, help="目标用户目录；显式指定时不使用环境中的 CODEX_HOME")
     parser.add_argument("--codex-home", type=Path, help="显式指定目标 Codex home")
-    parser.add_argument("command", choices=("status", "install", "apply", "pull", "export"))
+    parser.add_argument("command", choices=("status", "install", "apply", "pull", "export",
+                        "sync-status", "refresh", "install-hook", "session-start"))
     parser.add_argument("--apply", action="store_true", help="pull 后应用；否则仅预览差异")
+    parser.add_argument("--snapshot", type=Path, help="原生连接取得的完整共享内容快照")
+    parser.add_argument("--revision", help="原生连接刚读取的发布提交 SHA")
+    parser.add_argument("--cloud-error", help="云端入口不可用的简短原因；随后使用本机 Git")
+    parser.add_argument("--expected-revision", help="访问远端前 sync-status 的 observed_revision；无版本用 none")
     args = parser.parse_args(argv)
     if args.apply and args.command != "pull":
         parser.error("--apply 仅用于 pull")
     codex_home = args.codex_home or (os.environ.get("CODEX_HOME") if args.home is None else None)
-    framework = Framework(args.repo, args.home or Path.home(), codex_home)
+    framework = Framework(args.repo or Path(__file__).resolve().parent.parent,
+                          args.home or Path.home(), codex_home)
     try:
+        import framework_refresh as refresh
+        if args.command in ("sync-status", "refresh", "install-hook", "session-start"):
+            return refresh.dispatch(framework, args)
         if args.command == "pull":
+            expected_revision = refresh.sync_status(framework)["expected_revision"]
             framework.pull()
+            if args.apply:
+                snapshot = refresh.snapshot_at_revision(framework, git(framework.repo, "rev-parse", "HEAD"))
+                output = refresh.refresh(framework, snapshot=snapshot, expected_revision=expected_revision,
+                                         route="local")
+                print(json.dumps(output, ensure_ascii=False, indent=2))
+                return 2 if output.get("conflicts") else 0
         applying = args.command in ("install", "apply", "export") or args.apply
-        results = framework.reconcile(apply=applying, export=args.command == "export")
+        # A connector refresh may be newer than the local source-code checkout.
+        # Default status/apply compare against that published payload, not stale code.
+        source = refresh.cached_files(framework) if args.repo is None and args.command in ("status", "apply") else None
+        results = framework.reconcile(apply=applying, export=args.command == "export", source=source)
         code = report(results)
         if args.command == "install":
             print("命令入口: " + str(framework.launcher()))
@@ -292,4 +333,5 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
+    sys.modules["codex_framework"] = sys.modules[__name__]
     sys.exit(main())

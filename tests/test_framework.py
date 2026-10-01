@@ -249,7 +249,7 @@ class SyncTests(FixtureCase):
         self.assertFalse(self.a.target(".codex/AGENTS.md").exists())
 
 
-class GitSyncTests(FixtureCase):
+class GitFixtureCase(FixtureCase):
     # Use a real local Git remote, including commits and pulls, without network credentials.
     def setUp(self):
         super().setUp()
@@ -273,6 +273,8 @@ class GitSyncTests(FixtureCase):
         run_git(self.repo, "commit", "-m", "fixture update")
         run_git(self.repo, "push", str(self.remote), cf.BRANCH)
 
+
+class GitSyncTests(GitFixtureCase):
     def test_pull_round_trip_with_unrelated_checkout_edit(self):
         put(self.receiver / "README.md", "unrelated checkout edit")
         self.publish_fixture(".codex/AGENTS.md", "published revision")
