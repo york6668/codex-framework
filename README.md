@@ -31,7 +31,7 @@ python3 "$HOME/work/codex-framework/scripts/codex_framework.py" install
 
 每台设备保存自己最后已应用的框架基线。只有上游改变的文件才更新；设备独有修改显示为 `keep-local`。双方修改同一文件时保留双方并返回退出码 2，其余可独立更新的文件继续处理。人工解决后再次 `apply` 记录共同版本。Git、文件或输入错误返回 1，无冲突返回 0。
 
-`export` 不包含设备的 `config.toml`、历史记忆或新建的无关 Skill，也不会将未发布修改当成已发布的共同基线。审核后通过普通 Git 提交与推送，其他设备再主动同步。没有后台任务或自动推送。
+`export` 不包含设备的 `config.toml`、历史记忆或新建的无关 Skill，也不会将未发布修改当成已发布的共同基线。本框架仓库已获用户授权，由 Codex 核对修改、完成必要验证后自主提交与推送，无需逐次交用户审核；其他设备再主动同步。同步命令没有后台任务或自动推送行为。
 
 记忆配置片段仅供参考，安装不改写 `config.toml`、不自动开启原生记忆；见 [.codex/memory-framework.md](.codex/memory-framework.md)。设备可选资源说明放在 Codex home 的 `workstation/local.md`，不随本仓分发。
 
@@ -43,6 +43,16 @@ python3 "$HOME/work/codex-framework/scripts/codex_framework.py" install
 4. 发布后用新任务核验中文偏好、记忆边界及至少一个 York Skill；已有任务保留自己的状态。更新框架后，在环境编辑流程中拉取并安装，再重新发布，供新任务使用。
 
 云端加载共享规则和方法，不获得任何一台设备的历史记忆。原生记忆功能取决于客户端与账号能力，安装脚本不声称开启了云端原生记忆。
+
+如果平台注入的 `CODEX_HOME` 是只读目录，在环境的 Install script 中仅为安装和状态命令指定可写用户目录；不更改平台的环境变量或配置：
+
+```sh
+# 先进入环境实际检出的 codex-framework 仓库目录
+CODEX_HOME="$HOME/.codex" sh scripts/cloud-install.sh
+CODEX_HOME="$HOME/.codex" "$HOME/.local/bin/codex-framework" status
+```
+
+这时规则由仓库根 `AGENTS.md` 读取同一份 `.codex/AGENTS.md`；Skills 位于仓库 `.agents/skills`，也安装到 `$HOME/.agents/skills`。`$HOME/.codex` 中的副本和同步基线不能证明平台会加载它作为全局偏好，仍需通过发布后的新任务验证。云端检出分支可能由平台命名为 `work`；同步命令不会为此自动切换分支，环境更新使用编辑、仓库刷新、安装和重新发布流程。
 
 官方说明：[Cloud environments](https://learn.chatgpt.com/docs/environments/cloud-environments)、[Memories](https://learn.chatgpt.com/docs/customization/memories)。
 
