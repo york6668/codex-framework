@@ -6,7 +6,7 @@
 
 ## 在另一台电脑安装
 
-需要 Git、Python 3.9+ 和本机自己的 GitHub 私有仓库访问权限。支持 macOS 与 Linux；Windows 可在 WSL 中使用。不要复制其他设备的登录凭据。
+需要 Git、Python 3.9+ 和可用的 GitHub 私有仓库访问权限；配置与认证按 [共享资源入口](.codex/workstation/README.md) 发现。支持 macOS 与 Linux；Windows 可在 WSL 中使用。不要复制其他设备的登录凭据。
 
 ```sh
 git clone --branch 'york-worktree/Codex框架共享' \
@@ -41,6 +41,8 @@ python3 "$HOME/work/codex-framework/scripts/codex_framework.py" install
 2. 使用发布分支，在仓库目录运行 `sh scripts/cloud-install.sh`，作为环境的 Install script。无需安装业务项目、数据库、JDK 或 Maven。
 3. 查看 `"$HOME/.local/bin/codex-framework" status`，处理实际冲突后发布环境。根 `AGENTS.md` 指向同一份偏好，Skills 既能从仓库发现，也能安装到环境的标准位置。
 4. 发布后用新任务核验中文偏好、记忆边界及至少一个 York Skill；已有任务保留自己的状态。更新框架后，在环境编辑流程中拉取并安装，再重新发布，供新任务使用。
+
+配置与认证遵循 [共享资源入口](.codex/workstation/README.md)：先使用已有云端配置，没有适用配置时再检查本地是否可用。环境准备时引用入口中已确认的配置键，核对是否已请求并提供给任务；各业务仓共用这一入口，不新增变量或重复填写凭据。具体名称、类型和适用范围只在入口维护，凭据值继续由原有配置渠道管理。
 
 云端加载共享规则和方法，不获得任何一台设备的历史记忆。原生记忆功能取决于客户端与账号能力，安装脚本不声称开启了云端原生记忆。
 
