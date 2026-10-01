@@ -4,6 +4,8 @@
 
 本仓共享用户偏好、9 个 York Skills、必要引用、记忆使用方法和可选配置片段。历史记忆、任务记录、业务代码/数据、会话、认证、工具授权规则、插件包和运行缓存不在同步范围内。
 
+环境准备时安装完整共享内容，任务启动时读取全局和适用仓库规范；Skills 正文及引用按需读取，后续沿用。需求变化涉及长期规范时修正本仓并按需应用，普通业务需求只修改所属仓库。当前会话的新要求立即生效；不为后续对话增加实时同步、每轮拉取、重复安装或常驻任务协调。
+
 ## 在另一台电脑安装
 
 需要 Git、Python 3.9+ 和可用的 GitHub 私有仓库访问权限；配置与认证按 [共享资源入口](.codex/workstation/README.md) 发现。支持 macOS 与 Linux；Windows 可在 WSL 中使用。不要复制其他设备的登录凭据。
@@ -37,24 +39,26 @@ python3 "$HOME/work/codex-framework/scripts/codex_framework.py" install
 
 ## Codex 云端
 
-1. 在「设置 → Codex 云端 → 环境」创建环境，只选择 `york6668/codex-framework`，访问范围为 `Only me`。GitHub 连接仅授权该仓库。
-2. 使用发布分支，在仓库目录运行 `sh scripts/cloud-install.sh`，作为环境的 Install script。无需安装业务项目、数据库、JDK 或 Maven。
-3. 查看 `"$HOME/.local/bin/codex-framework" status`，处理实际冲突后发布环境。根 `AGENTS.md` 指向同一份偏好，Skills 既能从仓库发现，也能安装到环境的标准位置。
-4. 发布后用新任务核验中文偏好、记忆边界及至少一个 York Skill；已有任务保留自己的状态。更新框架后，在环境编辑流程中拉取并安装，再重新发布，供新任务使用。
+1. 在「设置 → Codex 云端 → 环境」维护私有环境。`codex-framework` 使用本仓的发布分支；`market-roles` 保留业务仓的 `main`，同时接入本框架发布分支作为共享规范来源。GitHub 连接只授予环境所需仓库的访问权限，业务仓不维护共享规范副本。
+2. 在框架实际检出目录运行下方安装和状态命令，纳入环境的 Install script；规则明确安装到 `$HOME/.codex`，9 个 Skills 及引用完整安装到 `$HOME/.agents/skills`。业务依赖继续由业务仓准备，框架环境本身无需业务服务或依赖。
+3. Start skill 在任务开始时明确读取 `$HOME/.codex/AGENTS.md` 和当前仓库适用说明，并按需要使用 `$HOME/.agents/skills` 下的 York Skills；已读取的规范后续沿用。启动不拉取框架、不重复安装或执行无关全量测试，worktree 按实际需要选择。业务仓自己的隔离和禁止真实发送边界继续生效。
+4. 准备验证后保存并发布环境，用新任务核验规则读取和至少一个适用 Skill。规范变更后再更新框架源码、安装并重新发布；已有任务保留自己的状态，确需采用修订时读取相关部分。仓库刷新不会重新执行安装；保存配置草稿、发布环境和新任务验证分别报告，接口未支持的步骤不能称为完成。
 
 配置与认证遵循 [共享资源入口](.codex/workstation/README.md)：先使用已有云端配置，没有适用配置时再检查本地是否可用。环境准备时引用入口中已确认的配置键，核对是否已请求并提供给任务；各业务仓共用这一入口，不新增变量或重复填写凭据。具体名称、类型和适用范围只在入口维护，凭据值继续由原有配置渠道管理。
 
 云端加载共享规则和方法，不获得任何一台设备的历史记忆。原生记忆功能取决于客户端与账号能力，安装脚本不声称开启了云端原生记忆。
 
-如果平台注入的 `CODEX_HOME` 是只读目录，在环境的 Install script 中仅为安装和状态命令指定可写用户目录；不更改平台的环境变量或配置：
+云端安装和状态检查沿用同一显式目标；`cloud-install.sh` 透传同步工具已有参数，不改写平台运行时 `CODEX_HOME`：
 
 ```sh
 # 先进入环境实际检出的 codex-framework 仓库目录
-CODEX_HOME="$HOME/.codex" sh scripts/cloud-install.sh
-CODEX_HOME="$HOME/.codex" "$HOME/.local/bin/codex-framework" status
+sh scripts/cloud-install.sh --codex-home "$HOME/.codex"
+"$HOME/.local/bin/codex-framework" --codex-home "$HOME/.codex" status
 ```
 
-这时规则由仓库根 `AGENTS.md` 读取同一份 `.codex/AGENTS.md`；Skills 位于仓库 `.agents/skills`，也安装到 `$HOME/.agents/skills`。`$HOME/.codex` 中的副本和同步基线不能证明平台会加载它作为全局偏好，仍需通过发布后的新任务验证。云端检出分支可能由平台命名为 `work`；同步命令不会为此自动切换分支，环境更新使用编辑、仓库刷新、安装和重新发布流程。
+安装位置与平台运行时 `CODEX_HOME` 不同时，由 Start skill 指向实际共享规则位置；不能只凭文件已复制就断言平台已将它作为全局偏好加载。框架仓根 `AGENTS.md` 也指向同源正文，工作站入口兼容显式安装位置、当前 Codex home 和框架源码。云端检出分支可能由平台命名为 `work`；同步命令不会自动切换分支，环境更新使用现有编辑、仓库刷新、安装和发布能力。
+
+本地与云端仅在需要远端执行、配置核验或环境更新时通过原生任务接口协作。读取已有任务帮助定位；用户授权后发送具体请求，再回读执行结果，不将任务间通信作为规范加载前置。历史记忆继续各自保留。
 
 官方说明：[Cloud environments](https://learn.chatgpt.com/docs/environments/cloud-environments)、[Memories](https://learn.chatgpt.com/docs/customization/memories)。
 

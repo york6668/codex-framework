@@ -170,6 +170,46 @@ class SyncTests(FixtureCase):
         self.assertEqual(code, 0)
         self.assertFalse((self.root / "never-touch").exists())
 
+    def test_cloud_install_forwards_existing_options(self):
+        # Capture the shell boundary without risking a real install if options are dropped.
+        python = self.root / "bin/python3"
+        put(python, "#!" + sys.executable + "\nimport json, sys\nprint(json.dumps(sys.argv[1:]))\n")
+        python.chmod(0o755)
+        options = ["--home", str(self.root / "cloud user"),
+                   "--codex-home", str(self.root / "installed codex")]
+        result = subprocess.run(
+            ["sh", str(self.repo / "scripts/cloud-install.sh")] + options,
+            cwd=self.root, capture_output=True, text=True, timeout=20,
+            env=dict(os.environ, PATH=str(python.parent) + os.pathsep + os.environ.get("PATH", "")),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout),
+                         [str(self.repo / "scripts/codex_framework.py"), "install"] + options)
+
+    def test_explicit_cloud_target_preserves_runtime_home_and_updates_on_apply(self):
+        runtime = self.root / "platform-runtime"
+        installed = self.root / "installed codex"
+        put(runtime / "AGENTS.md", "platform instructions")
+        put(runtime / "auth.json", "platform-owned authentication")
+        target = cf.Framework(self.repo, self.b.home, installed)
+        arguments = ["--repo", str(self.repo), "--home", str(self.b.home),
+                     "--codex-home", str(installed)]
+        with mock.patch.dict(os.environ, {"CODEX_HOME": str(runtime)}):
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(cf.main(arguments + ["install"]), 0)
+                self.assertEqual(target.collect(local=True), target.collect())
+                before = target.target(".codex/AGENTS.md").read_bytes()
+                put(self.repo / ".codex/AGENTS.md", "updated shared instructions")
+                self.assertEqual(cf.main(arguments + ["status"]), 0)
+                self.assertEqual(target.target(".codex/AGENTS.md").read_bytes(), before)
+                self.assertEqual(cf.main(arguments + ["apply"]), 0)
+                self.assertEqual(target.collect(local=True), target.collect())
+            self.assertEqual(os.environ["CODEX_HOME"], str(runtime))
+        self.assertFalse((self.b.home / ".codex").exists())
+        self.assertEqual((runtime / "AGENTS.md").read_text(), "platform instructions")
+        self.assertEqual((runtime / "auth.json").read_text(), "platform-owned authentication")
+        self.assertEqual(sorted(p.name for p in runtime.iterdir()), ["AGENTS.md", "auth.json"])
+
     def test_symlink_destination_does_not_modify_external_file(self):
         external = self.root / "external.md"
         put(external, "do not change")
