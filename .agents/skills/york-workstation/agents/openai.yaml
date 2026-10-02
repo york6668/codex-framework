@@ -1,6 +1,6 @@
 interface:
   display_name: "Codex 工作站"
-  short_description: "按 GitHub 框架维护执行节点资源，优先复用 Codex 已有配置与原生连接。"
-  default_prompt: "使用 $york-workstation 按 GitHub 发布框架准备执行节点所需能力，复用 Codex 已有配置或原生连接，当前入口不可用时核验本机资源。"
+  short_description: "按核心框架识别项目环境与服务连接，准备节点资源并执行数据生命周期策略。"
+  default_prompt: "使用 $york-workstation 识别当前项目环境，多环境时沿用明确选择或请用户确认，保存本地发现信息，按任务需要准备资源并执行生命周期策略。"
 policy:
   allow_implicit_invocation: true
