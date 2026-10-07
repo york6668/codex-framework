@@ -1,6 +1,6 @@
 interface:
   display_name: "任务对齐与纠偏"
-  short_description: "接续用户目标和累计改动，按需要保存简短工作记录。"
-  default_prompt: "使用 $york-task-alignment 接续目标与重要纠偏，记录只帮助找回上下文，不阻断工作。"
+  short_description: "接续有效目标与成果，反复纠偏时扩大范围综合对齐需求历史和实现。"
+  default_prompt: "使用 $york-task-alignment 接续有效目标与成果，反复纠偏时扩大范围综合比较需求历史、更早版本与相关实现。"
 policy:
   allow_implicit_invocation: true
