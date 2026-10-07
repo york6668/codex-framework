@@ -1,6 +1,6 @@
 ---
 name: york-workstation
-description: 按核心框架准备工作站环境并管理数据生命周期。需要识别项目配置中心和环境、发现服务连接、保存本地信息、准备依赖或维护执行节点资源时使用。
+description: 按核心框架准备工作站环境并管理数据生命周期。需要识别项目配置中心和环境、发现服务连接、保存本地信息、准备依赖、维护执行节点资源，或按权限和依赖拆分多机任务、处理局部访问受阻时使用。
 ---
 
 <!-- POLICY_OWNER: workstation -->
@@ -31,6 +31,7 @@ Mac mini 是数据存储与执行节点；核心框架、长期规范、Skills�
 
 ## 按当前需要加载
 
+- 多机分工、节点授权变化或局部访问受阻：[按依赖拆分多机任务](references/environment-sync.md#按依赖拆分多机任务)，区分任务附着、连接状态与执行权限，并核验产物交接。
 - 项目配置中心、多环境选择、服务连接发现与本地保存：[环境发现与同步](references/environment-sync.md)。
 - 新资源、共享服务、升级或清理：[资源生命周期](references/resource-lifecycle.md)。
 - 本机服务的发现、启动、容量与故障处理：[本机服务入口](references/local-services.md)。
