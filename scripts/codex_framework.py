@@ -21,7 +21,8 @@ SKILLS = (
     "york-task-alignment", "york-workstation",
 )
 DOCUMENTS = (
-    ".codex/AGENTS.md", ".codex/memory-framework.md",
+    ".codex/AGENTS.md", ".codex/model-defect-recovery.md",
+    ".codex/memory-framework.md",
     ".codex/memory-settings.example.toml", ".codex/workstation/README.md",
 )
 UNKNOWN = object()
