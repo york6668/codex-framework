@@ -43,4 +43,4 @@ Codex 云端未配置、当前任务无法取得、取得后认证失败是不�
 
 工作站异常与可溯源性沿用原生任务/工具记录和节点已有状态，模型在相关任务入口核对新鲜度、身份、采用版本及资源实际退出；失效观察不视为正常。只读 `codex-framework workstation-check` 和完整判断边界见 `york-workstation/references/observability.md`。本入口不启用后台采集或通知。
 
-现有 `SessionStart` Hook 在任务启动或恢复时按需读取本节点的 `observation-sources.json` 并向模型注入有界摘要；节点状态值映射留在该文件，核心不带项目专用状态。Hook 缺席、未获信任或没有模型执行机会时不能声称已感知，任务空闲时不提供即时唤醒。
+现有 `SessionStart` Hook 在任务启动或恢复时按需读取本节点的 `observation-sources.json` 并向模型注入有界摘要；摘要缺席时可只读运行 `codex-framework workstation-entry` 直读同一固定清单，清单缺失保持未知，不递归枚举工作站。节点状态值映射留在该文件，核心不带项目专用状态。Hook 缺席、未获信任或没有模型执行机会时不能声称已感知，任务空闲时不提供即时唤醒。

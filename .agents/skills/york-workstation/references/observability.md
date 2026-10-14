@@ -4,26 +4,29 @@
 
 ## 模型在何时读取
 
-新建或恢复相关任务、准备会改变共享资源的动作、动作结果不明、故障反馈和修复复测时，先确定原生任务、项目、节点和采用版本，再从节点现有入口读取有界状态。用 `list_threads` / `read_thread` 或当前任务的原生工具记录追溯原目标、操作和结果；节点源文件及系统日志按对象、时间、尺寸限界读取。不能仅用一次检查通过、命令退出 0、容器当前 healthy 或清理声明推定资源稳定、业务效果或实际退出。
+新建或恢复相关任务时先用已收到的 `SessionStart` 摘要；未收到则运行一次 `codex-framework workstation-entry`，它只读固定的 `$HOME/.codex/workstation/observation-sources.json`。若清单缺失或结果未知，保留未知和待处理点，不递归枚举工作站寻找替代清单，也不打断无关工作。具体异常与当前任务有关时，先确定原生任务、项目、节点和采用版本，再按清单给出的精确路径及运行 ID 读取必要原件。准备会改变共享资源的动作、动作结果不明、故障反馈和修复复测时，同样从受支持的原生任务/工具记录与定向节点来源核对。用 `list_threads` / `read_thread` 或当前任务的原生工具记录追溯原目标、操作和结果；系统日志按对象、时间、尺寸限界读取。不能仅用一次检查通过、命令退出 0、容器当前 healthy 或清理声明推定资源稳定、业务效果或实际退出。
 
 `python3 scripts/codex_framework.py workstation-check < /tmp/workstation-check.json` 是无持久状态的本地核对入口。输入只放本次需要的来源路径和判断范围；不得长期保存含原生响应或敏感内容的输入。结果为 `normal`、`abnormal`、`unknown`；仅 `normal` 退出 0，异常或未知退出 2，输入无效退出 1。检查器最多读 32 个普通 JSON 文件，每个不超过 64 KiB，不扫描目录、不启动服务、不执行 Docker 命令、不写节点状态。来源需包含项目、原生线程、节点、采用版本、带时区的观察时间；不具备这些字段的旧记录可作为故障线索，但不能证明健康。调用者仍须核实文件身份、来源完整性和状态的业务语义；检查器不能认证任意输入，也不能自行唤醒模型。
 
-本机已有 `SessionStart` Hook 在 `startup|resume|clear` 时还会读取节点的 `$HOME/.codex/workstation/observation-sources.json`，将有界状态摘要注入模型上下文。节点清单只指定已有 JSON 状态文件、状态值与时效；可用 `follow` 沿状态文件中的安全运行 ID 读取一份最新运行原件。状态值的业务解释、路径和新鲜度由节点配置，不写死在核心。清单缺失、文件损坏、观察入口失败、正常状态过期均显示“未知”；已知失败保留“异常”，即使失败记录已旧。Hook 最多读 8 个来源，每个文件不超过 16 KiB，只读且不联网、不启动模型或服务。摘要只代表已配置来源，不证明整机或未登记资源健康；具体版本、操作和资源后置条件仍按原件及下述即时入口核实。
+本机已有 `SessionStart` Hook 在 `startup|resume|clear` 时使用同一固定入口，将有界状态摘要注入模型上下文。节点清单只指定 `$HOME/.codex/workstation/` 内已有的普通 JSON 状态文件、状态值与时效；可用 `follow` 沿安全运行 ID 读取一份最新运行原件。目录越界和符号链接不作为自动摘要来源。状态值的业务解释、路径和新鲜度由节点配置，不写死在核心。清单缺失、文件损坏、观察入口失败、正常状态过期或身份不匹配均显示“未知”；已知失败保留“异常”线索，即使旧记录缺身份或已过期，其归属仍待原件核实。健康需来源同时匹配项目、原生任务、节点、采用版本及新鲜度。每次最多读 1 份 8 KiB 清单及 8 个来源（每个最多一份后续记录），合计最多 17 个文件和 64 KiB，只读且不联网、不启动模型或服务。摘要只代表已配置来源，不证明整机或未登记资源健康；具体版本、操作和资源后置条件仍按原件及下述即时入口核实。
+
+显式入口输出 `status`、短摘要、读取次数与字节数；仅配置内已核实的新鲜健康状态退出 0，异常或未知退出 2。异常或未知不能因单次命令退出码、日志上限、CLI 版本不符而被丢弃：保留原失败及恢复点，查明原因后在实质修正版本上定向复测；外部阻断只暂停依赖步骤，未验收不标完成。不靠提高日志上限弥补宽范围扫描。
 
 节点清单结构示例（仅说明字段，具体状态值由节点实际实现确定）：
 
 ```json
 {"schema":"workstation-entry-v1","node_id":"node-name","sources":[
-  {"id":"project-service","path":"/absolute/state.json","status_path":"status",
+  {"id":"project-service","path":"/home/user/.codex/workstation/project/state.json","status_path":"status",
    "time_path":"observed_at","max_age_seconds":900,
    "ok_values":["HEALTHY"],"failure_values":["FAILED"],
-   "follow":{"id_path":"last_run","directory":"/absolute/runs",
+   "identity":{"project_id":"project","task_ref":"codex:thread:original-id","version":"commit-sha"},
+   "follow":{"id_path":"last_run","directory":"/home/user/.codex/workstation/project/runs",
              "status_path":"status","time_path":"finished_at","max_age_seconds":900,
              "ok_values":["PASSED"],"failure_values":["FAILED"]}}
 ]}
 ```
 
-这是任务入口的**启动或恢复时感知**：仍须在正常 Codex 启动中确认 Hook 已获信任且摘要确实进入模型、模型按原任务处理。任务空闲时即时唤醒模型不由此实现，也不应把手动运行 handler 当作端到端验收。
+来源自身须包含与清单相同的 `project_id`、`task_ref`、`node_id` 和 `version`；字段嵌套时由 `identity_paths` 指向实际字段，`follow.identity_paths` 可指定后续记录的字段。旧来源缺这些字段时仍能报告故障线索，却不能证明健康。这是任务入口的**启动或恢复时感知**：仍须在正常 Codex 启动中确认 Hook 已获信任且摘要确实进入模型、模型按原任务处理。任务空闲时即时唤醒模型不由此实现，也不应把手动运行 handler 当作端到端验收。
 
 例如从节点已有状态入口得到一份绑定后的状态文件，再按当前任务构造短时输入：
 

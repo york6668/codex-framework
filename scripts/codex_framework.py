@@ -290,7 +290,8 @@ def main(argv=None):
     parser.add_argument("--home", type=Path, help="目标用户目录；显式指定时不使用环境中的 CODEX_HOME")
     parser.add_argument("--codex-home", type=Path, help="显式指定目标 Codex home")
     parser.add_argument("command", choices=("status", "install", "apply", "pull", "export",
-                        "sync-status", "refresh", "install-hook", "session-start", "check", "workstation-check"))
+                        "sync-status", "refresh", "install-hook", "session-start", "check",
+                        "workstation-check", "workstation-entry"))
     parser.add_argument("--apply", action="store_true", help="pull 后应用；否则仅预览差异")
     parser.add_argument("--snapshot", type=Path, help="原生连接取得的完整共享内容快照")
     parser.add_argument("--revision", help="原生连接刚读取的发布提交 SHA")
@@ -306,6 +307,9 @@ def main(argv=None):
         from workstation_check import dispatch
         return dispatch()
     codex_home = args.codex_home or (os.environ.get("CODEX_HOME") if args.home is None else None)
+    if args.command == "workstation-entry":
+        from workstation_entry import dispatch
+        return dispatch(codex_home or (args.home or Path.home()) / ".codex")
     framework = Framework(args.repo or Path(__file__).resolve().parent.parent,
                           args.home or Path.home(), codex_home)
     try:
