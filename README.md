@@ -18,7 +18,7 @@ Mac mini 上的全局文档和 Skills 是部署副本，供 Codex 加载使用�
 ## 任务如何使用框架
 
 1. 冷启动（新建、恢复或清空任务）检查 GitHub 发布版本，补齐缺少的部署内容，对变化做兼容更新，再读取全局和适用仓库规范；Skills 正文及引用按当前需求选用。
-2. 按已读取的框架和 Skills 完成用户需求。核心框架定义工作站的职责、策略设置和预期结果；具体数据单元识别项目环境、多环境时取得明确选择、发现服务并保存本地信息，按任务需要同步和核验数据，执行保留、过期与清理策略。方法见 [工作站入口](.codex/workstation/README.md)，工具与实际配置由节点实现。涉及多个节点或局部访问受阻时，按 [多机任务分工](.agents/skills/york-workstation/references/environment-sync.md#按依赖拆分多机任务) 明确各步骤及交接，继续已有授权内不依赖缺口的工作。
+2. 按已读取的框架和 Skills 完成用户需求。纠偏时先手动复测本地正常入口的可验证行为，明确通过后再进入真实任务持续验证；长期效果单列后续验收。核心框架定义工作站的职责、策略设置和预期结果；具体数据单元识别项目环境、多环境时取得明确选择、发现服务并保存本地信息，按任务需要同步和核验数据，执行保留、过期与清理策略。方法见 [工作站入口](.codex/workstation/README.md)，工具与实际配置由节点实现。涉及多个节点或局部访问受阻时，按 [多机任务分工](.agents/skills/york-workstation/references/environment-sync.md#按依赖拆分多机任务) 明确各步骤及交接，继续已有授权内不依赖缺口的工作。
 3. 发现长期规范或方法缺口时，在所属 GitHub 项目的检出中修订正文及引用，按该项目授权发布；发布后刷新受影响的部署副本，并重新读取当前任务需要的修订。普通业务需求在所属业务仓库处理。
 4. 来源暂时不可用时沿用最后有效版本，保留数据和未发布修改，继续不依赖刷新的工作；普通追加消息和上下文压缩不重复联网刷新。
 
@@ -41,7 +41,7 @@ python3 "$HOME/work/codex-framework/scripts/codex_framework.py" install
 
 ## 任务启动与变更刷新
 
-完成首次兼容迁移后运行 `"$HOME/.local/bin/codex-framework" install-hook`，将 SessionStart 提示合并到实际 Codex home 的 `hooks.json`，保留其他 Hook。首次启用及定义变化通过 Codex 原生 `/hooks` 审阅并信任；安装器不会修改信任记录或启用绕过选项。Hook 只提示当前任务执行检查，不直接联网或运行其他模型。
+完成首次兼容迁移后运行 `"$HOME/.local/bin/codex-framework" install-hook`，将 SessionStart 提示合并到实际 Codex home 的 `hooks.json`，保留其他 Hook。首次启用及定义变化通过 Codex 原生 `/hooks` 审阅并信任；安装器不会修改信任记录或启用绕过选项。Hook 只提示当前任务执行检查，不直接联网或运行其他模型。修改启动提示后，手动调用 handler 仅验证脚本；还须从正常 Codex CLI 启动并观察自动注入的专属上下文或受支持的 Hook 事件。若当前平台不提供可观察证据，明确保留未验证，不以配置存在或未来任务代替。
 
 先复用当前任务可用的 Codex 仓库能力或 GitHub 原生连接，当前入口不可用时回退到本机已有 Git 配置；两边失败标记待用户处理并保留现用规范。不同入口访问的是同一 GitHub 项目，Codex 云端执行环境不是必经中转。具体命令、快照格式、冲突处理与当前任务重读动作见 [同步方法](.agents/skills/york-codex-policy-maintenance/references/framework-sync.md)。普通追加消息和上下文压缩不联网；后续仅明确已发布的规范变化、当前任务完成长期规范发布或用户要求时刷新，不注册每轮 Hook、后台轮询或跨任务通知。
 

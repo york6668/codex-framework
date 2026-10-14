@@ -221,6 +221,25 @@ class CorrectionLoop(unittest.TestCase):
                     ("codex:copy:deployed", "copied " + fixed_version, False),
                     ("node:run:deployed", "deployed value 3: go; " + fixed_version, False)):
                 attach_native(request, ref, body, message=message)
+            # Fix the local acceptance input before invoking the normal CLI.
+            local_output = run_rule(deployed, 3)
+            local_plan = "case:boundary expected:" + digest("go") + " " + fixed_version
+            request["context"]["evidence"] += [
+                evidence("codex:plan:local", "local_plan", value_digest=digest(local_plan)),
+                evidence("codex:expect:local", "local_expectation",
+                         value_digest=digest("go"), related_ref="codex:plan:local", resource=RESOURCE),
+                evidence("codex:run:local", "local_result", result="passed",
+                         version=fixed_version, value_digest=digest(local_output),
+                         related_ref="codex:expect:local", resource=RESOURCE)]
+            attach_native(request, "codex:plan:local", local_plan, message=True)
+            attach_native(request, "codex:expect:local", "go", message=True)
+            attach_native(request, "codex:run:local", local_output)
+            local_item = request["context"]["native_sources"][0]["turns"][0]["items"][-1]
+            local_item["command"] += " " + fixed_version
+            request["issue"]["local_verification"] = {
+                "plan_ref": "codex:plan:local",
+                "cases": [{"id": "boundary", "resource": RESOURCE,
+                           "expected_ref": "codex:expect:local", "observed_ref": "codex:run:local"}]}
             self.assertIn("followup_used_correction", cli(request)[1]["missing"])
             request["context"]["evidence"].append(
                 evidence("codex:run:next-turn", "followup", result="used_correction",

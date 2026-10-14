@@ -9,7 +9,7 @@ import json
 import re
 import sys
 
-from source_evidence import verify as verify_source
+from source_evidence import native_precedes, source_text, verify as verify_source
 
 
 class CheckError(ValueError):
@@ -80,8 +80,8 @@ def evaluate(payload):
     for scope in project_scopes + task_scopes:
         covers(scope, resource(scope), False)
     phase = payload.get("phase", "action")
-    if phase not in ("resume", "action", "feedback", "close_issue"):
-        raise CheckError("phase must be resume, action, feedback or close_issue")
+    if phase not in ("resume", "action", "feedback", "verify_local", "close_issue"):
+        raise CheckError("phase must be resume, action, feedback, verify_local or close_issue")
     blocked, missing, deviations = [], [], []
 
     def block(code):
@@ -113,7 +113,7 @@ def evaluate(payload):
         evidence[ref] = record
 
     action_input = payload.get("action")
-    strict_sources = (phase in ("resume", "feedback", "close_issue")
+    strict_sources = (phase in ("resume", "feedback", "verify_local", "close_issue")
                       or (phase == "action" and isinstance(action_input, dict)
                           and (action_input.get("kind") in ("repair", "publish")
                                or "recovery" in action_input)))
@@ -152,6 +152,56 @@ def evaluate(payload):
                         or not verify_source(context, project, source_record)):
                     need("accepted_correction_unverified")
 
+    def check_local_verification(validation, target, version):
+        """Check fixed expectations against manually observed local outputs."""
+        if not isinstance(validation, dict):
+            need("local_verification_plan")
+            need("local_verification_results")
+            return
+        plan_ref = validation.get("plan_ref")
+        plan = linked(plan_ref, "local_plan")
+        plan_text = source_text(context, plan) if plan and plan.get("source") == "codex" else None
+        if not plan_text or not version or version not in plan_text:
+            need("local_verification_plan")
+        cases = items(validation.get("cases", []), "local_verification.cases")
+        if not cases:
+            need("local_verification_cases")
+            need("local_verification_results")
+        seen = set()
+        for entry in cases:
+            case = obj(entry, "local verification case")
+            case_id = identifier(case.get("id"), "local verification case.id")
+            if case_id in seen:
+                raise CheckError("local verification case IDs must be unique")
+            seen.add(case_id)
+            candidate = resource(case.get("resource"))
+            if (not any(covers(scope, candidate, False) for scope in project_scopes)
+                    or not any(covers(scope, candidate, False) for scope in task_scopes)):
+                block("local_verification_outside_scope")
+            if not overlaps(candidate, target):
+                need("local_verification_unrelated_case")
+            expected = linked(case.get("expected_ref"), "local_expectation")
+            observed = linked(case.get("observed_ref"), "local_result")
+            expected_digest = expected.get("digest") if expected else None
+            if (not isinstance(expected_digest, str)
+                    or not re.fullmatch(r"[0-9a-f]{64}", expected_digest)
+                    or not plan_text or not re.search(
+                        r"(?:^|\n)case:" + re.escape(case_id) +
+                        r"\s+expected:" + expected_digest + r"(?:\s|$)", plan_text)):
+                need("local_case_not_fixed_in_plan")
+            if (expected is None or observed is None or expected.get("resource") != case.get("resource")
+                    or observed.get("resource") != case.get("resource")
+                    or expected.get("related_ref") != plan_ref
+                    or observed.get("related_ref") != case.get("expected_ref")
+                    or observed.get("version") != version
+                    or observed.get("result") != "passed"
+                    or observed.get("digest") != expected_digest):
+                need("local_verification_results")
+            if (plan and observed and not native_precedes(context, plan, observed)):
+                need("local_plan_not_before_result")
+        if not version:
+            need("local_verification_version")
+
     if phase == "resume":
         resume = obj(payload.get("resume"), "resume")
         target = resource(resume.get("resource"))
@@ -160,6 +210,11 @@ def evaluate(payload):
             block("resume_outside_scope")
         linked(resume.get("goal_ref"), "goal")
         check_corrections(target, resume.get("accepted_corrections", []))
+        if resume.get("stage") == "continuous":
+            check_local_verification(resume.get("local_verification"), target,
+                                     resume.get("version"))
+        elif resume.get("stage") not in (None, "work", "local"):
+            raise CheckError("resume.stage must be work, local or continuous")
     elif phase == "feedback":
         feedback = obj(payload.get("feedback"), "feedback")
         target = resource(feedback.get("resource"))
@@ -185,6 +240,13 @@ def evaluate(payload):
                         need("unverified_prior_correction")
                     else:
                         deviate("correction_ineffective_or_regressed")
+    elif phase == "verify_local":
+        validation = obj(payload.get("local_verification"), "local_verification")
+        target = resource(validation.get("resource"))
+        if (not any(covers(scope, target, False) for scope in project_scopes)
+                or not any(covers(scope, target, False) for scope in task_scopes)):
+            block("local_verification_outside_scope")
+        check_local_verification(validation, target, validation.get("version"))
     elif phase == "action":
         action = obj(payload.get("action"), "action")
         kind = action.get("kind")
@@ -298,11 +360,16 @@ def evaluate(payload):
             block("issue_owner_mismatch")
         if issue.get("resource") is None:
             need("issue_resource")
+            target = None
         else:
             target = resource(issue["resource"])
             if (not any(covers(scope, target, True) for scope in project_scopes)
                     or not any(covers(scope, target, True) for scope in task_scopes)):
                 block("issue_outside_scope")
+
+        if target is not None:
+            check_local_verification(issue.get("local_verification"), target,
+                                     obj(issue.get("regression", {}), "issue.regression").get("version"))
 
         for key in ("goal_ref", "failure_ref", "cause_ref", "fix_ref", "acceptance_ref"):
             if not issue.get(key):
@@ -354,7 +421,11 @@ def evaluate(payload):
 
     status = ("blocked" if blocked else "needs_evidence" if missing else
               "deviation" if deviations else "ready")
+    continuous_eligible = (status == "ready" and
+                           (phase == "verify_local" or phase == "close_issue" or
+                            (phase == "resume" and payload["resume"].get("stage") == "continuous")))
     return {"status": status, "blocked": blocked, "missing": missing, "deviations": deviations,
+            "continuous_eligible": continuous_eligible,
             "meaning": "source_excerpt_and_input_consistency_only; provenance, authorization and goal semantics remain external"}
 
 

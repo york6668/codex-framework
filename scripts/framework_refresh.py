@@ -205,7 +205,8 @@ def session_start(framework, event):
                " 和当前已使用且被更新的 Skill/相关引用。普通追加消息不联网；"
                "后续仅明确已发布规范变更或用户要求时刷新。同步失败不阻断无依赖工作。"
                "按当前任务目标读取适用项目边界、偏好和原任务记录；属于既有纠偏时，"
-               "从原生记录与节点原件核对旧失败、修正版本及适用范围，复测目标结果并在接续中实际使用。"
+               "从原生记录与节点原件核对旧失败、修正版本及适用范围；先手动从本地正常入口复测可执行部分，"
+               "结果通过后才进入真实任务持续验证，长期效果另列验收，并在接续中实际使用纠正。"
                "复杂或结果不明时可运行 codex-framework check 的 resume/feedback/close_issue，"
                "其 ready 只表示已供来源的关系通过，不能代替原件真实性或目标验收。")
     return {"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": context}}

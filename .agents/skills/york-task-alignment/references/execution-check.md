@@ -10,7 +10,9 @@ python3 scripts/codex_framework.py check < /tmp/current-action.json
 
 输入的 `project.id` 和 `task.project_id` 必须一致，`task.native_ref` 与 `context.task_ref` 都指向要接续的同一原生线程（`codex:thread:<id>`）。`project.scopes`、`task.scopes` 分别给出项目和本任务范围；每项由 `kind`、`id`、可选的相对 `path` 与 `access: read|write` 组成。`action.resource` 使用同样的身份字段，`kind` 是 `read|write|invoke|repair|publish`。资源身份应取自实际仓库、数据或服务，不用路径相似性推断归属。范围和路径的包含检查会拒绝跨项目及同项目其他任务越界。
 
-新建或恢复相关任务时，`phase: resume` 以 `resume.resource`、`resume.goal_ref` 和选中的 `resume.accepted_corrections` 核对原目标来源、项目与任务边界、适用的旧纠正及其版本。先从项目现有契约和原任务历史识别适用纠正；程序无法自行发现调用者遗漏的项目历史。`ready` 后仍须在本轮行为中实际使用纠正并留下原生记录。
+新建或恢复相关任务时，`phase: resume` 以 `resume.resource`、`resume.goal_ref` 和选中的 `resume.accepted_corrections` 核对原目标来源、项目与任务边界、适用的旧纠正及其版本。先从项目现有契约和原任务历史识别适用纠正；程序无法自行发现调用者遗漏的项目历史。`ready` 后仍须在本轮行为中实际使用纠正并留下原生记录。接续若要进入真实持续验证，标明 `resume.stage: continuous`、`resume.version` 和 `resume.local_verification`；缺少本地复测计划或结果不得进入该阶段。普通 `work` 或 `local` 接续不因此被阻断。
+
+纠偏的本地复测先于真实持续验证。先在原任务中固定可手动执行的原失败和受影响行为、输入、预期、适用版本与正常入口；长期效果确实无法本地复现时说明理由及单独的后续验收，不用这个理由跳过其他本地检查。手动执行一次固定案例，失败先定位修复，沿同一输入再测，不反复生成测试直到碰巧通过。若修复涉及 Hook 自动加载，必须在正常 CLI 启动中观察专属注入内容或受支持的 Hook 事件；单独运行 handler、查看配置或等待将来任务都不能代替。平台不暴露该证据时如实保留未验证。`phase: verify_local` 接受 `local_verification.resource`、`version`、`plan_ref` 和非空 `cases`。每个 case 给唯一 `id`、`resource`、`expected_ref`、`observed_ref`。计划来源为原生 `local_plan` item，正文含版本、每项 `case:<id> expected:<SHA-256>`；预期来源为 `local_expectation`，其 `related_ref` 指向计划；实际来源为 `local_result`，其 `related_ref` 指向预期，版本与被验证版本一致。预期和实际文本摘要必须相同，实际来源须为完成、退出码 0、输出未截断且含版本的原生命令；`result: passed` 单独无效。程序检查来源片段、版本与精确输出，执行者还须核实计划覆盖完整可执行风险、原生来源真实性、计划先于实测及输出的业务语义。`ready` 仅表示这些可验证输入满足本地准入，不代表未来效果已经发生。输出 `continuous_eligible` 仅在本地准入通过、连续阶段接续通过或缺陷关闭检查通过时为 true；普通 `resume` 即使 `ready` 仍为 false。关闭问题的 `issue.local_verification` 使用同一计划与案例；`resume(stage=continuous)` 也重复检查，不会凭先前标签跳过。
 
 有副作用的动作还提供稳定的 `effect_key`、`context.native_snapshot_ref`、`native_snapshot_complete: true` 和相关 `native_operations` 的引用、任务、项目、资源、effect key 与 `succeeded|running|failed|unknown` 状态。这里的 complete 只表示**本次副作用范围内**的原生记录已读全；做不到就保留待核实，不能填 true 让检查通过。相同效果已成功、进行中或结果不明时不重复执行；失败后再试需对同一原任务提供失败引用、原因引用及已验证纠正引用。`depends_on` 指向已成功的原生操作；其他任务正在写同一资源或结果不明时先隔离冲突。操作需要能力或消耗额度时，同时提供节点快照引用、当前能力和剩余额度。入口或上下文失败只证明那次调用失败，不能据此断言功能缺失或实现缺陷。
 
@@ -20,7 +22,7 @@ python3 scripts/codex_framework.py check < /tmp/current-action.json
 
 项目原有契约、修正代码及回归测试是后续接续的来源；不另建纠正台账。下一轮从这些来源和原生任务记录读出适用纠正，在本次输入的 `project.accepted_corrections` 放入其引用、资源、版本，并以 `project.corrections_source_ref` 指向所核对来源。`resume` 或 `action` 的 `accepted_corrections` 应包含同一资源的纠正及同版依据；程序会要求临时证据中有可核验的旧修正原件，遗漏、旧版或来源缺失不会得到 `ready`。空数组本身不证明没有历史偏差。
 
-缺陷修复后用 `phase: close_issue` 核对原目标、原失败、根因、修正、原场景及受影响路径复测、独立目标验收、正式采用版本、实际效果与后续接续。`issue.goal_ref` 和 `acceptance_ref` 必须关联；目标验收不能复用局部回归命令。原场景复测的 `related_ref` 指向原失败，目标验收指向原目标，后续接续指向修正；回归、验收、采用、效果及接续版本须一致。仅命令退出 0 不证明业务目标完成，执行者须核对实际输出和目标语义。修后尚未正式采用、没有效果或没有后续使用证据时为 `needs_evidence`。
+缺陷修复后用 `phase: close_issue` 核对本地准入、原目标、原失败、根因、修正、原场景及受影响路径复测、独立目标验收、正式采用版本、实际效果与后续接续。`issue.goal_ref` 和 `acceptance_ref` 必须关联；目标验收不能复用局部回归命令。原场景复测的 `related_ref` 指向原失败，目标验收指向原目标，后续接续指向修正；本地验证、回归、验收、采用、效果及接续版本须一致。仅命令退出 0 不证明业务目标完成，执行者须核对实际输出和目标语义。修后尚未正式采用、没有效果或没有后续使用证据时为 `needs_evidence`，但不得把可本地复测的部分推迟到后续任务。
 
 反馈、恢复入口和缺陷关闭的来源核验：`context.native_sources` 可临时放 Codex `read_thread` 的原始 JSON 响应；Codex 证据用 `native_item_id` 指向其中 item，非命令文本以 `digest` 绑定。成功证据要求原生命令 `completed`、退出码 0、输出未截断，带版本的结果还须在命令或输出出现该版本。节点文件证据用 `project.root`、相对 `node_path` 和 `digest` 核对当前文件；`passed/applied/observed/used_correction` 还须由 JSON 文件同时给出相同 `result/version`。临时输入可含原生响应以供本次比对，不能提交到框架仓库或复制成长期日志；取不到完整原件时保留 `needs_evidence`。来源由当前任务的受支持接口取得，检查器不能认证任意调用者提供的 JSON 未被伪造。
 

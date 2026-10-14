@@ -41,6 +41,49 @@ def _native_item(context, record):
     return None
 
 
+def source_text(context, record):
+    """Read a verified source's text for the local plan's fixed case identifiers."""
+    if not verify(context, {}, record):
+        return None
+    item = _native_item(context, record)
+    return _body(item) if item is not None and item.get("type") in ("agentMessage", "userMessage") else None
+
+
+def native_precedes(context, earlier, later):
+    """Require plan and result in one native snapshot with known order."""
+    snapshots = context.get("native_sources", [])
+    if not isinstance(snapshots, list):
+        return False
+    for snapshot in snapshots:
+        if not isinstance(snapshot, dict) or snapshot.get("schemaVersion") != 1:
+            continue
+        thread = snapshot.get("thread")
+        if (not isinstance(thread, dict) or
+                thread.get("id") != earlier.get("task_ref", "").removeprefix("codex:thread:")):
+            continue
+        positions = {}
+        for turn_index, turn in enumerate(snapshot.get("turns", []) or []):
+            if not isinstance(turn, dict):
+                continue
+            for item_index, item in enumerate(turn.get("items", []) or []):
+                if not isinstance(item, dict):
+                    continue
+                if item.get("id") in (earlier.get("native_item_id"), later.get("native_item_id")):
+                    positions[item["id"]] = (turn_index, item_index)
+        first, second = positions.get(earlier.get("native_item_id")), positions.get(later.get("native_item_id"))
+        if first is None or second is None:
+            continue
+        if first[0] == second[0]:
+            return first[1] < second[1]
+        page = snapshot.get("page")
+        order = page.get("order") if isinstance(page, dict) else None
+        if order == "newest_first":
+            return first[0] > second[0]
+        if order == "oldest_first":
+            return first[0] < second[0]
+    return False
+
+
 def verify(context, project, record):
     """Return whether the declared result is supported by a source excerpt.
 

@@ -66,6 +66,35 @@ def bind_native_sources(request):
         "turns": [{"items": entries}]}]
 
 
+def attach_local_verification(request, target, version):
+    """A fixed expected output and a manually invoked, version-bound result."""
+    plan_ref, expected_ref, result_ref = "codex:plan:local", "codex:expect:local", "codex:run:local"
+    body = "local output"
+    value_hash = hashlib.sha256(body.encode()).hexdigest()
+    records = request["context"]["evidence"]
+    for ref, kind in ((plan_ref, "local_plan"), (expected_ref, "local_expectation"),
+                      (result_ref, "local_result")):
+        record = fact(ref, kind, "passed" if kind == "local_result" else None,
+                      version if kind == "local_result" else None)
+        record["source"] = "codex"
+        record["native_item_id"] = ref
+        record["digest"] = (hashlib.sha256(("case:original expected:" + value_hash + " " + version).encode()).hexdigest()
+                            if kind == "local_plan" else value_hash)
+        if kind != "local_plan":
+            record["resource"] = target
+            record["related_ref"] = plan_ref if kind == "local_expectation" else expected_ref
+        records.append(record)
+    request["context"]["native_sources"][0]["turns"][0]["items"] += [
+        {"id": plan_ref, "type": "agentMessage",
+         "text": "case:original expected:" + value_hash + " " + version},
+        {"id": expected_ref, "type": "agentMessage", "text": body},
+        {"id": result_ref, "type": "commandExecution", "status": "completed", "exitCode": 0,
+         "command": "manual local command " + version,
+         "output": {"text": body, "truncated": False}}]
+    return {"plan_ref": plan_ref, "cases": [{"id": "original", "resource": target,
+            "expected_ref": expected_ref, "observed_ref": result_ref}]}
+
+
 class ActionChecks(unittest.TestCase):
     def test_project_isolation_and_task_scope(self):
         request = action_case()
@@ -185,6 +214,8 @@ class ClosureChecks(unittest.TestCase):
         request["context"]["evidence"][6]["related_ref"] = "codex:user:goal"
         request["context"]["evidence"][9]["related_ref"] = "codex:commit:fix"
         bind_native_sources(request)
+        request["issue"]["local_verification"] = attach_local_verification(
+            request, request["issue"]["resource"], "commit:abc")
         return request
 
     def test_closure_requires_actual_links_tested_adoption_and_effect(self):
@@ -218,6 +249,59 @@ class ClosureChecks(unittest.TestCase):
         request = self.close_case()
         request["context"]["native_sources"][0]["turns"][0]["items"][8]["output"]["truncated"] = True
         self.assertIn("unverified_effect_source", check.evaluate(request)["missing"])
+
+    def test_local_verification_is_required_before_continuous_and_close(self):
+        request = self.close_case()
+        local = request["issue"].pop("local_verification")
+        self.assertIn("local_verification_plan", check.evaluate(request)["missing"])
+        request["issue"]["local_verification"] = local
+        request["phase"] = "resume"
+        request["resume"] = {"resource": request["issue"]["resource"],
+                             "goal_ref": request["issue"]["goal_ref"],
+                             "stage": "continuous", "version": "commit:abc"}
+        self.assertIn("local_verification_plan", check.evaluate(request)["missing"])
+        request["resume"]["local_verification"] = local
+        self.assertEqual(check.evaluate(request)["status"], "ready")
+        self.assertTrue(check.evaluate(request)["continuous_eligible"])
+        request["resume"]["stage"] = "work"
+        self.assertFalse(check.evaluate(request)["continuous_eligible"])
+        request["resume"]["stage"] = "continuous"
+        request["phase"] = "verify_local"
+        request["local_verification"] = {**local, "resource": request["issue"]["resource"],
+                                         "version": "commit:abc"}
+        self.assertEqual(check.evaluate(request)["status"], "ready")
+        self.assertTrue(check.evaluate(request)["continuous_eligible"])
+
+    def test_local_output_and_plan_must_be_real_and_match(self):
+        request = self.close_case()
+        records = request["context"]["evidence"]
+        result = next(record for record in records if record["kind"] == "local_result")
+        local = request["issue"]["local_verification"]
+        items = request["context"]["native_sources"][0]["turns"][0]["items"]
+        actual = next(item for item in items if item["id"] == result["ref"])
+        actual["output"]["text"] = "wrong output"
+        self.assertIn("unverified_local_result_source", check.evaluate(request)["missing"])
+        actual["output"]["text"] = "local output"
+        actual["status"] = "failed"
+        self.assertIn("unverified_local_result_source", check.evaluate(request)["missing"])
+        actual["status"] = "completed"
+        result["digest"] = hashlib.sha256(b"wrong output").hexdigest()
+        self.assertIn("unverified_local_result_source", check.evaluate(request)["missing"])
+        result["digest"] = hashlib.sha256(b"local output").hexdigest()
+        result["version"] = "commit:older"
+        self.assertIn("local_verification_results", check.evaluate(request)["missing"])
+        result["version"] = "commit:abc"
+        result["result"] = "unknown"
+        self.assertIn("local_verification_results", check.evaluate(request)["missing"])
+        result["result"] = "passed"
+        local["cases"][0]["id"] = "invented"
+        self.assertIn("local_case_not_fixed_in_plan", check.evaluate(request)["missing"])
+        local["cases"][0]["id"] = "original"
+        items[-3], items[-1] = items[-1], items[-3]
+        self.assertIn("local_plan_not_before_result", check.evaluate(request)["missing"])
+        items[-3], items[-1] = items[-1], items[-3]
+        local["cases"] = []
+        self.assertIn("local_verification_cases", check.evaluate(request)["missing"])
 
 
 if __name__ == "__main__":
