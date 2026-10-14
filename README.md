@@ -92,6 +92,8 @@ sh scripts/cloud-install.sh --codex-home "$HOME/.codex"
 
 ## 开发验证
 
+`python3 scripts/codex_framework.py check < /tmp/current-action.json` 提供无持久台账的项目/任务范围、原生副作用去重、依赖、预算、节点能力、失败恢复和缺陷闭环检查。它处理当前任务从原生工具与节点取得的短暂引用元数据，不读写同步状态；用法与证据边界见[执行与修复的即时检查](.agents/skills/york-task-alignment/references/execution-check.md)。检查结果不能代替平台实际权限或原件核验。
+
 ```sh
 python3 -m unittest discover -s tests -v
 ```
