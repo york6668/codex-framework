@@ -86,7 +86,7 @@ sh scripts/cloud-install.sh --codex-home "$HOME/.codex"
 
 安装位置与平台运行时 `CODEX_HOME` 不同时，由 Start skill 指向实际共享规则位置；不能只凭文件已复制就断言平台已将它作为全局偏好加载。框架仓根 `AGENTS.md` 也指向同源正文，工作站入口兼容显式安装位置、当前 Codex home 和框架源码。云端检出分支可能由平台命名为 `work`；同步命令不会自动切换分支，环境更新使用现有编辑、仓库刷新、安装和发布能力。
 
-同一主会话可按需要通过已授权的原生任务接口，协调固定在不同 Mac mini 或 Codex 云端执行环境的子任务。读取已有任务帮助定位，按已有授权发送具体请求并回读执行结果；执行机、输入版本和输出交接见 [多机任务分工](.agents/skills/york-workstation/references/environment-sync.md#按依赖拆分多机任务)。这不要求迁移既有任务、业务状态或调度，也不将任务间通信作为规范加载前置。历史记忆继续各自保留。
+同一主会话可按需要通过已授权的原生任务接口，协调固定在不同 Mac mini 或 Codex 云端执行环境的子任务。读取已有任务帮助定位；向运行中的任务发送消息可能改变其当前执行，先按 [任务对齐](.agents/skills/york-task-alignment/SKILL.md) 核对本次目标、必要依赖和拟影响的对象与优先级，不能把接口可用当成打断或扩大该任务范围的授权。确需交接时发送有界请求并回读结果；执行机、输入版本和输出交接见 [多机任务分工](.agents/skills/york-workstation/references/environment-sync.md#按依赖拆分多机任务)。这不要求迁移既有任务、业务状态或调度，也不将任务间通信作为规范加载前置。历史记忆继续各自保留。
 
 官方说明：[Cloud environments](https://learn.chatgpt.com/docs/environments/cloud-environments)、[Memories](https://learn.chatgpt.com/docs/customization/memories)。
 
