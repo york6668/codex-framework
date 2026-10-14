@@ -103,3 +103,5 @@ python3 -m unittest discover -s tests -v
 ## 工作站异常与追溯
 
 `python3 scripts/codex_framework.py workstation-check < /tmp/workstation-check.json` 对当前任务选定的节点状态做有界只读核对。它将已知故障、来源过期/缺失、身份或版本不符、资源清理后置条件不符分别呈现为异常或未知；仅 `normal` 退出 0。来源契约与限制见[工作站异常与可溯源性](.agents/skills/york-workstation/references/observability.md)。该入口不创建采集或调度，也不代替原生任务记录和模型对实际原件的核实。
+
+已安装的 `SessionStart` Hook 还可在本地任务启动或恢复时读取节点来源清单，注入简短异常或未知摘要；不会在任务空闲时唤醒模型。正常启动的自动注入须单独验收。

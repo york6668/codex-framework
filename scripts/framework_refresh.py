@@ -209,6 +209,14 @@ def session_start(framework, event):
                "结果通过后才进入真实任务持续验证，长期效果另列验收，并在接续中实际使用纠正。"
                "复杂或结果不明时可运行 codex-framework check 的 resume/feedback/close_issue，"
                "其 ready 只表示已供来源的关系通过，不能代替原件真实性或目标验收。")
+    try:
+        import workstation_entry
+        observation = workstation_entry.summary(framework.codex_home)
+    except Exception:
+        observation = "工作站观察: 未知(观察入口失败)；检查节点来源清单与原任务。"
+    limit = max(0, 1790 - len(context.encode("utf-8")))
+    observation = observation.encode("utf-8")[:limit].decode("utf-8", "ignore")
+    context = observation + " " + context
     return {"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": context}}
 
 

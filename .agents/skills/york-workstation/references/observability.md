@@ -8,6 +8,23 @@
 
 `python3 scripts/codex_framework.py workstation-check < /tmp/workstation-check.json` 是无持久状态的本地核对入口。输入只放本次需要的来源路径和判断范围；不得长期保存含原生响应或敏感内容的输入。结果为 `normal`、`abnormal`、`unknown`；仅 `normal` 退出 0，异常或未知退出 2，输入无效退出 1。检查器最多读 32 个普通 JSON 文件，每个不超过 64 KiB，不扫描目录、不启动服务、不执行 Docker 命令、不写节点状态。来源需包含项目、原生线程、节点、采用版本、带时区的观察时间；不具备这些字段的旧记录可作为故障线索，但不能证明健康。调用者仍须核实文件身份、来源完整性和状态的业务语义；检查器不能认证任意输入，也不能自行唤醒模型。
 
+本机已有 `SessionStart` Hook 在 `startup|resume|clear` 时还会读取节点的 `$HOME/.codex/workstation/observation-sources.json`，将有界状态摘要注入模型上下文。节点清单只指定已有 JSON 状态文件、状态值与时效；可用 `follow` 沿状态文件中的安全运行 ID 读取一份最新运行原件。状态值的业务解释、路径和新鲜度由节点配置，不写死在核心。清单缺失、文件损坏、观察入口失败、正常状态过期均显示“未知”；已知失败保留“异常”，即使失败记录已旧。Hook 最多读 8 个来源，每个文件不超过 16 KiB，只读且不联网、不启动模型或服务。摘要只代表已配置来源，不证明整机或未登记资源健康；具体版本、操作和资源后置条件仍按原件及下述即时入口核实。
+
+节点清单结构示例（仅说明字段，具体状态值由节点实际实现确定）：
+
+```json
+{"schema":"workstation-entry-v1","node_id":"node-name","sources":[
+  {"id":"project-service","path":"/absolute/state.json","status_path":"status",
+   "time_path":"observed_at","max_age_seconds":900,
+   "ok_values":["HEALTHY"],"failure_values":["FAILED"],
+   "follow":{"id_path":"last_run","directory":"/absolute/runs",
+             "status_path":"status","time_path":"finished_at","max_age_seconds":900,
+             "ok_values":["PASSED"],"failure_values":["FAILED"]}}
+]}
+```
+
+这是任务入口的**启动或恢复时感知**：仍须在正常 Codex 启动中确认 Hook 已获信任且摘要确实进入模型、模型按原任务处理。任务空闲时即时唤醒模型不由此实现，也不应把手动运行 handler 当作端到端验收。
+
 例如从节点已有状态入口得到一份绑定后的状态文件，再按当前任务构造短时输入：
 
 ```json

@@ -42,3 +42,5 @@ Codex 云端未配置、当前任务无法取得、取得后认证失败是不�
 专业方法位于当前用户的 `$HOME/.agents/skills/york-workstation`，相关测试与数据方法按 Skill 入口引用读取。持久工具与服务不会随框架更新或任务结束被删除、关闭或重新初始化；其中数据按生命周期策略处理。未知资源先辨识，服务管理权不等于其中业务数据的处置授权。
 
 工作站异常与可溯源性沿用原生任务/工具记录和节点已有状态，模型在相关任务入口核对新鲜度、身份、采用版本及资源实际退出；失效观察不视为正常。只读 `codex-framework workstation-check` 和完整判断边界见 `york-workstation/references/observability.md`。本入口不启用后台采集或通知。
+
+现有 `SessionStart` Hook 在任务启动或恢复时按需读取本节点的 `observation-sources.json` 并向模型注入有界摘要；节点状态值映射留在该文件，核心不带项目专用状态。Hook 缺席、未获信任或没有模型执行机会时不能声称已感知，任务空闲时不提供即时唤醒。
