@@ -99,3 +99,7 @@ python3 -m unittest discover -s tests -v
 ```
 
 测试使用独立临时用户目录和本地 Git 远端，不访问业务服务或修改真实 Codex home。可用 `--home /absolute/test-home` 和 `--codex-home /absolute/codex-home` 指定测试目标；显式 `--home` 会忽略环境中的 `CODEX_HOME`，避免误触真实目录。
+
+## 工作站异常与追溯
+
+`python3 scripts/codex_framework.py workstation-check < /tmp/workstation-check.json` 对当前任务选定的节点状态做有界只读核对。它将已知故障、来源过期/缺失、身份或版本不符、资源清理后置条件不符分别呈现为异常或未知；仅 `normal` 退出 0。来源契约与限制见[工作站异常与可溯源性](.agents/skills/york-workstation/references/observability.md)。该入口不创建采集或调度，也不代替原生任务记录和模型对实际原件的核实。

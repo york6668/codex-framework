@@ -34,6 +34,7 @@ Mac mini 是数据存储与执行节点；核心框架、长期规范、Skills�
 - 多机分工、节点授权变化或局部访问受阻：[按依赖拆分多机任务](references/environment-sync.md#按依赖拆分多机任务)，区分任务附着、连接状态与执行权限，并核验产物交接。
 - 项目配置中心、多环境选择、服务连接发现与本地保存：[环境发现与同步](references/environment-sync.md)。
 - 新资源、共享服务、升级或清理：[资源生命周期](references/resource-lifecycle.md)。
+- 工作站故障发现、来源新鲜度、操作后置状态与有界追溯：[异常与可溯源性](references/observability.md)。
 - 本机服务的发现、启动、容量与故障处理：[本机服务入口](references/local-services.md)。
 - 私有依赖、日志入口的网络要求或连接故障：[本机网络](references/local-network.md)。
 - 业务数据选择、导入、同步恢复及上线 SQL 数据修正使用 [本地数据方法](../york-local-data/SKILL.md)。工作站负责本地分析、冲突处置和最终 SQL 验证，再将已确定的变更交付线上；不把这些工作转交线上环境或执行方。复用已有资源，Docker 为可选实现；数据库就绪不代表数据或业务断言通过。
