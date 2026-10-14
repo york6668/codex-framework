@@ -196,21 +196,18 @@ def session_start(framework, event):
         return {}
     # This hook never performs network I/O, runs another model, or decides permissions.
     context = ("Codex 共享框架启动检查：遵循当前用户指令和更高优先级约束。"
-               "本机已安装规范可继续使用；先读取 " + str(framework.home / REFERENCE) +
-               "，由当前任务使用已有 Codex 云端能力或 GitHub 原生连接检查 "
+               "前置工作站摘要若为异常或未知，先报告具体状态、归属限制和可执行的原任务核对；"
+               "已收到摘要无需重复调用观察入口。摘要缺席时只读运行 codex-framework workstation-entry，"
+               "未知保留未知，不递归枚举工作站；原任务记录从原生入口读取，节点原件仅按清单路径有界读取。"
+               "本机已安装规范可继续使用。新建、恢复或清空任务核对 GitHub 发布版本："
+               "先直接运行 codex-framework sync-status，再用当前可用的 Codex 仓库或 GitHub 原生入口读取 "
                "york6668/codex-framework 的 " + cf.BRANCH + " 分支。"
-               "云端入口不可用才使用同步器的本机 Git 回退；两边失败记录待用户处理并只提示一次。"
-               "版本未变不重复安装。有更新时按基线保护本机修改，随后重新读取 " +
-               str(framework.target(".codex/AGENTS.md")) +
-               " 和当前已使用且被更新的 Skill/相关引用。普通追加消息不联网；"
-               "后续仅明确已发布规范变更或用户要求时刷新。同步失败不阻断无依赖工作。"
-               "工作站摘要缺席时只运行 codex-framework workstation-entry 读取固定节点清单；"
-               "未知保留未知，不递归枚举工作站。异常按归属进入原任务，原件按清单路径有界读取。"
-               "按当前任务目标读取适用项目边界、偏好和原任务记录；属于既有纠偏时，"
-               "从原生记录与节点原件核对旧失败、修正版本及适用范围；先手动从本地正常入口复测可执行部分，"
-               "结果通过后才进入真实任务持续验证，长期效果另列验收，并在接续中实际使用纠正。"
-               "复杂或结果不明时可运行 codex-framework check 的 resume/feedback/close_issue，"
-               "其 ready 只表示已供来源的关系通过，不能代替原件真实性或目标验收。")
+               "需要刷新、入口故障或版本不明时再读 " + str(framework.home / REFERENCE) +
+               " 按其处理；常规启动不解析同步器源码。版本未变不重复安装，"
+               "有更新才按基线保护本机修改并重新读取更新后的全局及已使用 Skill。"
+               "同步失败标明待处理，继续无依赖工作；普通追加消息不联网。"
+               "复杂或结果不明时可用 codex-framework check 的 resume/feedback/close_issue，"
+               "其 ready 不代表实际完成；缺陷修正后先手动从本地正常入口复测。")
     try:
         import workstation_entry
         observation = workstation_entry.summary(framework.codex_home)

@@ -8,7 +8,7 @@ GitHub 项目是内容来源，Codex 云端执行环境是可选运行位置。�
 
 ## 读取来源与应用
 
-命令入口为 `$HOME/.local/bin/codex-framework`；显式安装到其他 Codex home 时沿用 `--codex-home <安装目录>`。先执行 `sync-status`，保存返回的 `expected_revision`，作为本次读取远端前的版本。它只用于防止并发同步覆盖较新的内容，不提供任务独占权。
+命令入口为 `$HOME/.local/bin/codex-framework`；显式安装到其他 Codex home 时沿用 `--codex-home <安装目录>`。普通启动直接按下列命令与已支持的远端入口核对；只有入口异常或确需修改同步器时才检查实现源码，不先读取或解析整套工具代码。已收到的工作站异常摘要可先用于首报，版本核对不阻断其可执行处置。先执行 `sync-status`，保存返回的 `expected_revision`，作为本次读取远端前的版本。它只用于防止并发同步覆盖较新的内容，不提供任务独占权。
 
 优先使用当前任务可调用的 Codex 仓库能力或 GitHub 原生连接，直接读取 GitHub 发布分支。当前 GitHub 连接可通过 `github_fetch` 读取 `https://api.github.com/repos/york6668/codex-framework/branches`，从中选取上述精确分支；避免把含 `/` 的分支名整个编码后当作单段 URL。工具可用性按当前任务发现，不要求固定工具前缀。
 
