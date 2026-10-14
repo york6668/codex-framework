@@ -6,7 +6,10 @@ history or grants permissions that the underlying platform has not granted.
 """
 
 import json
+import re
 import sys
+
+from source_evidence import verify as verify_source
 
 
 class CheckError(ValueError):
@@ -77,9 +80,9 @@ def evaluate(payload):
     for scope in project_scopes + task_scopes:
         covers(scope, resource(scope), False)
     phase = payload.get("phase", "action")
-    if phase not in ("action", "close_issue"):
-        raise CheckError("phase must be action or close_issue")
-    blocked, missing = [], []
+    if phase not in ("resume", "action", "feedback", "close_issue"):
+        raise CheckError("phase must be resume, action, feedback or close_issue")
+    blocked, missing, deviations = [], [], []
 
     def block(code):
         if code not in blocked:
@@ -88,6 +91,10 @@ def evaluate(payload):
     def need(code):
         if code not in missing:
             missing.append(code)
+
+    def deviate(code):
+        if code not in deviations:
+            deviations.append(code)
 
     if context.get("task_ref") != task_ref:
         block("resume_original_task")
@@ -100,9 +107,16 @@ def evaluate(payload):
         if ref in evidence or record.get("source") not in ("codex", "node"):
             raise CheckError("evidence references must be unique and name a native or node source")
         if set(record) - {"ref", "source", "kind", "project_id", "task_ref", "version",
-                           "result", "related_ref"}:
+                           "result", "related_ref", "digest", "resource", "native_item_id",
+                           "node_path"}:
             raise CheckError("evidence may contain only references and outcome metadata")
         evidence[ref] = record
+
+    action_input = payload.get("action")
+    strict_sources = (phase in ("resume", "feedback", "close_issue")
+                      or (phase == "action" and isinstance(action_input, dict)
+                          and (action_input.get("kind") in ("repair", "publish")
+                               or "recovery" in action_input)))
 
     def linked(ref, kind):
         record = evidence.get(ref)
@@ -111,9 +125,67 @@ def evaluate(payload):
                 or record.get("task_ref") != task_ref):
             need("unresolved_" + kind + "_reference")
             return None
+        if strict_sources and not verify_source(context, project, record):
+            need("unverified_" + kind + "_source")
+            return None
         return record
 
-    if phase == "action":
+    def check_corrections(target, selected):
+        selected = items(selected, "selected accepted corrections")
+        corrections = items(project.get("accepted_corrections", []), "project.accepted_corrections")
+        if corrections and not project.get("corrections_source_ref"):
+            need("accepted_corrections_source")
+        for correction in corrections:
+            correction = obj(correction, "accepted correction")
+            if overlaps(resource(correction.get("resource")), target):
+                ref = identifier(correction.get("ref"), "accepted correction.ref")
+                version = identifier(correction.get("version"), "accepted correction.version")
+                matching = [entry for entry in selected if isinstance(entry, dict) and entry.get("ref") == ref]
+                if not matching:
+                    need("accepted_correction_not_used")
+                elif any(entry.get("version") != version for entry in matching):
+                    block("stale_correction_version")
+                source_record = evidence.get(ref)
+                if (source_record is None or source_record.get("project_id") != project_id
+                        or source_record.get("kind") != "fix"
+                        or source_record.get("version") != version
+                        or not verify_source(context, project, source_record)):
+                    need("accepted_correction_unverified")
+
+    if phase == "resume":
+        resume = obj(payload.get("resume"), "resume")
+        target = resource(resume.get("resource"))
+        if (not any(covers(scope, target, False) for scope in project_scopes)
+                or not any(covers(scope, target, False) for scope in task_scopes)):
+            block("resume_outside_scope")
+        linked(resume.get("goal_ref"), "goal")
+        check_corrections(target, resume.get("accepted_corrections", []))
+    elif phase == "feedback":
+        feedback = obj(payload.get("feedback"), "feedback")
+        target = resource(feedback.get("resource"))
+        if (not any(covers(scope, target, False) for scope in project_scopes)
+                or not any(covers(scope, target, False) for scope in task_scopes)):
+            block("feedback_outside_task_scope")
+        expected = linked(feedback.get("expected_ref"), "expectation")
+        observed = linked(feedback.get("observed_ref"), "observation")
+        if expected and observed:
+            for fact in (expected, observed):
+                if resource(fact.get("resource")) != target:
+                    block("feedback_resource_mismatch")
+                if not isinstance(fact.get("digest"), str) or not re.fullmatch(r"[0-9a-f]{64}", fact["digest"]):
+                    raise CheckError("feedback digest must be a SHA-256 reference to the original value")
+            if expected["digest"] != observed["digest"]:
+                deviate("observed_result_differs_from_expectation")
+                prior_ref = feedback.get("prior_correction_ref")
+                if prior_ref:
+                    prior = evidence.get(prior_ref)
+                    if (prior is None or prior.get("kind") != "fix"
+                            or prior.get("project_id") != project_id
+                            or not verify_source(context, project, prior)):
+                        need("unverified_prior_correction")
+                    else:
+                        deviate("correction_ineffective_or_regressed")
+    elif phase == "action":
         action = obj(payload.get("action"), "action")
         kind = action.get("kind")
         if kind not in ("read", "write", "invoke", "repair", "publish"):
@@ -124,6 +196,7 @@ def evaluate(payload):
             block("outside_project_scope")
         if not any(covers(scope, target, write) for scope in task_scopes):
             block("outside_task_scope")
+        check_corrections(target, action.get("accepted_corrections", []))
         required = items(action.get("capabilities", []), "action.capabilities")
         available = items(context.get("capabilities", []), "context.capabilities")
         if any(capability not in available for capability in required):
@@ -198,6 +271,17 @@ def evaluate(payload):
             if defect.get("cause_layer") not in (
                     "rules", "execution", "implementation", "data", "environment", "tool_context"):
                 need("root_cause_layer")
+            authorization = linked(defect.get("authorization_ref"), "authorization")
+            if authorization is None or authorization.get("result") != "granted":
+                need("repair_authorization")
+            affected = items(defect.get("affected_resources", []), "action.defect.affected_resources")
+            if not affected:
+                need("affected_scope")
+            for entry in affected:
+                candidate = resource(entry)
+                if (not any(covers(scope, candidate, False) for scope in project_scopes)
+                        or not any(covers(scope, candidate, False) for scope in task_scopes)):
+                    block("affected_scope_outside_task")
             if (failure and failure.get("kind") == "context_unavailable"
                     and defect.get("cause_layer") == "implementation"):
                 block("tool_context_is_not_implementation_defect")
@@ -220,16 +304,18 @@ def evaluate(payload):
                     or not any(covers(scope, target, True) for scope in task_scopes)):
                 block("issue_outside_scope")
 
-        for key in ("failure_ref", "cause_ref", "fix_ref"):
+        for key in ("goal_ref", "failure_ref", "cause_ref", "fix_ref", "acceptance_ref"):
             if not issue.get(key):
                 need(key)
-        for key, kind in (("failure_ref", "failure"), ("cause_ref", "cause"),
-                          ("fix_ref", "fix")):
+        for key, kind in (("goal_ref", "goal"), ("failure_ref", "failure"),
+                          ("cause_ref", "cause"), ("fix_ref", "fix"),
+                          ("acceptance_ref", "acceptance")):
             if issue.get(key):
                 linked(issue[key], kind)
         regression = obj(issue.get("regression", {}), "issue.regression")
         adoption = obj(issue.get("adoption", {}), "issue.adoption")
         effect = obj(issue.get("effect", {}), "issue.effect")
+        followup = obj(issue.get("followup", {}), "issue.followup")
         for key in ("original_ref", "affected_ref", "version"):
             if not regression.get(key):
                 need("regression_" + key)
@@ -251,12 +337,25 @@ def evaluate(payload):
                 or observed.get("result") != "observed"
                 or observed.get("version") != regression.get("version")):
             need("observed_effect")
+        acceptance = linked(issue.get("acceptance_ref"), "acceptance")
+        if (acceptance is None or acceptance.get("result") != "passed"
+                or acceptance.get("version") != regression.get("version")
+                or acceptance.get("related_ref") != issue.get("goal_ref")
+                or issue.get("acceptance_ref") in (regression.get("original_ref"),
+                                                    regression.get("affected_ref"))):
+            need("goal_acceptance_beyond_smoke_test")
+        continuation = linked(followup.get("ref"), "followup")
+        if (continuation is None or continuation.get("result") != "used_correction"
+                or continuation.get("version") != regression.get("version")
+                or continuation.get("related_ref") != issue.get("fix_ref")):
+            need("followup_used_correction")
         if not issue.get("acceptance_owner") or not issue.get("followup_owner"):
             need("completion_responsibility")
 
-    status = "blocked" if blocked else "needs_evidence" if missing else "ready"
-    return {"status": status, "blocked": blocked, "missing": missing,
-            "meaning": "input_consistency_only; platform authorization and source truth remain external"}
+    status = ("blocked" if blocked else "needs_evidence" if missing else
+              "deviation" if deviations else "ready")
+    return {"status": status, "blocked": blocked, "missing": missing, "deviations": deviations,
+            "meaning": "source_excerpt_and_input_consistency_only; provenance, authorization and goal semantics remain external"}
 
 
 def dispatch():

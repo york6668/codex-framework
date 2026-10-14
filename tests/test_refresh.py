@@ -187,6 +187,8 @@ class RefreshTests(FixtureCase):
             if source in ("startup", "resume", "clear"):
                 self.assertEqual(output["hookSpecificOutput"]["hookEventName"], "SessionStart")
                 self.assertIn(str(self.a.home / rf.REFERENCE), output["hookSpecificOutput"]["additionalContext"])
+                self.assertIn("原任务记录", output["hookSpecificOutput"]["additionalContext"])
+                self.assertIn("resume/feedback/close_issue", output["hookSpecificOutput"]["additionalContext"])
                 self.assertNotIn("continue", output)
             else:
                 self.assertEqual(output, {})

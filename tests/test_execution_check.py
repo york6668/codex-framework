@@ -1,4 +1,5 @@
 import contextlib
+import hashlib
 import io
 import json
 import sys
@@ -41,6 +42,30 @@ def fact(ref, kind, result=None, version=None):
     return value
 
 
+def bind_native_sources(request):
+    """Provide native-shaped source items; later mutations cannot alter them."""
+    entries = []
+    for record in request["context"]["evidence"]:
+        record["source"] = "codex"
+        record["native_item_id"] = record["ref"]
+        kind = record["kind"]
+        if kind in ("goal", "cause"):
+            body = "user requested complete behavior" if kind == "goal" else "diagnosed cause"
+            record["digest"] = hashlib.sha256(body.encode()).hexdigest()
+            item = {"id": record["ref"], "type": "userMessage" if kind == "goal" else "agentMessage",
+                    "text": body}
+        else:
+            body = "result " + str(record.get("version", ""))
+            failed = kind == "failure"
+            item = {"id": record["ref"], "type": "commandExecution",
+                    "status": "completed", "exitCode": 1 if failed else 0,
+                    "command": "verify " + kind, "output": {"text": body, "truncated": False}}
+        entries.append(item)
+    request["context"]["native_sources"] = [{"schemaVersion": 1,
+        "thread": {"id": request["task"]["native_ref"].removeprefix("codex:thread:")},
+        "turns": [{"items": entries}]}]
+
+
 class ActionChecks(unittest.TestCase):
     def test_project_isolation_and_task_scope(self):
         request = action_case()
@@ -81,6 +106,7 @@ class ActionChecks(unittest.TestCase):
                                            "cause_ref": "node:diagnosis", "correction_ref": "codex:tool:fix"}
         request["context"]["evidence"] = [fact("node:diagnosis", "cause"),
                                              fact("codex:tool:fix", "correction", "verified")]
+        bind_native_sources(request)
         self.assertEqual(check.evaluate(request)["status"], "ready")
         request["action"]["effect_key"] = "different-action"
         existing["task_ref"] = "codex:thread:other"
@@ -124,6 +150,7 @@ class ActionChecks(unittest.TestCase):
         request["context"]["evidence"] = [fact("node:test:release", "release_test", "passed", "commit:older")]
         self.assertIn("tested_release_version", check.evaluate(request)["missing"])
         request["context"]["evidence"][0]["version"] = "commit:abc"
+        bind_native_sources(request)
         self.assertEqual(check.evaluate(request)["status"], "ready")
 
 
@@ -134,6 +161,7 @@ class ClosureChecks(unittest.TestCase):
         request["phase"] = "close_issue"
         request["issue"] = {"task_ref": "codex:thread:framework-task", "project_id": "framework",
                             "resource": {"kind": "repo", "id": "framework", "path": "scripts/check.py"},
+                            "goal_ref": "codex:user:goal", "acceptance_ref": "codex:run:goal",
                             "failure_ref": "codex:tool:failure", "cause_ref": "node:diagnosis",
                             "fix_ref": "codex:commit:fix", "acceptance_owner": "codex:thread:framework-task",
                             "followup_owner": "codex:thread:framework-task",
@@ -141,30 +169,37 @@ class ClosureChecks(unittest.TestCase):
                                            "affected_ref": "node:test:affected", "version": "commit:abc",
                                            "result": "passed"},
                             "adoption": {"ref": "codex:tool:install", "version": "commit:abc"},
-                            "effect": {"ref": "node:runtime:observation", "result": "observed"}}
+                            "effect": {"ref": "node:runtime:observation", "result": "observed"},
+                            "followup": {"ref": "codex:turn:continued"}}
         request["context"]["evidence"] = [
-            fact("codex:tool:failure", "failure"), fact("node:diagnosis", "cause"),
+            fact("codex:user:goal", "goal"),
+            fact("codex:tool:failure", "failure", "failed"), fact("node:diagnosis", "cause"),
             fact("codex:commit:fix", "fix"),
             fact("node:test:original", "regression_original", "passed", "commit:abc"),
             fact("node:test:affected", "regression_affected", "passed", "commit:abc"),
+            fact("codex:run:goal", "acceptance", "passed", "commit:abc"),
             fact("codex:tool:install", "adoption", "applied", "commit:abc"),
-            fact("node:runtime:observation", "effect", "observed", "commit:abc")]
-        request["context"]["evidence"][3]["related_ref"] = "codex:tool:failure"
+            fact("node:runtime:observation", "effect", "observed", "commit:abc"),
+            fact("codex:turn:continued", "followup", "used_correction", "commit:abc")]
+        request["context"]["evidence"][4]["related_ref"] = "codex:tool:failure"
+        request["context"]["evidence"][6]["related_ref"] = "codex:user:goal"
+        request["context"]["evidence"][9]["related_ref"] = "codex:commit:fix"
+        bind_native_sources(request)
         return request
 
     def test_closure_requires_actual_links_tested_adoption_and_effect(self):
         request = self.close_case()
         self.assertEqual(check.evaluate(request)["status"], "ready")
-        request["context"]["evidence"][-1]["result"] = "unknown"
+        request["context"]["evidence"][8]["result"] = "unknown"
         self.assertIn("observed_effect", check.evaluate(request)["missing"])
-        request["context"]["evidence"][-1]["result"] = "observed"
+        request["context"]["evidence"][8]["result"] = "observed"
         request["issue"]["adoption"]["version"] = "commit:older"
         self.assertIn("adopted_tested_version", check.evaluate(request)["missing"])
         request["issue"]["adoption"]["version"] = "commit:abc"
-        request["context"]["evidence"][3]["result"] = "failed"
+        request["context"]["evidence"][4]["result"] = "failed"
         self.assertIn("regression_passed", check.evaluate(request)["missing"])
-        request["context"]["evidence"][3]["result"] = "passed"
-        request["context"]["evidence"][3]["project_id"] = "trading"
+        request["context"]["evidence"][4]["result"] = "passed"
+        request["context"]["evidence"][4]["project_id"] = "trading"
         self.assertIn("unresolved_regression_original_reference", check.evaluate(request)["missing"])
 
     def test_full_log_copy_is_rejected(self):
@@ -172,6 +207,17 @@ class ClosureChecks(unittest.TestCase):
         request["context"]["evidence"][0]["body"] = "full private transcript"
         with self.assertRaises(check.CheckError):
             check.evaluate(request)
+
+    def test_smoke_pass_and_unverified_native_result_cannot_close_goal(self):
+        request = self.close_case()
+        request["issue"].pop("acceptance_ref")
+        self.assertIn("goal_acceptance_beyond_smoke_test", check.evaluate(request)["missing"])
+        request = self.close_case()
+        request["context"]["native_sources"][0]["turns"][0]["items"][4]["exitCode"] = 1
+        self.assertIn("unverified_regression_original_source", check.evaluate(request)["missing"])
+        request = self.close_case()
+        request["context"]["native_sources"][0]["turns"][0]["items"][8]["output"]["truncated"] = True
+        self.assertIn("unverified_effect_source", check.evaluate(request)["missing"])
 
 
 if __name__ == "__main__":
