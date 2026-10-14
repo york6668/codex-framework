@@ -95,6 +95,8 @@ def verify(context, project, record):
         item = _native_item(context, record)
         if item is None:
             return False
+        if record.get("kind") in ("authorization", "confirmation") and item.get("type") != "userMessage":
+            return False
         output = item.get("output")
         if isinstance(output, dict) and output.get("truncated") is not False:
             return False

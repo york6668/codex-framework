@@ -16,6 +16,16 @@ python3 scripts/codex_framework.py check < /tmp/current-action.json
 
 有副作用的动作还提供稳定的 `effect_key`、`context.native_snapshot_ref`、`native_snapshot_complete: true` 和相关 `native_operations` 的引用、任务、项目、资源、effect key 与 `succeeded|running|failed|unknown` 状态。这里的 complete 只表示**本次副作用范围内**的原生记录已读全；做不到就保留待核实，不能填 true 让检查通过。相同效果已成功、进行中或结果不明时不重复执行；失败后再试需对同一原任务提供失败引用、原因引用及已验证纠正引用。`depends_on` 指向已成功的原生操作；其他任务正在写同一资源或结果不明时先隔离冲突。操作需要能力或消耗额度时，同时提供节点快照引用、当前能力和剩余额度。入口或上下文失败只证明那次调用失败，不能据此断言功能缺失或实现缺陷。
 
+工作空间或授权范围有争议时，可在已有 `phase: action` 的临时输入中附 `action.workspace`：`channel` 仅记录协调入口名称，`execution_node` 取工具实际返回的执行机，`data_node` 是数据所在节点，`destination_node` 是实际操作结果/数据目的地，`side_effect` 为 `read|local_change|transfer|irreversible_delete|synthetic_test`。本地只读诊断沿用项目与任务的读取范围；本地写入等维护动作由 `authorization_ref` 指向原任务已授权的 `authorization` 证据，不因 `channel: cloud_threads` 再请一次许可。证据的 `workspace` 元数据列明已授权的 `execution_nodes`、`data_nodes`、`destination_nodes` 和 `side_effects`，且关联同一资源；这些字段必须按原用户请求和工具结果解释，程序只检查提供的关系，不从名称创造授权。源证据仍须经原生 item 与摘要核对。
+
+目的地与数据节点不同即属跨环境，需单独的 `transfer_authorization_ref` 和 `risk_review_ref`，后者指向说明必要性、数据/权限/运行影响及目的地的原生证据；本地维护授权不能自动覆盖。`irreversible_delete` 即使仍在本机，也需要针对确切资源的 `confirmation_ref`。`context.tool_failure` 若为 `platform_denied`，以被拒资源、`action_kind` 和可选的 `side_effect` 关联本动作；同一动作改通道仍是 `blocked`，另一独立获准动作不会因此整体失权。证据改变时只按实际平台规则复核，检查器结果从不解除平台拒绝或批准传输、删除。`ready` 仍只表示临时输入内部一致，不是审批回执。
+
+`authorization` 与 `confirmation` 的原生来源须是用户消息；助手说明或命令成功不能变成用户许可。证据摘要只绑定所给原文，程序不自动理解自然语言中的范围，执行者必须核对对象、节点、目的地与副作用确在原授权内。已有授权仍适用时复用原引用，不为每个内部操作创建新批准记录。
+
+同一操作遇到 `resource_exhausted` 时，检查器要求原失败、原因与已验证纠正的引用后才允许作为恢复重试；输出 `local_resource_diagnosis_before_retry` 指向本地取证和修复缺口，不代表需要再次找用户批准。读取获准的日志或执行独立修复不依赖该重试；`platform_denied` 则始终保留为外部拒绝，不能用本地诊断或更换通道消除。
+
+同一本地事故经历多次资源不足、工具故障或方案调整时，沿用原目标而非每步重定义。可附 `context.incident` 的原生 `goal_ref`、受影响 `resource`、`responsible_node`、原始 `data_node` 和获准 `destination_nodes`；每个相关动作的 `action.workspace.responsible_node` 必须保持原责任节点，真实数据位置与目的地不能偏离原边界，缺少工作空间事实则为 `needs_evidence`。云端合成代码测试只在有 `synthetic_fixture` 来源且不使用真实数据时可单列通过；它可以改变测试执行机，不改变本地事故责任或真实恢复目的地。若用户以后明确修改目标或授权，从新的原生用户证据更新这份临时输入；不能以 CI 成功、容量故障或协调工具名称暗中改写。该输入只为当前检查使用，不建立永久事故台账。
+
 `publish` 动作的 `release.version` 须与 `release.test_ref` 指向的已通过测试版本一致；提交或投递记录不能替代测试。原生工具仅返回命令退出码时，先核对实际副作用或产物，不能凭退出码把业务效果标为 `succeeded`。
 
 发现偏差时用 `phase: feedback`：`feedback.resource` 是观察对象，`expected_ref` 与 `observed_ref` 指向 `context.evidence` 中同一资源的 `expectation` 与 `observation`。两份记录的 SHA-256 摘要须与提供的原生 item 文本或节点文件内容一致，程序比较后输出 `deviation`。期望标准应在观察前形成；摘要差异是诊断入口，不自动确定根因或许可重试。已有修正无效或复发时给 `prior_correction_ref`，仍返回偏差并标记需重新处理。模型沿原失败、实际路径和影响对象确认原因。`repair` 动作需给出失败与根因引用、原因层、受影响资源及原任务 `authorization_ref`；它可指向已有用户授权，不要求每次常规修复重新请示。平台权限仍由平台执行。
@@ -23,6 +33,10 @@ python3 scripts/codex_framework.py check < /tmp/current-action.json
 项目原有契约、修正代码及回归测试是后续接续的来源；不另建纠正台账。下一轮从这些来源和原生任务记录读出适用纠正，在本次输入的 `project.accepted_corrections` 放入其引用、资源、版本，并以 `project.corrections_source_ref` 指向所核对来源。`resume` 或 `action` 的 `accepted_corrections` 应包含同一资源的纠正及同版依据；程序会要求临时证据中有可核验的旧修正原件，遗漏、旧版或来源缺失不会得到 `ready`。空数组本身不证明没有历史偏差。
 
 缺陷修复后用 `phase: close_issue` 核对本地准入、原目标、原失败、根因、修正、原场景及受影响路径复测、独立目标验收、正式采用版本、实际效果与后续接续。`issue.goal_ref` 和 `acceptance_ref` 必须关联；目标验收不能复用局部回归命令。原场景复测的 `related_ref` 指向原失败，目标验收指向原目标，后续接续指向修正；本地验证、回归、验收、采用、效果及接续版本须一致。仅命令退出 0 不证明业务目标完成，执行者须核对实际输出和目标语义。修后尚未正式采用、没有效果或没有后续使用证据时为 `needs_evidence`，但不得把可本地复测的部分推迟到后续任务。
+
+本地 Docker/OOM 事故中，云端合成 CI 的通过记录只能作为代码层的有限证据；`close_issue` 仍须独立的本地原失败复测、实际采用、资源与恢复效果及后续使用证据。日志未报错、临时容器健康或合成回放也不能冒充这些事实。若平台拒绝某次真实恢复或备份动作，保留该动作的外部阻断，但仍完成不依赖它的本地调查和修复，原任务持续负责待验部分。
+
+若这份临时检查输入带 `context.incident`，`close_issue` 还核对同一原目标与资源，并要求 `adoption` 和实际 `effect` 证据标明原责任节点的 `node_id`；云端 CI 的节点身份不能冒充本机采用或本地恢复。调用者须以工具返回和节点原件核实该身份，检查器只能比较提供的元数据，不能认证伪造的节点标签或代替真实恢复测试。
 
 反馈、恢复入口和缺陷关闭的来源核验：`context.native_sources` 可临时放 Codex `read_thread` 的原始 JSON 响应；Codex 证据用 `native_item_id` 指向其中 item，非命令文本以 `digest` 绑定。成功证据要求原生命令 `completed`、退出码 0、输出未截断，带版本的结果还须在命令或输出出现该版本。节点文件证据用 `project.root`、相对 `node_path` 和 `digest` 核对当前文件；`passed/applied/observed/used_correction` 还须由 JSON 文件同时给出相同 `result/version`。临时输入可含原生响应以供本次比对，不能提交到框架仓库或复制成长期日志；取不到完整原件时保留 `needs_evidence`。来源由当前任务的受支持接口取得，检查器不能认证任意调用者提供的 JSON 未被伪造。
 

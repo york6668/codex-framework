@@ -108,7 +108,7 @@ def evaluate(payload):
             raise CheckError("evidence references must be unique and name a native or node source")
         if set(record) - {"ref", "source", "kind", "project_id", "task_ref", "version",
                            "result", "related_ref", "digest", "resource", "native_item_id",
-                           "node_path"}:
+                           "node_path", "node_id", "workspace"}:
             raise CheckError("evidence may contain only references and outcome metadata")
         evidence[ref] = record
 
@@ -116,7 +116,8 @@ def evaluate(payload):
     strict_sources = (phase in ("resume", "feedback", "verify_local", "close_issue")
                       or (phase == "action" and isinstance(action_input, dict)
                           and (action_input.get("kind") in ("repair", "publish")
-                               or "recovery" in action_input)))
+                               or "recovery" in action_input or "workspace" in action_input
+                               or "incident" in context)))
 
     def linked(ref, kind):
         record = evidence.get(ref)
@@ -323,6 +324,94 @@ def evaluate(payload):
             if (failure.get("kind") == "context_unavailable"
                     and action.get("assertion") == "capability_missing"):
                 block("tool_context_is_not_capability_absence")
+            if (failure.get("kind") == "resource_exhausted" and failure.get("resource") is not None
+                    and resource(failure["resource"]) == target
+                    and failure.get("action_kind") == kind and kind != "repair"):
+                recovery = action.get("recovery")
+                if not isinstance(recovery, dict) or recovery.get("source_ref") != failure.get("ref"):
+                    need("local_resource_diagnosis_before_retry")
+                else:
+                    source = linked(recovery.get("source_ref"), "failure")
+                    cause = linked(recovery.get("cause_ref"), "cause")
+                    correction = linked(recovery.get("correction_ref"), "correction")
+                    if (source is None or cause is None or correction is None
+                            or correction.get("result") != "verified"):
+                        need("local_resource_diagnosis_before_retry")
+            if failure.get("kind") == "platform_denied" and failure.get("resource") is not None:
+                denied = resource(failure["resource"])
+                if (denied == target and failure.get("action_kind") == kind
+                        and (failure.get("side_effect") is None
+                             or not isinstance(action.get("workspace"), dict)
+                             or failure.get("side_effect") == action["workspace"].get("side_effect"))):
+                    block("platform_denied_action")
+        workspace = action.get("workspace")
+        incident = context.get("incident")
+        incident_target = None
+        if incident is not None:
+            incident = obj(incident, "context.incident")
+            incident_target = resource(incident.get("resource"))
+            if overlaps(incident_target, target) and workspace is None:
+                need("workspace_boundary_for_incident")
+        if workspace is not None:
+            workspace = obj(workspace, "action.workspace")
+            # The coordination channel is descriptive; the tool's actual node,
+            # data location and destination determine the workspace relation.
+            if workspace.get("channel") is not None:
+                identifier(workspace["channel"], "action.workspace.channel")
+            executor = identifier(workspace.get("execution_node"), "action.workspace.execution_node")
+            data_node = identifier(workspace.get("data_node"), "action.workspace.data_node")
+            destination = identifier(workspace.get("destination_node"), "action.workspace.destination_node")
+            side_effect = workspace.get("side_effect")
+            if side_effect not in ("read", "local_change", "transfer", "irreversible_delete",
+                                   "synthetic_test"):
+                raise CheckError("action.workspace.side_effect is invalid")
+            if (kind == "read") != (side_effect == "read"):
+                block("action_effect_mismatch")
+            if incident_target is not None and overlaps(incident_target, target):
+                linked(incident.get("goal_ref"), "goal")
+                responsible = identifier(incident.get("responsible_node"), "context.incident.responsible_node")
+                original_data = identifier(incident.get("data_node"), "context.incident.data_node")
+                allowed_destinations = items(incident.get("destination_nodes"),
+                                             "context.incident.destination_nodes")
+                if workspace.get("responsible_node") != responsible:
+                    block("incident_responsibility_drift")
+                if side_effect == "synthetic_test":
+                    fixture = (linked(workspace.get("fixture_ref"), "synthetic_fixture")
+                               if workspace.get("fixture_ref") else None)
+                    if fixture is None:
+                        need("synthetic_input_provenance")
+                else:
+                    if data_node != original_data:
+                        block("incident_data_boundary_drift")
+                    if destination not in allowed_destinations:
+                        block("incident_destination_drift")
+            cross_environment = destination != data_node
+            # A read already covered by project/task scopes needs no second grant.
+            if cross_environment or side_effect != "read":
+                auth_ref = workspace.get("transfer_authorization_ref" if cross_environment
+                                         else "authorization_ref")
+                authorization = linked(auth_ref, "authorization") if auth_ref else None
+                if authorization is None or authorization.get("result") != "granted":
+                    need("cross_environment_authorization" if cross_environment
+                         else "local_action_authorization")
+                else:
+                    authorized = obj(authorization.get("workspace", {}), "authorization.workspace")
+                    if (authorization.get("resource") != action.get("resource")
+                            or executor not in items(authorized.get("execution_nodes", []), "authorized execution_nodes")
+                            or data_node not in items(authorized.get("data_nodes", []), "authorized data_nodes")
+                            or destination not in items(authorized.get("destination_nodes", []), "authorized destination_nodes")
+                            or side_effect not in items(authorized.get("side_effects", []), "authorized side_effects")):
+                        block("outside_authorized_workspace")
+            if cross_environment:
+                review = linked(workspace.get("risk_review_ref"), "risk_review") if workspace.get("risk_review_ref") else None
+                if review is None or review.get("resource") != action.get("resource"):
+                    need("cross_environment_necessity_and_impacts")
+            if side_effect == "irreversible_delete":
+                confirmation = (linked(workspace.get("confirmation_ref"), "confirmation")
+                                if workspace.get("confirmation_ref") else None)
+                if (confirmation is None or confirmation.get("result") != "granted"
+                        or confirmation.get("resource") != action.get("resource")):
+                    need("irreversible_action_confirmation")
         if kind == "repair":
             defect = obj(action.get("defect", {}), "action.defect")
             if not defect.get("failure_ref") or not defect.get("cause_ref"):
@@ -404,6 +493,17 @@ def evaluate(payload):
                 or observed.get("result") != "observed"
                 or observed.get("version") != regression.get("version")):
             need("observed_effect")
+        incident = context.get("incident")
+        if incident is not None:
+            incident = obj(incident, "context.incident")
+            responsible = identifier(incident.get("responsible_node"), "context.incident.responsible_node")
+            if (issue.get("goal_ref") != incident.get("goal_ref")
+                    or (target is not None and target != resource(incident.get("resource")))):
+                block("incident_goal_or_resource_drift")
+            if applied is None or applied.get("node_id") != responsible:
+                need("local_adoption_at_responsible_node")
+            if observed is None or observed.get("node_id") != responsible:
+                need("local_runtime_effect_at_responsible_node")
         acceptance = linked(issue.get("acceptance_ref"), "acceptance")
         if (acceptance is None or acceptance.get("result") != "passed"
                 or acceptance.get("version") != regression.get("version")

@@ -49,10 +49,12 @@ def bind_native_sources(request):
         record["source"] = "codex"
         record["native_item_id"] = record["ref"]
         kind = record["kind"]
-        if kind in ("goal", "cause"):
-            body = "user requested complete behavior" if kind == "goal" else "diagnosed cause"
+        if kind in ("goal", "cause", "authorization", "confirmation"):
+            body = ("user requested complete behavior" if kind == "goal" else
+                    "diagnosed cause" if kind == "cause" else
+                    "user granted this action")
             record["digest"] = hashlib.sha256(body.encode()).hexdigest()
-            item = {"id": record["ref"], "type": "userMessage" if kind == "goal" else "agentMessage",
+            item = {"id": record["ref"], "type": "agentMessage" if kind == "cause" else "userMessage",
                     "text": body}
         else:
             body = "result " + str(record.get("version", ""))
@@ -183,6 +185,184 @@ class ActionChecks(unittest.TestCase):
         self.assertEqual(check.evaluate(request)["status"], "ready")
 
 
+class WorkspaceBoundaryChecks(unittest.TestCase):
+    def local_case(self):
+        request = action_case()
+        target = request["action"]["resource"]
+        request["action"]["workspace"] = {
+            "channel": "cloud_threads", "execution_node": "mac-mini", "data_node": "mac-mini",
+            "destination_node": "mac-mini", "side_effect": "local_change",
+            "authorization_ref": "codex:user:local-maintenance"}
+        self.add_user_evidence(request, "codex:user:local-maintenance", "authorization",
+                               "Local workstation maintenance is authorized", "granted", target,
+                               {"execution_nodes": ["mac-mini"], "data_nodes": ["mac-mini"],
+                                "destination_nodes": ["mac-mini"],
+                                "side_effects": ["read", "local_change"]})
+        return request
+
+    def add_user_evidence(self, request, ref, kind, text, result=None, target=None, workspace=None):
+        record = {"ref": ref, "source": "codex", "kind": kind, "project_id": "framework",
+                  "task_ref": request["task"]["native_ref"], "native_item_id": ref,
+                  "digest": hashlib.sha256(text.encode()).hexdigest()}
+        if result:
+            record["result"] = result
+        if target:
+            record["resource"] = target
+        if workspace:
+            record["workspace"] = workspace
+        request["context"].setdefault("evidence", []).append(record)
+        sources = request["context"].setdefault("native_sources", [{"schemaVersion": 1,
+            "thread": {"id": "framework-task"}, "turns": [{"items": []}]}])
+        sources[0]["turns"][0]["items"].append({"id": ref, "type": "userMessage", "text": text})
+
+    def test_coordination_channel_does_not_move_local_execution_or_renew_grant(self):
+        request = self.local_case()
+        self.assertEqual(check.evaluate(request)["status"], "ready")
+        request["action"]["workspace"]["channel"] = "local_cli"
+        self.assertEqual(check.evaluate(request)["status"], "ready")
+
+    def test_bounded_local_log_read_uses_existing_task_scope(self):
+        request = action_case()
+        request["action"]["kind"] = "read"
+        request["action"]["workspace"] = {
+            "channel": "cloud_threads", "execution_node": "mac-mini", "data_node": "mac-mini",
+            "destination_node": "mac-mini", "side_effect": "read"}
+        self.assertEqual(check.evaluate(request)["status"], "ready")
+
+    def test_local_tool_error_is_not_missing_user_authorization(self):
+        request = self.local_case()
+        request["context"]["tool_failure"] = {"kind": "context_unavailable",
+                                               "ref": "codex:tool:local-error"}
+        self.assertEqual(check.evaluate(request)["status"], "ready")
+        request["action"]["assertion"] = "capability_missing"
+        self.assertIn("tool_context_is_not_capability_absence", check.evaluate(request)["blocked"])
+
+    def test_agent_or_tool_text_cannot_be_user_authorization(self):
+        request = self.local_case()
+        request["context"]["native_sources"][0]["turns"][0]["items"][0]["type"] = "agentMessage"
+        self.assertIn("local_action_authorization", check.evaluate(request)["missing"])
+
+    def test_real_transfer_outside_local_grant_needs_specific_authorization_and_risk_review(self):
+        request = self.local_case()
+        workspace = request["action"]["workspace"]
+        workspace.update(destination_node="assistant-cloud", side_effect="transfer",
+                         transfer_authorization_ref="codex:user:local-maintenance")
+        result = check.evaluate(request)
+        self.assertIn("outside_authorized_workspace", result["blocked"])
+        self.assertIn("cross_environment_necessity_and_impacts", result["missing"])
+        workspace["channel"] = "local_cli"
+        self.assertIn("outside_authorized_workspace", check.evaluate(request)["blocked"])
+        workspace.pop("transfer_authorization_ref")
+        self.assertIn("cross_environment_authorization", check.evaluate(request)["missing"])
+
+    def test_irreversible_delete_requires_action_confirmation(self):
+        request = self.local_case()
+        request["context"]["evidence"][0]["workspace"]["side_effects"].append("irreversible_delete")
+        workspace = request["action"]["workspace"]
+        workspace["side_effect"] = "irreversible_delete"
+        self.assertIn("irreversible_action_confirmation", check.evaluate(request)["missing"])
+        workspace["confirmation_ref"] = "codex:user:delete-confirmation"
+        self.add_user_evidence(request, workspace["confirmation_ref"], "confirmation",
+                               "Confirm this specific irreversible deletion", "granted",
+                               request["action"]["resource"])
+        self.assertEqual(check.evaluate(request)["status"], "ready")
+
+    def test_platform_denial_stops_same_action_across_channels_not_independent_repair(self):
+        request = self.local_case()
+        request["context"]["tool_failure"] = {
+            "kind": "platform_denied", "ref": "codex:tool:denied",
+            "resource": request["action"]["resource"], "action_kind": "write",
+            "side_effect": "local_change"}
+        self.assertIn("platform_denied_action", check.evaluate(request)["blocked"])
+        request["action"]["workspace"]["channel"] = "different_thread"
+        self.assertIn("platform_denied_action", check.evaluate(request)["blocked"])
+        request["action"].pop("workspace")
+        self.assertIn("platform_denied_action", check.evaluate(request)["blocked"])
+        request["action"]["resource"] = {"kind": "repo", "id": "framework", "path": "scripts/other.py"}
+        request["action"]["effect_key"] = "independent-repair"
+        self.assertEqual(check.evaluate(request)["status"], "ready")
+
+    def test_local_capacity_does_not_authorize_other_project_shutdown(self):
+        request = self.local_case()
+        request["action"]["resource"] = {"kind": "service", "id": "other-project"}
+        result = check.evaluate(request)
+        self.assertIn("outside_project_scope", result["blocked"])
+        self.assertIn("outside_task_scope", result["blocked"])
+
+    def test_one_local_incident_keeps_responsibility_and_data_boundary_across_failures(self):
+        request = self.local_case()
+        target = request["action"]["resource"]
+        request["context"]["incident"] = {
+            "goal_ref": "codex:user:local-incident", "resource": target,
+            "responsible_node": "mac-mini", "data_node": "mac-mini",
+            "destination_nodes": ["mac-mini"]}
+        self.add_user_evidence(request, "codex:user:local-incident", "goal",
+                               "Diagnose and recover this incident on the local workstation")
+        request["action"]["workspace"]["responsible_node"] = "mac-mini"
+
+        # A repeated capacity failure asks for diagnosis, never a fresh grant.
+        request["context"]["tool_failure"] = {
+            "kind": "resource_exhausted", "resource": target,
+            "action_kind": "write", "ref": "codex:tool:capacity"}
+        result = check.evaluate(request)
+        self.assertIn("local_resource_diagnosis_before_retry", result["missing"])
+        self.assertNotIn("local_action_authorization", result["missing"])
+        log_read = json.loads(json.dumps(request))
+        log_read["action"]["kind"] = "read"
+        log_read["action"]["workspace"]["side_effect"] = "read"
+        log_read["action"]["workspace"].pop("authorization_ref")
+        self.assertEqual(check.evaluate(log_read)["status"], "ready")
+
+        # A tool-context failure does not revoke the old grant either.
+        request["context"]["tool_failure"] = {"kind": "context_unavailable", "ref": "codex:tool:local"}
+        self.assertEqual(check.evaluate(request)["status"], "ready")
+
+        # Cloud CI can test synthetic code while the incident stays owned locally.
+        cloud_test = json.loads(json.dumps(request))
+        cloud_test["context"].pop("tool_failure")
+        cloud_test["action"]["workspace"] = {
+            "channel": "cloud_threads", "execution_node": "assistant-cloud",
+            "data_node": "synthetic-fixture", "destination_node": "synthetic-fixture",
+            "responsible_node": "mac-mini", "side_effect": "synthetic_test",
+            "authorization_ref": "codex:user:synthetic-test", "fixture_ref": "codex:item:fixture"}
+        self.add_user_evidence(cloud_test, "codex:user:synthetic-test", "authorization",
+                               "Synthetic code-only CI is authorized", "granted", target,
+                               {"execution_nodes": ["assistant-cloud"],
+                                "data_nodes": ["synthetic-fixture"],
+                                "destination_nodes": ["synthetic-fixture"],
+                                "side_effects": ["synthetic_test"]})
+        self.add_user_evidence(cloud_test, "codex:item:fixture", "synthetic_fixture",
+                               "This fixture contains synthetic code data only")
+        self.assertEqual(check.evaluate(cloud_test)["status"], "ready")
+
+        # A later resource problem cannot turn that CI into a real cloud restore.
+        transfer = json.loads(json.dumps(request))
+        transfer["context"].pop("tool_failure")
+        transfer["action"]["workspace"].update(
+            channel="cloud_threads", destination_node="assistant-cloud",
+            responsible_node="assistant-cloud", side_effect="transfer",
+            transfer_authorization_ref="codex:user:local-maintenance")
+        result = check.evaluate(transfer)
+        self.assertIn("incident_responsibility_drift", result["blocked"])
+        self.assertIn("incident_destination_drift", result["blocked"])
+        self.assertIn("outside_authorized_workspace", result["blocked"])
+        self.assertIn("cross_environment_necessity_and_impacts", result["missing"])
+
+        # A real platform refusal stays bound to that transfer across channels.
+        transfer["context"]["tool_failure"] = {
+            "kind": "platform_denied", "resource": target, "action_kind": "write",
+            "side_effect": "transfer", "ref": "codex:tool:denied-transfer"}
+        transfer["action"]["workspace"]["channel"] = "local_cli"
+        self.assertIn("platform_denied_action", check.evaluate(transfer)["blocked"])
+
+        # The original local investigation is still authorized and responsible.
+        resumed_local = json.loads(json.dumps(transfer))
+        resumed_local["action"]["workspace"] = request["action"]["workspace"]
+        self.assertEqual(check.evaluate(resumed_local)["status"], "ready")
+        resumed_local["action"].pop("workspace")
+        self.assertIn("workspace_boundary_for_incident", check.evaluate(resumed_local)["missing"])
+
+
 class ClosureChecks(unittest.TestCase):
     def close_case(self):
         request = action_case()
@@ -238,6 +418,41 @@ class ClosureChecks(unittest.TestCase):
         request["context"]["evidence"][0]["body"] = "full private transcript"
         with self.assertRaises(check.CheckError):
             check.evaluate(request)
+
+    def test_synthetic_result_cannot_replace_local_runtime_recovery(self):
+        request = self.close_case()
+        request["issue"]["effect"] = {"ref": "node:test:adjacent", "result": "observed"}
+        self.assertIn("observed_effect", check.evaluate(request)["missing"])
+        request = self.close_case()
+        local_result = next(record for record in request["context"]["evidence"]
+                            if record["kind"] == "local_result")
+        local_result["result"] = "failed"
+        self.assertIn("local_verification_results", check.evaluate(request)["missing"])
+
+    def test_unfinished_local_incident_retains_followup_owner(self):
+        request = self.close_case()
+        request["issue"].pop("followup_owner")
+        self.assertIn("completion_responsibility", check.evaluate(request)["missing"])
+
+    def test_cloud_ci_cannot_close_incident_without_local_adoption_and_effect(self):
+        request = self.close_case()
+        request["context"]["incident"] = {
+            "goal_ref": request["issue"]["goal_ref"], "resource": request["issue"]["resource"],
+            "responsible_node": "mac-mini", "data_node": "mac-mini",
+            "destination_nodes": ["mac-mini"]}
+        result = check.evaluate(request)
+        self.assertIn("local_adoption_at_responsible_node", result["missing"])
+        self.assertIn("local_runtime_effect_at_responsible_node", result["missing"])
+        for record in request["context"]["evidence"]:
+            if record["kind"] in ("adoption", "effect"):
+                record["node_id"] = "assistant-cloud"
+        self.assertIn("local_runtime_effect_at_responsible_node", check.evaluate(request)["missing"])
+        for record in request["context"]["evidence"]:
+            if record["kind"] in ("adoption", "effect"):
+                record["node_id"] = "mac-mini"
+        self.assertEqual(check.evaluate(request)["status"], "ready")
+        request["issue"]["goal_ref"] = "codex:user:different-goal"
+        self.assertIn("incident_goal_or_resource_drift", check.evaluate(request)["blocked"])
 
     def test_smoke_pass_and_unverified_native_result_cannot_close_goal(self):
         request = self.close_case()
