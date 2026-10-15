@@ -132,6 +132,7 @@ def evaluate(payload):
     if phase not in ("resume", "action", "feedback", "verify_local", "close_issue", "progress"):
         raise CheckError("phase must be resume, action, feedback, verify_local, close_issue or progress")
     blocked, missing, deviations = [], [], []
+    access_route = None
 
     def block(code):
         if code not in blocked:
@@ -166,7 +167,7 @@ def evaluate(payload):
                       or (phase == "action" and isinstance(action_input, dict)
                           and (action_input.get("kind") in ("repair", "publish")
                                or "recovery" in action_input or "workspace" in action_input
-                               or "incident" in context)))
+                               or "incident" in context or "access" in action_input)))
 
     def linked(ref, kind):
         record = evidence.get(ref)
@@ -674,6 +675,87 @@ def evaluate(payload):
                 if (confirmation is None or confirmation.get("result") != "granted"
                         or confirmation.get("resource") != action.get("resource")):
                     need("irreversible_action_confirmation")
+        access = action.get("access")
+        if access is not None:
+            access = obj(access, "action.access")
+            choices = {
+                "resource_owner": ("managed_workstation", "external_business", "unknown"),
+                "identity_role": ("maintenance", "business", "test", "unknown"),
+                "authentication_path": ("existing_session", "managed_provider", "missing", "unknown",
+                                        "failed", "new_credentials", "native_authentication"),
+                "permission_change": ("none", "persistent"),
+                "secret_handling": ("provider_only", "expose", "transfer"),
+                "platform_requirement": ("none", "confirmation", "denied", "trust_record_edit"),
+            }
+            if set(access) - set(choices) - {"change_authorization_ref", "confirmation_ref"}:
+                raise CheckError("action.access may contain only classification and evidence references")
+            for field, allowed in choices.items():
+                if access.get(field) not in allowed:
+                    raise CheckError("action.access." + field + " is invalid")
+            # These are supplied facts, never credentials or a grant of authority.
+            access_route = "reuse_existing_authentication"
+            if "unknown" in (access["resource_owner"], access["identity_role"]):
+                need("resource_ownership_and_identity_purpose")
+                access_route = "discover_existing_authentication"
+            path = access["authentication_path"]
+            if path in ("missing", "unknown", "failed"):
+                need("existing_authentication_path")
+                access_route = "discover_existing_authentication"
+            if path == "native_authentication":
+                need("native_authentication_step")
+                access_route = "native_authentication_step_only"
+            if path == "failed":
+                block("failed_authentication_no_retry")
+            for failure in tool_failures(context):
+                if (failure.get("kind") == "authentication_failed"
+                        and failure.get("resource") is not None
+                        and overlaps(resource(failure["resource"]), target)
+                        and path in ("existing_session", "managed_provider", "new_credentials")):
+                    block("failed_authentication_no_retry")
+            changes = []
+            if path == "new_credentials":
+                changes.append("new_credentials")
+            if access["permission_change"] == "persistent":
+                changes.append("persistent_permission")
+            if access["secret_handling"] == "transfer":
+                changes.append("secret_transfer")
+                if not isinstance(workspace, dict) or workspace.get("side_effect") != "transfer":
+                    block("secret_transfer_workspace_required")
+            if changes:
+                access_route = "apply_authorized_access_change"
+                if kind == "read":
+                    block("access_change_requires_write_effect")
+                ref = access.get("change_authorization_ref")
+                grant = linked(ref, "authorization") if ref else None
+                approved = obj(grant.get("workspace", {}), "access authorization.workspace") if grant else {}
+                allowed_changes = items(approved.get("access_changes", []), "authorized access_changes")
+                if (grant is None or grant.get("result") != "granted"
+                        or grant.get("resource") != action.get("resource")
+                        or any(change not in allowed_changes for change in changes)):
+                    need("specific_access_change_authorization")
+                    access_route = "resolve_specific_access_change"
+            if access["secret_handling"] == "expose":
+                block("secret_read_or_output_forbidden")
+            requirement = access["platform_requirement"]
+            if requirement == "confirmation":
+                ref = access.get("confirmation_ref")
+                confirmation = linked(ref, "confirmation") if ref else None
+                confirmed = obj(confirmation.get("workspace", {}), "confirmation.workspace") if confirmation else {}
+                effects = items(confirmed.get("effect_keys", []), "confirmation.workspace.effect_keys")
+                for effect in effects:
+                    identifier(effect, "confirmation effect_key")
+                if action.get("effect_key") is not None:
+                    identifier(action["effect_key"], "action.effect_key")
+                if (confirmation is None or confirmation.get("result") != "granted"
+                        or confirmation.get("resource") != action.get("resource")
+                        or not action.get("effect_key")
+                        or action["effect_key"] not in effects):
+                    need("native_action_confirmation")
+                    access_route = "native_confirmation"
+            elif requirement in ("denied", "trust_record_edit"):
+                block("platform_denied_action" if requirement == "denied" else "direct_trust_edit_forbidden")
+            if blocked:
+                access_route = "stop_affected_action"
         if kind == "repair":
             defect = obj(action.get("defect", {}), "action.defect")
             if not defect.get("failure_ref") or not defect.get("cause_ref"):
@@ -805,6 +887,8 @@ def evaluate(payload):
     result = {"status": status, "blocked": blocked, "missing": missing, "deviations": deviations,
               "continuous_eligible": continuous_eligible,
               "meaning": "source_excerpt_and_input_consistency_only; provenance, authorization and goal semantics remain external"}
+    if access_route is not None:
+        result["access_route"] = access_route
     if phase == "close_issue":
         validation = payload["issue"].get("independent_verification")
         attempts = validation.get("attempts", []) if isinstance(validation, dict) else []

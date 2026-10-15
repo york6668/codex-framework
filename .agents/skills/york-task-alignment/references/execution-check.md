@@ -65,3 +65,11 @@ python3 scripts/codex_framework.py check < /tmp/current-action.json
 输出 `blocked` 表示输入中的已知冲突，`deviation` 表示观察值与既有期望不符，`needs_evidence` 表示缺少决定所需事实，`ready` 仅表示这份输入内部一致。退出码分别是 2、2、2、0；格式错误为 1。检查器无法自行证明调用者提供的原始记录是否真实或完整，也不能拦截未经过它的工具调用；执行者仍须核对原件、遵守平台权限和业务授权。结果不明时先查询原动作，不能把一次新的检查当作重试许可。修订规则后用原失败输入和受影响行为复测；代码测试、文件安装和实际运行效果分别报告。
 
 独立验收适用性来自有效用户要求和项目契约，输入 `project.independent_verification_required: true` 表明该要求；已有 `independent_verification` 输入无论标记如何仍受核验。普通单任务修复没有此要求时不自动创建第二任务。检查器不能从布尔值识别自然语言中的义务，调用者仍须核对原生目标，不能填 false 回避明示要求。原生 `userMessage.content` 文本块和旧式 `text` 均可核对摘要；委托文本不自动变成直接用户授权。共享服务的并发写冲突按实际资源交叠检查，不能因项目 ID 不同略过；独立文件或命名空间可继续。
+
+## 可选认证与维护分流
+
+`phase: action` 可附 `action.access` 对照[认证与操作能力](../../york-workstation/references/environment-sync.md#入口、认证与操作能力)，无需为旧输入补填；不提供时保持原检查和退出语义。六项分类分别为 `resource_owner: managed_workstation|external_business|unknown`、`identity_role: maintenance|business|test|unknown`、`authentication_path: existing_session|managed_provider|missing|unknown|failed|new_credentials|native_authentication`、`permission_change: none|persistent`、`secret_handling: provider_only|expose|transfer`、`platform_requirement: none|confirmation|denied|trust_record_edit`。不接受秘密值、账号名或 `internal:true` 作为授权依据。
+
+既有会话或提供方且范围匹配时建议 `reuse_existing_authentication`；内部和外部身份都受原项目、任务、workspace 及平台拒绝检查，身份分类不创造权限。路径缺失/未知返回 `needs_evidence` 与 `discover_existing_authentication`，缺的是有界路径证据，不是重新申请维护权。失败路径或仍有效的 `context.tool_failures.kind: authentication_failed` 对同资源的认证重试返回 `failed_authentication_no_retry`；不登录的发现另用 `authentication_path: missing|unknown` 检查，只能读取允许的非敏感引用。普通 1045 不自动升级成平台硬拒绝。已证实只能由本人完成原生认证时，用 `native_authentication` 返回 `native_authentication_step_only`，仅交该步骤，不新增用途授权。
+
+新凭据、持久权限、秘密传输需要 `change_authorization_ref` 引用原生用户授权，关联相同资源、`result: granted`，其 `workspace.access_changes` 分别列 `new_credentials`、`persistent_permission`、`secret_transfer`；秘密传输还须提供真实 `action.workspace` 的 `transfer` 效果及原有目的地/风险核对，不能用本地读标签掩盖。`expose` 阻断秘密读取/输出，`trust_record_edit` 阻断直接改信任。平台逐次确认须原生 `confirmation_ref` 绑定同资源且其 `workspace.effect_keys` 含本动作 `effect_key`，不能用一般维护授权替代。`access_route` 仅给当前输入的下一步建议；实际受支持入口、真实认证是否可用、原授权语义和平台确认仍由执行者核验，不是登录工具或自动审批。

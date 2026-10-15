@@ -484,6 +484,190 @@ class WorkspaceBoundaryChecks(unittest.TestCase):
         self.assertIn("workspace_boundary_for_incident", check.evaluate(resumed_local)["missing"])
 
 
+class AccessRoutingChecks(unittest.TestCase):
+    local_case = WorkspaceBoundaryChecks.local_case
+    add_user_evidence = WorkspaceBoundaryChecks.add_user_evidence
+
+    def access_case(self):
+        request = self.local_case()
+        request["action"]["kind"] = "read"
+        request["action"]["workspace"]["side_effect"] = "read"
+        request["action"]["workspace"].pop("authorization_ref")
+        request["action"]["access"] = {
+            "resource_owner": "managed_workstation", "identity_role": "maintenance",
+            "authentication_path": "managed_provider", "permission_change": "none",
+            "secret_handling": "provider_only", "platform_requirement": "none"}
+        return request
+
+    def test_existing_internal_maintenance_needs_no_new_identity_grant(self):
+        for path in ("managed_provider", "existing_session"):
+            with self.subTest(path=path):
+                request = self.access_case()
+                request["action"]["access"]["authentication_path"] = path
+                result = check.evaluate(request)
+                self.assertEqual(result["status"], "ready")
+                self.assertEqual(result["access_route"], "reuse_existing_authentication")
+                self.assertEqual(result["missing"], [])
+
+        # Normal provider lifecycle may update local session state within the old grant.
+        renewal = self.local_case()
+        renewal["action"]["access"] = self.access_case()["action"]["access"]
+        result = check.evaluate(renewal)
+        self.assertEqual(result["status"], "ready")
+        self.assertNotIn("specific_access_change_authorization", result["missing"])
+
+    def test_missing_gui_or_unsubmitted_auth_routes_to_discovery_not_new_grant(self):
+        for path in ("missing", "unknown"):
+            request = self.access_case()
+            request["action"]["access"]["authentication_path"] = path
+            result = check.evaluate(request)
+            self.assertEqual(result["status"], "needs_evidence")
+            self.assertEqual(result["access_route"], "discover_existing_authentication")
+            self.assertEqual(result["missing"], ["existing_authentication_path"])
+            self.assertEqual(result["blocked"], [])
+
+        request = self.access_case()
+        request["action"]["access"]["authentication_path"] = "native_authentication"
+        result = check.evaluate(request)
+        self.assertEqual(result["missing"], ["native_authentication_step"])
+        self.assertEqual(result["access_route"], "native_authentication_step_only")
+
+    def test_failed_auth_stops_login_but_permits_non_login_discovery(self):
+        request = self.access_case()
+        request["context"]["tool_failures"] = [{"kind": "authentication_failed",
+            "resource": request["action"]["resource"], "ref": "codex:tool:1045"}]
+        for path in ("failed", "managed_provider", "existing_session", "new_credentials"):
+            request["action"]["access"]["authentication_path"] = path
+            self.assertIn("failed_authentication_no_retry", check.evaluate(request)["blocked"])
+        request["action"]["access"]["authentication_path"] = "missing"
+        result = check.evaluate(request)
+        self.assertEqual(result["status"], "needs_evidence")
+        self.assertEqual(result["blocked"], [])
+        self.assertEqual(result["access_route"], "discover_existing_authentication")
+
+    def test_external_business_and_test_identity_keep_original_scope(self):
+        for role in ("business", "test"):
+            request = self.access_case()
+            request["action"]["access"].update(resource_owner="external_business", identity_role=role)
+            self.assertEqual(check.evaluate(request)["status"], "ready")
+            request["action"]["resource"] = {"kind": "service", "id": "external-other"}
+            result = check.evaluate(request)
+            self.assertIn("outside_project_scope", result["blocked"])
+            self.assertIn("outside_task_scope", result["blocked"])
+
+    def test_internal_label_never_authorizes_unknown_or_outside_resource(self):
+        request = self.access_case()
+        request["action"]["access"]["resource_owner"] = "unknown"
+        self.assertIn("resource_ownership_and_identity_purpose", check.evaluate(request)["missing"])
+        request["action"]["access"]["resource_owner"] = "managed_workstation"
+        request["action"]["resource"]["path"] = "other-task/data"
+        self.assertIn("outside_task_scope", check.evaluate(request)["blocked"])
+
+    def test_temporary_session_is_not_persistent_access_but_new_changes_need_scope(self):
+        for field, value, change in (("authentication_path", "new_credentials", "new_credentials"),
+                                     ("permission_change", "persistent", "persistent_permission")):
+            with self.subTest(change=change):
+                request = self.local_case()
+                request["action"]["access"] = self.access_case()["action"]["access"]
+                request["action"]["access"][field] = value
+                result = check.evaluate(request)
+                self.assertIn("specific_access_change_authorization", result["missing"])
+                # A generic maintenance grant does not approve a new access effect.
+                request["action"]["access"]["change_authorization_ref"] = "codex:user:local-maintenance"
+                self.assertIn("specific_access_change_authorization", check.evaluate(request)["missing"])
+                self.add_user_evidence(request, "codex:user:change", "authorization",
+                    "Approve this specific access change", "granted", request["action"]["resource"],
+                    {"access_changes": [change]})
+                request["action"]["access"]["change_authorization_ref"] = "codex:user:change"
+                self.assertEqual(check.evaluate(request)["status"], "ready")
+                self.assertEqual(check.evaluate(request)["access_route"], "apply_authorized_access_change")
+                # A permission/credential change cannot masquerade as a metadata read.
+                request["action"]["kind"] = "read"
+                request["action"]["workspace"]["side_effect"] = "read"
+                self.assertIn("access_change_requires_write_effect", check.evaluate(request)["blocked"])
+                request["action"]["kind"] = "write"
+                request["action"]["workspace"]["side_effect"] = "local_change"
+                # Assistant text cannot manufacture the user change grant.
+                request["context"]["native_sources"][0]["turns"][0]["items"][-1]["type"] = "agentMessage"
+                self.assertIn("specific_access_change_authorization", check.evaluate(request)["missing"])
+
+    def test_internal_provider_does_not_permit_secret_read_or_hidden_transfer(self):
+        request = self.access_case()
+        request["action"]["access"]["secret_handling"] = "expose"
+        self.assertIn("secret_read_or_output_forbidden", check.evaluate(request)["blocked"])
+        request["action"]["access"]["secret_handling"] = "transfer"
+        result = check.evaluate(request)
+        self.assertIn("secret_transfer_workspace_required", result["blocked"])
+        self.assertIn("specific_access_change_authorization", result["missing"])
+
+    def test_platform_confirmation_is_specific_and_separate_from_maintenance_grant(self):
+        request = self.access_case()
+        request["action"]["access"]["platform_requirement"] = "confirmation"
+        self.assertIn("native_action_confirmation", check.evaluate(request)["missing"])
+        self.add_user_evidence(request, "codex:user:confirm", "confirmation",
+            "Confirm this native action", "granted", request["action"]["resource"],
+            {"effect_keys": [request["action"]["effect_key"]]})
+        request["action"]["access"]["confirmation_ref"] = "codex:user:confirm"
+        self.assertEqual(check.evaluate(request)["status"], "ready")
+        request["action"]["effect_key"] = "another-effect"
+        self.assertIn("native_action_confirmation", check.evaluate(request)["missing"])
+
+    def test_native_confirmation_rejects_malformed_scope_and_substring_matching(self):
+        malformed = [[], None, "scope", {"effect_keys": "prefix-fix-check-1-suffix"},
+                     {"effect_keys": None}, {"effect_keys": [7]}, {"effect_keys": [""]}]
+        for workspace in malformed:
+            with self.subTest(workspace=workspace):
+                request = self.access_case()
+                request["action"]["access"].update(platform_requirement="confirmation",
+                                                    confirmation_ref="codex:user:confirm")
+                self.add_user_evidence(request, "codex:user:confirm", "confirmation",
+                    "Confirm the exact native effect", "granted", request["action"]["resource"])
+                request["context"]["evidence"][-1]["workspace"] = workspace
+                output = io.StringIO()
+                with contextlib.redirect_stdout(output), mock.patch("sys.stdin", io.StringIO(json.dumps(request))):
+                    self.assertEqual(framework.main(["check"]), 1)
+                self.assertEqual(json.loads(output.getvalue())["status"], "invalid")
+        # A valid list requires full element equality, never a substring.
+        request["context"]["evidence"][-1]["workspace"] = {"effect_keys": ["prefix-fix-check-1-suffix"]}
+        self.assertIn("native_action_confirmation", check.evaluate(request)["missing"])
+        request["context"]["evidence"][-1]["workspace"] = {"effect_keys": [request["action"]["effect_key"]]}
+        self.assertEqual(check.evaluate(request)["status"], "ready")
+
+    def test_internal_identity_does_not_clear_platform_denial_or_allow_trust_edit(self):
+        request = self.access_case()
+        for value, reason in (("denied", "platform_denied_action"),
+                              ("trust_record_edit", "direct_trust_edit_forbidden")):
+            request["action"]["access"]["platform_requirement"] = value
+            result = check.evaluate(request)
+            self.assertIn(reason, result["blocked"])
+            self.assertEqual(result["access_route"], "stop_affected_action")
+        request["action"]["access"]["platform_requirement"] = "none"
+        request["context"]["tool_failure"] = {"kind": "platform_denied", "action_kind": "read",
+            "resource": request["action"]["resource"], "side_effect": "read"}
+        request["action"]["workspace"]["channel"] = "different-thread-or-client"
+        self.assertIn("platform_denied_action", check.evaluate(request)["blocked"])
+
+    def test_optional_access_keeps_old_inputs_and_cli_exit_semantics(self):
+        request = self.local_case()
+        old = check.evaluate(request)
+        self.assertEqual(old["status"], "ready")
+        self.assertNotIn("access_route", old)
+        request = self.access_case()
+        request["action"]["access"]["authentication_path"] = "missing"
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output), mock.patch("sys.stdin", io.StringIO(json.dumps(request))):
+            self.assertEqual(framework.main(["check"]), 2)
+        self.assertEqual(json.loads(output.getvalue())["access_route"], "discover_existing_authentication")
+
+    def test_access_accepts_no_secret_payload_or_self_asserted_internal_bypass(self):
+        for key in ("internal", "authenticated", "password", "account"):
+            request = self.access_case()
+            request["action"]["access"][key] = True
+            with self.assertRaises(check.CheckError):
+                check.evaluate(request)
+
+
+
 class ClosureChecks(unittest.TestCase):
     def close_case(self):
         request = action_case()
