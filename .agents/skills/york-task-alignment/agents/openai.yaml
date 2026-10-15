@@ -1,6 +1,6 @@
 interface:
-  display_name: "任务对齐与纠偏"
-  short_description: "接续有效目标与成果，反复纠偏时扩大范围综合对齐需求历史和实现。"
-  default_prompt: "使用 $york-task-alignment 接续有效目标与成果，反复纠偏时扩大范围综合比较需求历史、更早版本与相关实现。"
+  display_name: "需求规划与交付"
+  short_description: "从首次需求选择方法、组织必要设计验证与依赖，接续有效目标并完成授权内交付。"
+  default_prompt: "使用 $york-task-alignment 从当前需求识别适用方法、必要设计验证与依赖，推进到授权内交付。"
 policy:
   allow_implicit_invocation: true

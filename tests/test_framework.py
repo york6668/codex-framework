@@ -310,8 +310,45 @@ class GitSyncTests(GitFixtureCase):
         self.assertEqual(before, self.client.collect(local=True))
 
 
+class MethodDeliveryTests(FixtureCase):
+    """Exercise installed method availability; these tests do not grade model routing."""
+
+    def test_deployed_method_links_are_self_contained(self):
+        self.apply()
+        for name in self.a.collect():
+            if not name.endswith(".md"):
+                continue
+            path = self.a.target(name)
+            for link in re.findall(r"\]\(([^)]+)\)", path.read_text()):
+                if "://" in link or link.startswith(("#", "$")):
+                    continue
+                destination = link.split("#", 1)[0]
+                if destination:
+                    self.assertTrue((path.parent / destination).is_file(),
+                                    name + " -> " + link)
+
+    def test_method_update_preserves_unpublished_work_and_delivers_independent_reference(self):
+        self.apply()
+        method = ".agents/skills/york-engineering/references/verification.md"
+        routing = ".agents/skills/york-task-alignment/SKILL.md"
+        adapter = ".agents/skills/york-java-test/SKILL.md"
+        local = self.a.target(method).read_text() + "\nLocal method refinement.\n"
+        put(self.a.target(method), local)
+        put(self.repo / method, (self.repo / method).read_text() + "\nIncoming method change.\n")
+        incoming = (self.repo / routing).read_text() + "\nUpdated routing reference.\n"
+        put(self.repo / routing, incoming)
+        before_adapter = self.a.target(adapter).read_bytes()
+        results = dict(self.a.reconcile(apply=True))
+        self.assertEqual(results[method], "conflict")
+        self.assertEqual(self.a.target(method).read_text(), local)
+        self.assertEqual(results[routing], "update")
+        self.assertEqual(self.a.target(routing).read_text(), incoming)
+        self.assertEqual(self.a.target(adapter).read_bytes(), before_adapter)
+        self.assertNotEqual(self.a.load_state()[method], (self.repo / method).read_bytes())
+
+
 class PackageTests(unittest.TestCase):
-    def test_nine_skill_names_match_directories(self):
+    def test_published_skill_names_match_directories(self):
         names = sorted(p.name for p in (ROOT / ".agents/skills").iterdir())
         self.assertEqual(names, sorted(cf.SKILLS))
         for name in names:

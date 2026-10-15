@@ -6,7 +6,7 @@ Mac mini 上的全局文档和 Skills 是部署副本，供 Codex 加载使用�
 
 | 归属 | 职责 |
 |---|---|
-| [york6668/codex-framework](https://github.com/york6668/codex-framework) | 共享框架的权威来源，维护用户偏好、9 个 York Skills、引用、记忆使用方法、配置模板、工作站环境与数据生命周期规范及分发工具；发布分支为 `york-worktree/Codex框架共享`。 |
+| [york6668/codex-framework](https://github.com/york6668/codex-framework) | 共享框架的权威来源，维护用户偏好、10 个 York Skills、引用、记忆使用方法、配置模板、工作站环境与数据生命周期规范及分发工具；发布分支为 `york-worktree/Codex框架共享`。 |
 | [york6668/btc-core-strategy](https://github.com/york6668/btc-core-strategy) | BTC 专属方法、核心 Skill 与闭环源码的权威来源；本仓只保留发现入口。 |
 | Mac mini | 保存实际数据、历史记录、设备配置和运行状态，按核心框架策略实现环境发现、按需同步、数据保留与清理，提供任务所需工具与执行资源，加载所属 GitHub 项目的部署副本。其他执行节点遵循同一来源关系。 |
 | Codex 云端执行环境 | 按需使用的另一执行环境，从同一 GitHub 项目安装框架；其配置、任务和环境发布不等于 GitHub 框架发布。 |
@@ -18,11 +18,28 @@ Mac mini 上的全局文档和 Skills 是部署副本，供 Codex 加载使用�
 ## 任务如何使用框架
 
 1. 冷启动（新建、恢复或清空任务）检查 GitHub 发布版本，补齐缺少的部署内容，对变化做兼容更新，再读取全局和适用仓库规范；Skills 正文及引用按当前需求选用。
-2. 按已读取的框架和 Skills 完成用户需求。纠偏时先手动复测本地正常入口的可验证行为，明确通过后再进入真实任务持续验证；长期效果单列后续验收。核心框架定义工作站的职责、策略设置和预期结果；具体数据单元识别项目环境、多环境时取得明确选择、发现服务并保存本地信息，按任务需要同步和核验数据，执行保留、过期与清理策略。方法见 [工作站入口](.codex/workstation/README.md)，工具与实际配置由节点实现。涉及多个节点或局部访问受阻时，按 [多机任务分工](.agents/skills/york-workstation/references/environment-sync.md#按依赖拆分多机任务) 明确各步骤及交接，继续已有授权内不依赖缺口的工作。
+2. 从用户要看到的结果出发，首次复杂需求按 [需求到交付](.agents/skills/york-task-alignment/SKILL.md) 自主选择方法和必要切片；代码设计与验证按 [通用工程](.agents/skills/york-engineering/SKILL.md)，明确小任务直接完成。纠偏时先手动复测本地正常入口的可验证行为，明确通过后再进入真实任务持续验证；长期效果单列后续验收。核心框架定义工作站的职责、策略设置和预期结果；具体数据单元识别项目环境、多环境时取得明确选择、发现服务并保存本地信息，按任务需要同步和核验数据，执行保留、过期与清理策略。方法见 [工作站入口](.codex/workstation/README.md)，工具与实际配置由节点实现。涉及多个节点或局部访问受阻时，按 [多机任务分工](.agents/skills/york-workstation/references/environment-sync.md#按依赖拆分多机任务) 明确各步骤及交接，继续已有授权内不依赖缺口的工作。
 3. 发现长期规范或方法缺口时，在所属 GitHub 项目的检出中修订正文及引用，按该项目授权发布；发布后刷新受影响的部署副本，并重新读取当前任务需要的修订。普通业务需求在所属业务仓库处理。
 4. 来源暂时不可用时沿用最后有效版本，保留数据和未发布修改，继续不依赖刷新的工作；普通追加消息和上下文压缩不重复联网刷新。
 
 当前会话的新要求立即生效，不等待发布；可复用的长期变更归回所属项目。发布、部署和当前任务读取分别核验，不能以文件已写入证明任务已采用。具体执行见 [同步方法](.agents/skills/york-codex-policy-maintenance/references/framework-sync.md)。
+
+## 方法职责与当前能力
+
+| 层次 / 入口 | 负责的结果与边界 |
+|---|---|
+| `.codex/AGENTS.md` | 稳定偏好、授权与拒绝、来源/数据/额度保护及方法发现指针。 |
+| [需求到交付](.agents/skills/york-task-alignment/SKILL.md) | 首次复杂工作、纵向切片、实际依赖、授权交接、结果回收及父目标接续；简单任务直接完成。模型执行方法，非自动调度程序。 |
+| [通用工程](.agents/skills/york-engineering/SKILL.md) | 任意语言的需求理解、职责/接口设计、缺陷反馈、验证及两轴审查；[Java](.agents/skills/york-java-test/SKILL.md) 负责 JDK/Maven/JUnit 等执行适配。 |
+| [跨仓契约](.agents/skills/york-cross-repo-change/SKILL.md)、[资料](.agents/skills/york-provider-docs/SKILL.md) | 生产消费边界、语义与 mapping；不反向定义用户新目标。 |
+| [日志](.agents/skills/york-log-query/SKILL.md)、[本地数据](.agents/skills/york-local-data/SKILL.md)、[工作站](.agents/skills/york-workstation/SKILL.md) | 按疑点取证、隔离数据及节点资源方法；真实系统操作仍按原授权。 |
+| [交付](.agents/skills/york-safe-delivery/SKILL.md)、[框架维护](.agents/skills/york-codex-policy-maintenance/SKILL.md) | 工作区/Git 交付及共同规则/分发；正式独立验收不由实施自签。 |
+| `check` → `execution_check` → `source_evidence` | 对给定输入关系和来源形状做确定性检查；不自主发现遗漏任务、不认证原件，不证明语义规划或真实完成。 |
+| `install/refresh` → 分发正文；`SessionStart` → 启动提示/节点摘要 | 白名单及三方更新保护未发布修改；Hook 不在空闲时唤醒模型。launcher 当前仍指向可变检出脚本，正文 applied_revision 不证明运行工具同版。 |
+
+通用验证正文由工程方法持有，Java 与交付入口引用；生命周期正文由任务方法持有，跨仓只补契约共存顺序与组合边界。规则索引见 [正文归属](.agents/skills/york-codex-policy-maintenance/references/policy-owners.yaml)。方法存在及可安装只证明静态/分发能力；真实模型发现、规划和执行须由正常获授权交互独立判断。
+
+后续依赖仍包括固定版本的执行工具与正文/输入兼容关系、原生来源适配与统一有界读取、结果后的主动协调及真实采用证据。当前方法重构不声称这些程序或行为已经实现，不移动 BTC 额度权威或节点实际配置。
 
 ## 在另一台电脑安装
 
@@ -68,7 +85,7 @@ python3 "$HOME/work/codex-framework/scripts/codex_framework.py" install
 以下是可选执行环境的部署方式。GitHub 仍持有共享框架；Mac mini 直接访问 GitHub 时无需先更新或启动这些环境。
 
 1. 在「设置 → Codex 云端 → 环境」维护私有环境。`codex-framework` 使用本仓的发布分支；`market-roles` 保留业务仓的 `main`，同时接入本框架发布分支作为共享规范来源。GitHub 连接只授予环境所需仓库的访问权限，业务仓不维护共享规范副本。
-2. 在框架实际检出目录运行下方安装和状态命令，纳入环境的 Install script；规则明确安装到 `$HOME/.codex`，9 个 Skills 及引用完整安装到 `$HOME/.agents/skills`。业务仓提供依赖契约和配置线索，执行节点按工作站规范准备任务所需能力；共享框架安装本身不启动业务服务或同步业务数据。
+2. 在框架实际检出目录运行下方安装和状态命令，纳入环境的 Install script；规则明确安装到 `$HOME/.codex`，10 个 Skills 及引用完整安装到 `$HOME/.agents/skills`。业务仓提供依赖契约和配置线索，执行节点按工作站规范准备任务所需能力；共享框架安装本身不启动业务服务或同步业务数据。
 3. Start skill 在任务开始时明确读取 `$HOME/.codex/AGENTS.md` 和当前仓库适用说明，并按需要使用 `$HOME/.agents/skills` 下的 York Skills；已读取的规范后续沿用。Codex 云端执行环境按实际安装与启动能力检查和采用 GitHub 发布版本；本机 SessionStart 的版本检查见上节。版本不变且部署完整时不重复安装或执行无关全量测试，worktree 按实际需要选择。业务仓自己的隔离和禁止真实发送边界继续生效。
 4. 准备验证后保存并发布环境，用新任务核验规则读取和至少一个适用 Skill。长期规范先发布到 GitHub，再更新受影响环境的源码与安装内容；需要重新发布 Codex 环境时另行核验该结果。已有任务保留自己的状态，采用修订时读取相关部分。仓库刷新不会重新执行安装；GitHub 发布、保存环境配置草稿、发布环境和新任务验证分别报告，接口未支持的步骤不能称为完成。
 

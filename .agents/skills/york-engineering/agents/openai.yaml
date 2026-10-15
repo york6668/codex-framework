@@ -1,0 +1,6 @@
+interface:
+  display_name: "代码设计与行为验证"
+  short_description: "为任意语言开发、缺陷诊断与测试选择合适设计边界，验证用户要求和真实行为。"
+  default_prompt: "使用 $york-engineering 理解当前代码需求，完成必要设计、实施与行为验证。"
+policy:
+  allow_implicit_invocation: true
