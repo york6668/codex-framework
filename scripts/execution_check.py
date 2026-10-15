@@ -256,6 +256,8 @@ def evaluate(payload):
         steps = items(progress.get("steps", []), "progress.steps")
         if len(steps) > 32:
             raise CheckError("progress has too many remaining steps")
+        if claim == "working" and not steps:
+            need("remaining_steps_unlisted")
         decisions = []
         by_id = {}
         for entry in steps:
@@ -329,7 +331,19 @@ def evaluate(payload):
         if (not any(covers(scope, target, False) for scope in project_scopes)
                 or not any(covers(scope, target, False) for scope in task_scopes)):
             block("resume_outside_scope")
-        linked(resume.get("goal_ref"), "goal")
+        goal = linked(resume.get("goal_ref"), "goal")
+        if goal is not None:
+            for candidate in evidence.values():
+                if (candidate.get("kind") != "goal" or candidate.get("ref") == goal["ref"]
+                        or candidate.get("project_id") != project_id
+                        or candidate.get("task_ref") != task_ref):
+                    continue
+                if not verify_source(context, project, candidate):
+                    need("goal_source_unverified")
+                elif native_precedes(context, goal, candidate):
+                    need("newer_goal_requires_scope_review")
+                elif not native_precedes(context, candidate, goal):
+                    need("goal_order_unverified")
         check_corrections(target, resume.get("accepted_corrections", []))
         if resume.get("stage") == "continuous":
             check_local_verification(resume.get("local_verification"), target,

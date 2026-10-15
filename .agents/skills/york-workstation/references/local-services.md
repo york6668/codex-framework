@@ -6,6 +6,8 @@
 
 先用 `command -v docker`、`docker context show` 和所选 context 的 endpoint 核对实际执行位置，再读取相关 Compose 项目标签、容器、端口和挂载。区分本机 daemon、远程 daemon、named volume 与宿主机业务目录；同名容器和端口不能证明属于本机授权范围。优先显式选择已核实的 context，避免改变其他任务使用的共享默认。
 
+Compose 项目、网络和“开发”用途只帮助定位实际实例，不决定管理负责人或是否允许跨任务共享。按[资源生命周期](resource-lifecycle.md#发现与归属)先分清管理归属与消费者，再核对数据/权限隔离、容量及恢复；不同项目可复用同一服务实例，不能仅因标签拆分或仅因可连接就合并数据。
+
 Docker 只读调用遇到 `docker.sock permission denied` 时，核实所选 context 的 endpoint、socket 所属机器及当前命令的执行沙箱；在已委托范围内使用当前工具正式支持的执行升级或正常环境修复，再以同一目标的只读调用验证。该报错本身不证明需要用户代跑命令，也不授权修改 socket 权限、Docker 安全设置或绕过平台明确拒绝。若正式途径被拒绝，仅停止受影响调用，继续不依赖它的工作。
 
 读取实际工具的 README、帮助和必要源码，确认当前操作支持的服务及副作用；不要将完整容器环境变量或认证配置输出到聊天。已有 `dbctl` 时可参考 [可选 dbctl 实现](../../york-local-data/references/dbctl-operations.md)，普通 Docker/Compose 或其他本机实现同样适用。

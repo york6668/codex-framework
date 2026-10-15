@@ -98,6 +98,35 @@ def attach_local_verification(request, target, version):
 
 
 class ActionChecks(unittest.TestCase):
+    def test_resume_flags_newer_user_goal_without_deciding_its_meaning(self):
+        request = action_case()
+        helper = WorkspaceBoundaryChecks()
+        helper.add_user_evidence(request, "codex:user:old-goal", "goal", "Old scheduling goal")
+        helper.add_user_evidence(request, "codex:user:new-goal", "goal", "Current resource goal")
+        request["phase"] = "resume"
+        request["resume"] = {"resource": request["action"]["resource"],
+                             "goal_ref": "codex:user:old-goal"}
+        self.assertIn("newer_goal_requires_scope_review", check.evaluate(request)["missing"])
+        request["resume"]["goal_ref"] = "codex:user:new-goal"
+        self.assertEqual(check.evaluate(request)["status"], "ready")
+        old_item, new_item = request["context"]["native_sources"][0]["turns"][0]["items"]
+        request["context"]["native_sources"] = [
+            {"schemaVersion": 1, "thread": {"id": "framework-task"},
+             "turns": [{"items": [old_item]}]},
+            {"schemaVersion": 1, "thread": {"id": "framework-task"},
+             "turns": [{"items": [new_item]}]}]
+        self.assertIn("goal_order_unverified", check.evaluate(request)["missing"])
+
+    def test_agent_goal_cannot_be_used_as_direct_user_goal(self):
+        request = action_case()
+        WorkspaceBoundaryChecks().add_user_evidence(
+            request, "codex:agent:goal", "goal", "Agent restates a past goal")
+        request["context"]["native_sources"][0]["turns"][0]["items"][0]["type"] = "agentMessage"
+        request["phase"] = "resume"
+        request["resume"] = {"resource": request["action"]["resource"],
+                             "goal_ref": "codex:agent:goal"}
+        self.assertIn("unverified_goal_source", check.evaluate(request)["missing"])
+
     def test_project_isolation_and_task_scope(self):
         request = action_case()
         self.assertEqual(check.evaluate(request)["status"], "ready")

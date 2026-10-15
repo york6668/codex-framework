@@ -8,6 +8,8 @@
 
 `claim: waiting` 仅在没有独立可执行或待取证步骤、剩余步骤均直接受拒或依赖受阻，且直接拒绝的 `ref` 有可核原生 `failure` 证据时返回 `wait_allowed: true`。缺少失败原件、仍可本地归因或仍需核对旧资源测量时不能宣布全面等待。资源与额度动作在 `progress` 中须提供当前节点观察的 `node_snapshot_observed_at`（带时区）及 `node_snapshot_max_age_seconds`，过期或缺失不会给出 `ready`；单动作输入若提供这两个字段也检查时效。观察时间必须来自节点原件，不因重新读取而刷新；程序只比较所给值，来源真实性仍须用工作站检查和原生记录核实。
 
+`claim: working` 却没有列出剩余步骤时返回 `remaining_steps_unlisted`；这不能说明已全部完成或正在持续跟踪。未尝试的消费者只读核对等独立步骤应列为待做，不能伪造成平台拒绝。检查只覆盖调用者列出的步骤，仍须对照原任务核实完整性。
+
 `claim: completed` 仍需目标验收来源，且不能留下剩余步骤；本地事故还须使用 `close_issue` 核对实际节点采用和效果，合成 CI 不能替代。`continuous_tracking` 始终返回未验证：静态检查与 SessionStart Hook 不提供空闲时模型执行或未来唤醒保证。若没有实际执行机会，只能报告当前无法持续跟踪。此入口不自动拦截计划工具、等待或交接，使用点依任务规范由模型执行，真实行为仍需正常任务入口复测。
 
 先从 Codex 原生 `read_thread(includeOutputs=true)` 定位原线程、用户目标与相关工具调用；从节点实际入口读取能力、预算、数据状态及采用版本。项目规范、Git 提交和节点事实仍在原处。把适用规范引用、项目与任务范围、原线程、拟执行动作及相关来源放入临时 JSON，经标准输入调用：
@@ -19,6 +21,8 @@ python3 scripts/codex_framework.py check < /tmp/current-action.json
 输入的 `project.id` 和 `task.project_id` 必须一致，`task.native_ref` 与 `context.task_ref` 都指向要接续的同一原生线程（`codex:thread:<id>`）。`project.scopes`、`task.scopes` 分别给出项目和本任务范围；每项由 `kind`、`id`、可选的相对 `path` 与 `access: read|write` 组成。`action.resource` 使用同样的身份字段，`kind` 是 `read|write|invoke|repair|publish`。资源身份应取自实际仓库、数据或服务，不用路径相似性推断归属。范围和路径的包含检查会拒绝跨项目及同项目其他任务越界。
 
 新建或恢复相关任务时，`phase: resume` 以 `resume.resource`、`resume.goal_ref` 和选中的 `resume.accepted_corrections` 核对原目标来源、项目与任务边界、适用的旧纠正及其版本。先从项目现有契约和原任务历史识别适用纠正；程序无法自行发现调用者遗漏的项目历史。`ready` 后仍须在本轮行为中实际使用纠正并留下原生记录。接续若要进入真实持续验证，标明 `resume.stage: continuous`、`resume.version` 和 `resume.local_verification`；缺少本地复测计划或结果不得进入该阶段。普通 `work` 或 `local` 接续不因此被阻断。
+
+`goal_ref` 必须指向原生用户消息；将同一原任务中所有相关的直接用户目标及纠正作为临时证据提供。若其中可核的较新目标晚于选定目标，`resume` 返回 `newer_goal_requires_scope_review`：模型须判断较新消息是替换、补充还是独立要求，重定当前产出并保留仍有效的旧事项；多个来源无法判定先后则返回 `goal_order_unverified`。检查器不能只凭顺序理解消息语义，也不能发现被调用者遗漏的消息。来源或跨任务转交不完整时保留具体缺口，不以旧摘要填补。`resume` 是接续时的有界自检，不是所有动作的自动拦截。
 
 纠偏的本地复测先于真实持续验证。先在原任务中固定可手动执行的原失败和受影响行为、输入、预期、适用版本与正常入口；长期效果确实无法本地复现时说明理由及单独的后续验收，不用这个理由跳过其他本地检查。手动执行一次固定案例，失败先定位修复，沿同一输入再测，不反复生成测试直到碰巧通过。若修复涉及 Hook 自动加载，必须在正常 CLI 启动中观察专属注入内容或受支持的 Hook 事件；单独运行 handler、查看配置或等待将来任务都不能代替。平台不暴露该证据时如实保留未验证。`phase: verify_local` 接受 `local_verification.resource`、`version`、`plan_ref` 和非空 `cases`。每个 case 给唯一 `id`、`resource`、`expected_ref`、`observed_ref`。计划来源为原生 `local_plan` item，正文含版本、每项 `case:<id> expected:<SHA-256>`；预期来源为 `local_expectation`，其 `related_ref` 指向计划；实际来源为 `local_result`，其 `related_ref` 指向预期，版本与被验证版本一致。预期和实际文本摘要必须相同，实际来源须为完成、退出码 0、输出未截断且含版本的原生命令；`result: passed` 单独无效。程序检查来源片段、版本与精确输出，执行者还须核实计划覆盖完整可执行风险、原生来源真实性、计划先于实测及输出的业务语义。`ready` 仅表示这些可验证输入满足本地准入，不代表未来效果已经发生。输出 `continuous_eligible` 仅在本地准入通过、连续阶段接续通过或缺陷关闭检查通过时为 true；普通 `resume` 即使 `ready` 仍为 false。关闭问题的 `issue.local_verification` 使用同一计划与案例；`resume(stage=continuous)` 也重复检查，不会凭先前标签跳过。
 

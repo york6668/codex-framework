@@ -91,11 +91,13 @@ def verify(context, project, record):
     still interprets goals, diagnoses causes and observes downstream effects.
     """
     source = record.get("source")
+    if record.get("kind") == "goal" and source != "codex":
+        return False
     if source == "codex":
         item = _native_item(context, record)
         if item is None:
             return False
-        if record.get("kind") in ("authorization", "confirmation") and item.get("type") != "userMessage":
+        if record.get("kind") in ("goal", "authorization", "confirmation") and item.get("type") != "userMessage":
             return False
         output = item.get("output")
         if isinstance(output, dict) and output.get("truncated") is not False:

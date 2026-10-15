@@ -13,6 +13,28 @@ import test_execution_check as fixtures
 
 
 class ProgressChecks(unittest.TestCase):
+    def test_after_failure_cannot_claim_working_without_remaining_steps(self):
+        request = self.progress(self.base())
+        request["progress"]["steps"] = []
+        self.assertIn("remaining_steps_unlisted", check.evaluate(request)["missing"])
+
+    def test_new_goal_and_scoped_refusal_require_both_resume_and_progress(self):
+        request = self.base()
+        helper = fixtures.WorkspaceBoundaryChecks()
+        helper.add_user_evidence(request, "codex:user:old-goal", "goal", "Old scheduling goal")
+        helper.add_user_evidence(request, "codex:user:new-goal", "goal", "Current resource goal")
+        request["phase"] = "resume"
+        request["resume"] = {"resource": request["action"]["resource"],
+                             "goal_ref": "codex:user:old-goal"}
+        self.assertIn("newer_goal_requires_scope_review", check.evaluate(request)["missing"])
+        request["resume"]["goal_ref"] = "codex:user:new-goal"
+        self.assertEqual(check.evaluate(request)["status"], "ready")
+        request = self.progress(request)
+        result = check.evaluate(request)
+        self.assertEqual({step["id"]: step["state"] for step in result["steps"]},
+                         {"restore": "direct_refusal", "verify": "dependency_blocked",
+                          "diagnose": "ready"})
+
     def base(self):
         request = fixtures.WorkspaceBoundaryChecks().local_case()
         target = request["action"]["resource"]
