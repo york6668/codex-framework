@@ -6,7 +6,7 @@
 
 `context.tool_failures` 可列出多条仍有效的失败；原有单条 `tool_failure` 输入继续兼容，若两者同时存在会合并检查。每条平台拒绝按实际资源、原件提供的 effect_key、目的地与副作用匹配；write 改称 invoke 或更换通道、线程不会消除同一拒绝；资源路径的父子范围也会匹配。只把直接拒绝及其已证依赖标为暂停，其他获准动作单独检查。调用者须从原生记录保留所有仍有效的失败，检查器不能从省略的输入恢复历史；权限或事实确实改变时依原目标和平台规则复核，不能借输入删去拒绝来重试。
 
-`claim: waiting` 仅在没有独立可执行或待取证步骤、剩余步骤均直接受拒或依赖受阻，且直接拒绝的 `ref` 有可核原生 `failure` 证据时返回 `wait_allowed: true`。缺少失败原件、仍可本地归因或仍需核对旧资源测量时不能宣布全面等待。资源与额度动作在 `progress` 中须提供当前节点观察的 `node_snapshot_observed_at`（带时区）及 `node_snapshot_max_age_seconds`，过期或缺失不会给出 `ready`；单动作输入若提供这两个字段也检查时效。观察时间必须来自节点原件，不因重新读取而刷新；程序只比较所给值，来源真实性仍须用工作站检查和原生记录核实。
+`claim: waiting` 还需下面的本轮目标回看原件；仅在没有独立可执行或待取证步骤、剩余步骤均直接受拒或依赖受阻，且直接拒绝的 `ref` 有可核原生 `failure` 证据时返回 `wait_allowed: true`。缺少失败原件、仍可本地归因或仍需核对旧资源测量时不能宣布全面等待。资源与额度动作在 `progress` 中须提供当前节点观察的 `node_snapshot_observed_at`（带时区）及 `node_snapshot_max_age_seconds`，过期或缺失不会给出 `ready`；单动作输入若提供这两个字段也检查时效。观察时间必须来自节点原件，不因重新读取而刷新；程序只比较所给值，来源真实性仍须用工作站检查和原生记录核实。
 
 `claim: working` 却没有列出剩余步骤时返回 `remaining_steps_unlisted`；这不能说明已全部完成或正在持续跟踪。未尝试的消费者只读核对等独立步骤应列为待做，不能伪造成平台拒绝。检查只覆盖调用者列出的步骤，仍须对照原任务核实完整性。
 
@@ -73,3 +73,11 @@ python3 scripts/codex_framework.py check < /tmp/current-action.json
 既有会话或提供方且范围匹配时建议 `reuse_existing_authentication`；内部和外部身份都受原项目、任务、workspace 及平台拒绝检查，身份分类不创造权限。路径缺失/未知返回 `needs_evidence` 与 `discover_existing_authentication`，缺的是有界路径证据，不是重新申请维护权。失败路径或仍有效的 `context.tool_failures.kind: authentication_failed` 对同资源的认证重试返回 `failed_authentication_no_retry`；不登录的发现另用 `authentication_path: missing|unknown` 检查，只能读取允许的非敏感引用。普通 1045 不自动升级成平台硬拒绝。已证实只能由本人完成原生认证时，用 `native_authentication` 返回 `native_authentication_step_only`，仅交该步骤，不新增用途授权。
 
 新凭据、持久权限、秘密传输需要 `change_authorization_ref` 引用原生用户授权，关联相同资源、`result: granted`，其 `workspace.access_changes` 分别列 `new_credentials`、`persistent_permission`、`secret_transfer`；秘密传输还须提供真实 `action.workspace` 的 `transfer` 效果及原有目的地/风险核对，不能用本地读标签掩盖。`expose` 阻断秘密读取/输出，`trust_record_edit` 阻断直接改信任。平台逐次确认须原生 `confirmation_ref` 绑定同资源且其 `workspace.effect_keys` 含本动作 `effect_key`，不能用一般维护授权替代。`access_route` 仅给当前输入的下一步建议；实际受支持入口、真实认证是否可用、原授权语义和平台确认仍由执行者核验，不是登录工具或自动审批。
+
+## 阶段结果后的接续建议
+
+`progress.continuation` 是对原任务和唯一清单的临时有界投影，不要求调用检查器或建立新文件。`review_ref` 指向当前线程的 `goal_review` 原生消息/命令输出，正文为 `{"goal_ref":"本轮已选目标ref","step_ids":["全部仍有效剩余步骤ID"]}`；与 `progress.steps` 比较已给集合，缺项或额外未回看的步骤不能通过。回看内容由模型依据全部原目标解释，程序不能发现调用方未提供的目标。`waiting` 无此原件返回 `remaining_goal_review`，防止仅删掉可做步骤便宣布全面等待。其他旧输入仍可作关系检查，但输出 `continuation_state: not_checked`、`handoff_received: false`，不能称已接续。
+
+有可做步骤时用 `selected_step_id` 指向 `ready` 项；本任务直接执行或以现有授权交接。可选 `handoff` 只保存 `target_task_ref`、固定 `version`、`claim: suggested|sent|received|executing|returned`、原生 `authorization_ref` 和 `sent_ref/received_ref/execution_ref/result_ref`。直接用户授权可复用，委托包装不是消息授权；授权证据关联所选资源，`workspace.target_task_refs` 列出已授权目标任务，不以泛化维护授权替代消息授权。发送证据须为当前线程的原生发送工具回执且含目标身份；按完整工具名与已支持的 codex_app/cloud_threads 命名空间组合核对来源，不能由同名函数尾部推导提供方。回执按已支持的直接目标对象或 MCP content/structuredContent 包络解析，不从任意嵌套对象搜索目标。显式 success/isError 必须分别为严格布尔 true/false；状态须是已确认发送值，error/errors 须是相应无错形状。缺目标、非法类型、未知状态、冲突目标、重复 JSON 字段、内外层失败及不支持的包络均不确认发送，也不绑定接收。原生成功包络未提供可选标志时仍按原格式核对，不强制增加标记；额外元数据不能创造发送证据。接收证据须为目标线程的原生委托输入，带当前发送线程及相同版本；执行和返回引用同目标、版本与相应原生消息/命令。各证据的 `kind` 为 `handoff_sent|handoff_received|handoff_execution|handoff_result`，均用原生 item/digest 绑定；跨线程事件不使用本线程的 `linked` 冒充。只有实际可核接收时 `handoff_received` 为 true；`coordination_owner` 始终保留在发送协调方，只有 `step_owner` 在接收核实后体现子任务承接本次范围；整体目标责任不释放。
+
+建议、发送、接收、执行和返回分开输出；较高声明缺来源返回 `handoff_<状态>_unverified`。结果返回只证明本次交接已返回，不表示验收通过或全部目标完成，模型仍在本轮回看并选择下一步。`context.tool_failures` 中 `user_cancelled` 以同资源/动作效果匹配并停止该动作，不与平台拒绝或普通超时混同；原在途去重、拒绝、预算、版本及独立验收检查继续优先。发送超时不自动转重试，先回读现有动作和目标；检查器不派发任务、不确认外部真实性、不提供后台唤醒。真实接续验收使用正常结果链，未发生的分支保留未运行。

@@ -10,7 +10,7 @@ import re
 import sys
 from datetime import datetime, timezone
 
-from source_evidence import native_precedes, source_body, source_text, verify as verify_source
+from source_evidence import native_item, native_precedes, source_body, source_text, verify as verify_source
 
 
 class CheckError(ValueError):
@@ -94,6 +94,133 @@ def denied_action_matches(failure, action, target, workspace):
     destination = failure.get("destination_node")
     return ((effect is None or effect == workspace.get("side_effect"))
             and (destination is None or destination == workspace.get("destination_node")))
+
+
+def message_receipt_matches(item, text, target_id):
+    """Validate supported native receipt schemas; unresolved evidence stays unresolved."""
+    providers = {
+        "send_message_to_thread": (None, "codex_app", "mcp__codex_app"),
+        "mcp__codex_app__send_message_to_thread": (None, "codex_app", "mcp__codex_app"),
+        "send_message": (None, "cloud_threads"),
+    }
+    if (not isinstance(item, dict) or item.get("type") != "functionCallOutput"
+            or not isinstance(item.get("name"), str)
+            or item.get("namespace") not in providers.get(item["name"], ())
+            or not isinstance(text, str) or len(text) > 65536):
+        return False
+    destinations = {"threadId", "thread_id", "targetThreadId"}
+    controls = {"success", "isError", "status", "state", "error", "errors"}
+    states = {"sent", "queued", "accepted", "delivered", "success", "succeeded",
+              "completed", "started", "ok"}
+    metadata = {"hostId", "host_id", "messageId", "message_id"}
+
+    def flags(value):
+        # bool is a subtype of int: equality/truthiness would accept 0 and 1.
+        if "success" in value and (type(value["success"]) is not bool or value["success"] is not True):
+            return False
+        if "isError" in value and (type(value["isError"]) is not bool or value["isError"] is not False):
+            return False
+        for key in ("status", "state"):
+            if key in value and (not isinstance(value[key], str) or value[key] not in states):
+                return False
+        if "error" in value and value["error"] is not None and value["error"] != "":
+            return False
+        if "errors" in value and value["errors"] is not None and value["errors"] != []:
+            return False
+        return True
+
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate receipt field")
+            result[key] = value
+        return result
+
+    def reject_constant(value):
+        raise ValueError("non-JSON receipt constant")
+
+    def decode(value):
+        return json.loads(value, object_pairs_hook=unique_object, parse_constant=reject_constant)
+
+    nodes = 0
+    def audit(value, depth=0):
+        # Metadata cannot provide a target, but must not hide explicit failures.
+        nonlocal nodes
+        nodes += 1
+        if depth > 8 or nodes > 256:
+            return False
+        if isinstance(value, dict):
+            return flags(value) and all(audit(child, depth+1) for child in value.values())
+        if isinstance(value, list):
+            return all(audit(child, depth+1) for child in value)
+        return True
+
+    def receipt(value, depth=0):
+        if depth > 8 or not isinstance(value, dict) or not audit(value):
+            return None
+        if "content" in value or "structuredContent" in value:
+            # MCP CallToolResult. Only declared payload channels carry targets.
+            if set(value) - controls - {"content", "structuredContent", "_meta"}:
+                return None
+            targets = []
+            if "_meta" in value and not isinstance(value["_meta"], dict):
+                return None
+            if "structuredContent" in value:
+                result = receipt(value["structuredContent"], depth+1)
+                if result is None:
+                    return None
+                targets.extend(result)
+            if "content" in value:
+                content = value["content"]
+                if not isinstance(content, list) or len(content) > 32:
+                    return None
+                for block in content:
+                    if (not isinstance(block, dict) or block.get("type") != "text"
+                            or not isinstance(block.get("text"), str)
+                            or set(block) - {"type", "text", "annotations", "_meta"}):
+                        return None
+                    if any(key in block and not isinstance(block[key], dict) for key in ("annotations", "_meta")):
+                        return None
+                    try:
+                        decoded = decode(block["text"])
+                    except (ValueError, RecursionError):
+                        # Malformed/duplicate JSON is not presentation text.
+                        if block["text"].lstrip().startswith(("{", "[")):
+                            return None
+                        continue
+                    result = receipt(decoded, depth+1)
+                    if result is None:
+                        return None
+                    targets.extend(result)
+            return targets
+        # Verified legacy native return: a direct target plus optional typed flags
+        # and identity metadata. Arbitrary nested objects cannot prove a send.
+        if set(value) - destinations - controls - metadata:
+            return None
+        for key in metadata:
+            if key in value and value[key] is not None and not isinstance(value[key], str):
+                return None
+        targets = []
+        for key in destinations:
+            if key in value:
+                target = value[key]
+                if not isinstance(target, str) or not target.strip():
+                    return None
+                targets.append(target)
+        return targets
+
+    if not isinstance(item.get("output"), dict) or not audit(item):
+        return False
+    try:
+        targets = receipt(decode(text))
+    except (ValueError, RecursionError):
+        return False
+    return bool(targets) and set(targets) == {target_id}
+
+
+def contains_version(text, version):
+    return bool(re.search(r"(?<![\w:./-])" + re.escape(version) + r"(?![\w:./-])", text))
 
 
 def node_snapshot_fresh(context):
@@ -462,10 +589,134 @@ def evaluate(payload):
         elif claim == "continuous_tracking":
             # A static task snapshot cannot promise future model executions.
             need("active_execution_unverified")
+        # Optional, short-lived projection of the existing goal review and handoff.
+        # It never discovers omitted user goals or sends a message itself.
+        continuation = progress.get("continuation")
+        continuation_state, selected_step = "not_checked", None
+        received = False
+        if continuation is None:
+            if claim == "waiting":
+                need("remaining_goal_review")
+        else:
+            continuation = obj(continuation, "progress.continuation")
+            if set(continuation) - {"review_ref", "selected_step_id", "handoff"}:
+                raise CheckError("continuation may contain only review, selection and handoff references")
+            review = linked(continuation.get("review_ref"), "goal_review")
+            body = source_body(context, review) if review else None
+            try:
+                projection = json.loads(body) if body else None
+            except ValueError:
+                projection = None
+            if projection is None:
+                need("remaining_goal_review")
+            else:
+                projection = obj(projection, "goal review")
+                remaining = items(projection.get("step_ids"), "goal review.step_ids")
+                for step_id in remaining:
+                    identifier(step_id, "goal review step_id")
+                if len(set(remaining)) != len(remaining):
+                    raise CheckError("goal review step IDs must be unique")
+                if selected_goal is None or projection.get("goal_ref") != selected_goal.get("ref"):
+                    need("remaining_goal_review_for_current_goal")
+                if set(remaining) != set(by_id):
+                    block("remaining_goals_omitted_or_unreviewed")
+            selected_step = continuation.get("selected_step_id")
+            if selected_step is not None:
+                identifier(selected_step, "continuation.selected_step_id")
+                if selected_step not in by_id or by_id[selected_step]["state"] != "ready":
+                    block("selected_step_not_executable")
+            elif any(s["state"] == "ready" for s in decisions):
+                need("next_step_not_selected")
+            continuation_state = "selected" if selected_step else "reviewed"
+            handoff = continuation.get("handoff")
+            if handoff is not None:
+                handoff = obj(handoff, "continuation.handoff")
+                if set(handoff) - {"target_task_ref", "version", "claim", "authorization_ref",
+                                   "sent_ref", "received_ref", "execution_ref", "result_ref"}:
+                    raise CheckError("handoff may contain only identity, state and evidence references")
+                target_task = identifier(handoff.get("target_task_ref"), "handoff.target_task_ref")
+                version = identifier(handoff.get("version"), "handoff.version")
+                if not target_task.startswith("codex:thread:") or target_task == task_ref:
+                    raise CheckError("handoff target must be another native task")
+                stages = ("suggested", "sent", "received", "executing", "returned")
+                declared = handoff.get("claim", "suggested")
+                if declared not in stages:
+                    raise CheckError("handoff.claim is invalid")
+                continuation_state = "suggested"
+                authorization = linked(handoff.get("authorization_ref"), "authorization") if handoff.get("authorization_ref") else None
+                authority_item = native_item(context, authorization) if authorization else None
+                authority_text = source_body(context, authorization) if authorization else ""
+                # A relayed delegation is input, not direct human message authority.
+                blocks = authority_item.get("content", []) if authority_item else []
+                if not isinstance(blocks, list):
+                    raise CheckError("authorization message content must be an array")
+                delegated = ("<codex_delegation>" in (authority_text or "") or
+                             any(isinstance(b, dict) and b.get("codexDelegation") for b in blocks))
+                authority_scope = obj(authorization.get("workspace", {}), "message authorization.workspace") if authorization else {}
+                targets = items(authority_scope.get("target_task_refs", []), "authorized target_task_refs")
+                for target in targets:
+                    identifier(target, "authorized target task")
+                selected_resource = next((entry["action"]["resource"] for entry in steps
+                                          if entry["id"] == selected_step), None)
+                allowed = (authorization is not None and authorization.get("result") == "granted"
+                           and authority_item is not None and authority_item.get("type") == "userMessage"
+                           and not delegated and target_task in targets
+                           and authorization.get("resource") == selected_resource)
+                if not allowed:
+                    need("handoff_message_authorization")
+
+                def event(ref, kind, owner):
+                    record = evidence.get(ref) if ref else None
+                    if (record is None or record.get("kind") != kind
+                            or record.get("project_id") != project_id or record.get("task_ref") != owner
+                            or record.get("version") != version):
+                        return None, ""
+                    item = native_item(context, record)
+                    return item, source_body(context, record) if item else ""
+
+                sent, sent_text = event(handoff.get("sent_ref"), "handoff_sent", task_ref)
+                target_id, sender_id = target_task.removeprefix("codex:thread:"), task_ref.removeprefix("codex:thread:")
+                sent_ok = (allowed and selected_step is not None and by_id.get(selected_step, {}).get("state") == "ready"
+                           and message_receipt_matches(sent, sent_text, target_id))
+                if sent_ok:
+                    continuation_state = "sent"
+                received_item, received_text = event(handoff.get("received_ref"), "handoff_received", target_task)
+                wrapper = "<source_thread_id>" + sender_id + "</source_thread_id>"
+                content = received_item.get("content", []) if received_item else []
+                if not isinstance(content, list):
+                    raise CheckError("received message content must be an array")
+                structured = any(isinstance(b, dict) and isinstance(b.get("codexDelegation"), dict)
+                    and b["codexDelegation"].get("sourceThreadId") == sender_id for b in content)
+                received = bool(sent_ok and received_item is not None
+                    and (received_item.get("type") == "userMessage" or
+                         (received_item.get("type") == "functionCallOutput"
+                          and received_item.get("namespace") == "cloud_threads"
+                          and received_item.get("name") == "send_message"))
+                    and ((received_text.lstrip().startswith("<codex_delegation>")
+                          and wrapper in received_text) or structured)
+                    and contains_version(received_text, version))
+                if received:
+                    continuation_state = "received"
+                execution, execution_text = event(handoff.get("execution_ref"), "handoff_execution", target_task)
+                if (received and execution is not None and execution.get("type") == "commandExecution"
+                        and execution.get("status") in ("inProgress", "completed")
+                        and contains_version(execution.get("command", "") + " " + execution_text, version)):
+                    continuation_state = "executing"
+                result, result_text = event(handoff.get("result_ref"), "handoff_result", target_task)
+                if (received and result is not None and contains_version(result_text, version)
+                        and ((result.get("type") == "agentMessage" and result.get("phase") == "final_answer")
+                             or (result.get("type") == "commandExecution" and result.get("status") == "completed"))):
+                    continuation_state = "returned"
+                if stages.index(declared) > stages.index(continuation_state):
+                    need("handoff_" + declared + "_unverified")
         status = ("blocked" if blocked else "needs_evidence" if missing else
                   "deviation" if deviations else "ready")
         return {"status": status, "blocked": blocked, "missing": missing,
                 "deviations": deviations, "steps": decisions,
+                "continuation_state": continuation_state, "selected_step_id": selected_step,
+                "handoff_received": received,
+                "coordination_owner": task_ref,
+                "step_owner": (continuation["handoff"]["target_task_ref"] if received else task_ref),
                 "wait_allowed": claim == "waiting" and status == "ready",
                 "continuous_eligible": False,
                 "meaning": "advisory_progress_from_supplied_native_sources; no runtime interception"}
@@ -607,6 +858,9 @@ def evaluate(payload):
                         need("local_resource_diagnosis_before_retry")
             if denied_action_matches(failure, action, target, action.get("workspace")):
                 block("platform_denied_action")
+            if (failure.get("kind") == "user_cancelled" and denied_action_matches(
+                    {**failure, "kind": "platform_denied"}, action, target, action.get("workspace"))):
+                block("user_cancelled_action")
         workspace = action.get("workspace")
         incident = context.get("incident")
         incident_target = None

@@ -48,6 +48,11 @@ def _native_item(context, record):
     return None
 
 
+def native_item(context, record):
+    """Return a verified native item; its text still needs semantic interpretation."""
+    return _native_item(context, record) if verify(context, {}, record) else None
+
+
 def source_text(context, record):
     """Read a verified source's text for the local plan's fixed case identifiers."""
     if not verify(context, {}, record):

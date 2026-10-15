@@ -146,9 +146,14 @@ class ProgressChecks(unittest.TestCase):
         self.assertIn("independent_work_remaining", check.evaluate(request)["blocked"])
         request["progress"]["steps"].pop()
         result = check.evaluate(request)
+        self.assertIn("remaining_goal_review", result["missing"])
+        self.assertFalse(result["wait_allowed"])
+        ContinuationChecks().review(request)
+        result = check.evaluate(request)
         self.assertEqual(result["status"], "ready")
         self.assertTrue(result["wait_allowed"])
-        request["context"]["evidence"].pop()
+        request["context"]["evidence"] = [r for r in request["context"]["evidence"]
+                                             if r.get("kind") != "failure"]
         self.assertIn("wait_refusal_unverified", check.evaluate(request)["missing"])
 
     def test_channel_change_does_not_clear_denial(self):
@@ -192,6 +197,337 @@ class ProgressChecks(unittest.TestCase):
             "responsible_node": "mac-mini", "data_node": "mac-mini",
             "destination_nodes": ["mac-mini"]}
         self.assertIn("incident_closure_required", check.evaluate(request)["missing"])
+
+
+
+class ContinuationChecks(unittest.TestCase):
+    def add(self, request, ref, kind, text, *, thread=None, item_type="agentMessage", **extra):
+        import hashlib
+        thread = thread or request["task"]["native_ref"]
+        record = {"ref": ref, "source": "codex", "kind": kind, "project_id": "framework",
+                  "task_ref": thread, "native_item_id": ref,
+                  "digest": hashlib.sha256(text.encode()).hexdigest(), **extra}
+        request["context"].setdefault("evidence", []).append(record)
+        item = {"id": ref, "type": item_type}
+        if item_type in ("agentMessage", "userMessage"):
+            item["text"] = text
+        else:
+            item["output"] = {"text": text, "truncated": False}
+        sources = request["context"].setdefault("native_sources", [])
+        snapshot = next((x for x in sources if x["thread"]["id"] == thread.removeprefix("codex:thread:")), None)
+        if snapshot is None:
+            snapshot = {"schemaVersion": 1, "thread": {"id": thread.removeprefix("codex:thread:")},
+                        "turns": [{"items": []}]}
+            sources.append(snapshot)
+        snapshot["turns"][0]["items"].append(item)
+        return record, item
+
+    def review(self, request):
+        import json
+        goal = "codex:user:whole-goal"
+        self.add(request, goal, "goal", "Continue the whole authorized goal", item_type="userMessage")
+        request["progress"]["goal_ref"] = goal
+        self.add(request, "codex:review:remaining", "goal_review", json.dumps({"goal_ref": goal,
+            "step_ids": [s["id"] for s in request["progress"]["steps"]]}))
+        request["progress"]["continuation"] = {"review_ref": "codex:review:remaining"}
+
+    def base(self):
+        request = ProgressChecks().progress(ProgressChecks().base())
+        request["context"]["tool_failures"] = []
+        request["progress"]["steps"] = request["progress"]["steps"][2:]
+        request["progress"]["checkpoint"] = "stage_end"
+        self.review(request)
+        return request
+
+    def selected(self):
+        request = self.base()
+        request["progress"]["continuation"]["selected_step_id"] = "diagnose"
+        return request
+
+    def handoff(self, stage="suggested"):
+        import json
+        request = self.selected()
+        target, version = "codex:thread:review-task", "commit:fixed-2"
+        h = {"target_task_ref": target, "version": version, "claim": stage,
+             "authorization_ref": "codex:user:message", "sent_ref": "codex:send:one",
+             "received_ref": "codex:receive:one"}
+        request["progress"]["continuation"]["handoff"] = h
+        self.add(request, h["authorization_ref"], "authorization", "Send this scope to the existing review task",
+                 item_type="userMessage", result="granted",
+                 resource=request["progress"]["steps"][0]["action"]["resource"],
+                 workspace={"target_task_refs": [target]})
+        _, sent = self.add(request, h["sent_ref"], "handoff_sent", json.dumps({"threadId": "review-task"}),
+                           item_type="functionCallOutput", version=version)
+        sent["name"] = "send_message_to_thread"
+        sender = request["task"]["native_ref"].removeprefix("codex:thread:")
+        self.add(request, h["received_ref"], "handoff_received",
+                 "<codex_delegation><source_thread_id>"+sender+"</source_thread_id><input>verify "+version+
+                 "</input></codex_delegation>", thread=target, item_type="userMessage", version=version)
+        return request
+
+    def test_stage_end_selects_work_instead_of_open_owner(self):
+        request = self.base()
+        result = check.evaluate(request)
+        self.assertIn("next_step_not_selected", result["missing"])
+        self.assertFalse(result["handoff_received"])
+        request["progress"]["continuation"]["selected_step_id"] = "diagnose"
+        result = check.evaluate(request)
+        self.assertEqual(result["status"], "ready")
+        self.assertEqual(result["continuation_state"], "selected")
+        self.assertEqual(result["coordination_owner"], request["task"]["native_ref"])
+
+    def test_review_detects_omission_only_from_explicit_source_set(self):
+        request = self.base()
+        request["progress"]["steps"] = []
+        request["progress"]["claim"] = "waiting"
+        result = check.evaluate(request)
+        self.assertIn("remaining_goals_omitted_or_unreviewed", result["blocked"])
+        self.assertFalse(result["wait_allowed"])
+
+    def test_old_progress_ready_does_not_claim_receipt_or_continuation(self):
+        request = self.base()
+        request["progress"].pop("continuation")
+        result = check.evaluate(request)
+        self.assertEqual(result["status"], "ready")
+        self.assertEqual(result["continuation_state"], "not_checked")
+        self.assertFalse(result["handoff_received"])
+
+    def test_sent_and_received_are_different_and_overall_owner_never_releases(self):
+        request = self.handoff("received")
+        request["progress"]["continuation"]["handoff"].pop("received_ref")
+        result = check.evaluate(request)
+        self.assertEqual(result["continuation_state"], "sent")
+        self.assertIn("handoff_received_unverified", result["missing"])
+        self.assertEqual(result["coordination_owner"], request["task"]["native_ref"])
+        request["progress"]["continuation"]["handoff"]["received_ref"] = "codex:receive:one"
+        result = check.evaluate(request)
+        self.assertTrue(result["handoff_received"])
+        self.assertEqual(result["coordination_owner"], request["task"]["native_ref"])
+        self.assertEqual(result["step_owner"], "codex:thread:review-task")
+
+    def test_delegated_or_generic_maintenance_authority_is_not_message_authority(self):
+        request = self.handoff("sent")
+        auth = next(r for r in request["context"]["evidence"] if r["ref"] == "codex:user:message")
+        auth["workspace"]["target_task_refs"] = []
+        self.assertIn("handoff_message_authorization", check.evaluate(request)["missing"])
+        auth["workspace"]["target_task_refs"] = ["codex:thread:review-task"]
+        import hashlib
+        text = "<codex_delegation>Ask you to send</codex_delegation>"
+        auth["digest"] = hashlib.sha256(text.encode()).hexdigest()
+        request["context"]["native_sources"][0]["turns"][0]["items"][-2]["text"] = text
+        self.assertIn("handoff_message_authorization", check.evaluate(request)["missing"])
+
+    def test_timeout_error_or_assistant_promise_never_counts_as_sent(self):
+        import hashlib,json
+        for value in [{"threadId": "review-task", "error": "TimeoutError"},
+                      {"threadId": "review-task", "isError": True},
+                      {"threadId": "other-task"}]:
+            request = self.handoff("sent")
+            item = request["context"]["native_sources"][0]["turns"][0]["items"][-1]
+            text = json.dumps(value, separators=(",", ":"))
+            item["output"]["text"] = text
+            next(r for r in request["context"]["evidence"] if r["ref"] == "codex:send:one")["digest"] = hashlib.sha256(text.encode()).hexdigest()
+            result = check.evaluate(request)
+            self.assertEqual(result["continuation_state"], "suggested")
+            self.assertIn("handoff_sent_unverified", result["missing"])
+        request = self.handoff("sent")
+        item = request["context"]["native_sources"][0]["turns"][0]["items"][-1]
+        item["type"] = "agentMessage"
+        self.assertIn("handoff_sent_unverified", check.evaluate(request)["missing"])
+
+    def test_unknown_send_state_does_not_bind_even_a_matching_received_item(self):
+        import hashlib,json
+        for field in ("status", "state"):
+            for state in ("unknown", "pending", "unconfirmed", None, {}, []):
+                request = self.handoff("received")
+                record = next(r for r in request["context"]["evidence"] if r["kind"]=="handoff_sent")
+                item = next(i for i in request["context"]["native_sources"][0]["turns"][0]["items"] if i["id"]==record["ref"])
+                text = json.dumps({"threadId":"review-task",field:state})
+                item["output"]["text"]=text
+                record["digest"]=hashlib.sha256(text.encode()).hexdigest()
+                with self.subTest(field=field,state=state):
+                    result=check.evaluate(request)
+                    self.assertEqual(result["continuation_state"],"suggested")
+                    self.assertFalse(result["handoff_received"])
+                    self.assertIn("handoff_received_unverified",result["missing"])
+
+    def test_native_send_provider_uses_exact_envelope_and_preserves_legacy_success(self):
+        allowed = [("send_message_to_thread",None),("send_message_to_thread","codex_app"),
+                   ("send_message_to_thread","mcp__codex_app"),
+                   ("mcp__codex_app__send_message_to_thread",None),
+                   ("mcp__codex_app__send_message_to_thread","codex_app"),
+                   ("send_message","cloud_threads")]
+        rejected = [("send_message_to_thread","shell_echo"),("send_message_to_thread","unrelated_service"),
+                    ("mcp__unrelated_service__send_message_to_thread",None),
+                    ("mcp__codex_app__send_message_to_thread","unrelated_service"),
+                    ("send_message","codex_app"),("send_message_to_thread",[])]
+        for accepted, pairs in ((True,allowed),(False,rejected)):
+            for name,namespace in pairs:
+                request=self.handoff("sent")
+                request["progress"]["continuation"]["handoff"].pop("received_ref")
+                item=request["context"]["native_sources"][0]["turns"][0]["items"][-1]
+                item["name"]=name
+                if namespace is None:item.pop("namespace",None)
+                else:item["namespace"]=namespace
+                with self.subTest(name=name,namespace=namespace):
+                    result=check.evaluate(request)
+                    self.assertEqual(result["status"],"ready" if accepted else "needs_evidence")
+                    self.assertEqual(result["continuation_state"],"sent" if accepted else "suggested")
+
+    def test_receipt_schema_strict_boolean_types_in_every_supported_channel(self):
+        import json
+        native={"type":"functionCallOutput","name":"send_message_to_thread","output":{}}
+        for flag,good in (("success",True),("isError",False)):
+            for value in (True,False,None,0,1,"true","false","unknown",{},[]):
+                for channel in ("legacy","structured","text"):
+                    leaf={"threadId":"review-task",flag:value}
+                    payload=(leaf if channel=="legacy" else {"isError":False,"structuredContent":leaf}
+                             if channel=="structured" else {"isError":False,"content":[{"type":"text","text":json.dumps(leaf)}]})
+                    expected=type(value) is bool and value is good
+                    with self.subTest(flag=flag,value=value,channel=channel):
+                        self.assertEqual(check.message_receipt_matches(native,json.dumps(payload),"review-task"),expected)
+
+    def test_receipt_schema_requires_target_and_consistent_known_envelopes(self):
+        import json
+        target={"threadId":"review-task"}
+        valid=[target,{**target,"success":True,"isError":False,"error":None,"errors":[]},
+               {**target,"status":"queued","state":"accepted"},
+               {"isError":False,"content":[{"type":"text","text":json.dumps(target)}]},
+               {"isError":False,"structuredContent":target,"content":[{"type":"text","text":"Action completed."}]},
+               {"structuredContent":target,"content":[{"type":"text","text":json.dumps(target)}]},
+               {"threadId":"review-task","thread_id":"review-task"}]
+        invalid=[{},None,[],True,{"success":True},{"isError":False,"content":[]},
+                 {**target,"thread_id":"other-task"},{**target,"success":True,"isError":True},
+                 {**target,"success":False,"isError":False},{**target,"status":"unknown"},
+                 {**target,"error":False},{**target,"errors":{}},{"threadId":None},
+                 {"threadId":[]},{"data":target},{**target,"ok":False},
+                 {"structuredContent":target,"isError":1},
+                 {"structuredContent":target,"_meta":{"transport":{"success":"unknown"}}},
+                 {"structuredContent":target,"content":[{"type":"text","text":json.dumps({"success":False})}]},
+                 {"structuredContent":target,"content":[{"type":"text","text":json.dumps({"errors":["failed"]})}]},
+                 {"structuredContent":target,"content":[{"type":"text","text":json.dumps({"threadId":"other-task"})}]},
+                 {"structuredContent":target,"content":{"type":"text","text":"unknown"}},
+                 {"structuredContent":target,"content":[{"type":"image","text":"unknown"}]},
+                 {"structuredContent":target,"content":[{"type":"text","text":'{"success":false,"success":true}'}]},
+                 {"structuredContent":target,"content":[{"type":"text","text":'{"success":'}]}]
+        native={"type":"functionCallOutput","name":"send_message_to_thread","output":{}}
+        for expected,values in ((True,valid),(False,invalid)):
+            for payload in values:
+                with self.subTest(payload=payload):
+                    self.assertEqual(check.message_receipt_matches(native,json.dumps(payload),"review-task"),expected)
+        self.assertFalse(check.message_receipt_matches(native,'{"threadId":"review-task","success":false,"success":true}',"review-task"))
+        wrapped=target
+        for _ in range(10):wrapped={"structuredContent":wrapped}
+        self.assertFalse(check.message_receipt_matches(native,json.dumps(wrapped),"review-task"))
+        for value in (1,"false",None,True):
+            native["output"]["isError"]=value
+            self.assertFalse(check.message_receipt_matches(native,json.dumps(target),"review-task"))
+
+    def test_invalid_receipt_schema_cannot_bind_receiver_through_normal_cli(self):
+        import contextlib,hashlib,io,json
+        import codex_framework as framework
+        values=[{"threadId":"review-task","success":"unknown"},
+                {"threadId":"review-task","isError":1},{"threadId":"review-task","success":None},
+                {"threadId":"review-task","success":True,"isError":True},
+                {"structuredContent":{"threadId":"review-task"},"isError":False,
+                 "content":[{"type":"text","text":'{"success":false}'}]},
+                {"data":{"threadId":"review-task"},"success":True}]
+        for payload in values:
+            request=self.handoff("received")
+            record=next(r for r in request["context"]["evidence"] if r["kind"]=="handoff_sent")
+            item=next(i for i in request["context"]["native_sources"][0]["turns"][0]["items"] if i["id"]==record["ref"])
+            text=json.dumps(payload);record["digest"]=hashlib.sha256(text.encode()).hexdigest();item["output"]["text"]=text
+            output=io.StringIO()
+            with self.subTest(payload=payload),contextlib.redirect_stdout(output),unittest.mock.patch("sys.stdin",io.StringIO(json.dumps(request))):
+                self.assertEqual(framework.main(["check"]),2)
+            result=json.loads(output.getvalue())
+            self.assertEqual(result["continuation_state"],"suggested")
+            self.assertFalse(result["handoff_received"])
+            self.assertEqual(result["step_owner"],request["task"]["native_ref"])
+
+    def test_receipt_requires_exact_version_and_sender(self):
+        import hashlib
+        for text in ["<codex_delegation><source_thread_id>framework-task</source_thread_id>commit:fixed-20</codex_delegation>",
+                     "<codex_delegation><source_thread_id>other-task</source_thread_id>commit:fixed-2</codex_delegation>"]:
+            request = self.handoff("received")
+            request["context"]["native_sources"][-1]["turns"][0]["items"][0]["text"] = text
+            request["context"]["evidence"][-1]["digest"] = hashlib.sha256(text.encode()).hexdigest()
+            self.assertIn("handoff_received_unverified", check.evaluate(request)["missing"])
+
+    def test_target_native_delivery_is_accepted_but_arbitrary_tool_echo_is_not(self):
+        request = self.handoff("received")
+        item = request["context"]["native_sources"][-1]["turns"][0]["items"][0]
+        text = item.pop("text")
+        item.update(type="functionCallOutput", name="send_message", namespace="cloud_threads",
+                    output={"text":text,"truncated":False})
+        self.assertTrue(check.evaluate(request)["handoff_received"])
+        item["namespace"] = "shell_echo"
+        self.assertFalse(check.evaluate(request)["handoff_received"])
+
+    def test_malformed_continuation_metadata_returns_structured_input_error(self):
+        import contextlib,io,json
+        import codex_framework as framework
+        variants = ["continuation", "handoff", "authority_workspace", "authority_targets", "projection_ids"]
+        for variant in variants:
+            request = self.handoff("received")
+            c = request["progress"]["continuation"]
+            if variant == "continuation":
+                request["progress"]["continuation"] = []
+            elif variant == "handoff":
+                c["handoff"] = []
+            elif variant == "authority_workspace":
+                next(r for r in request["context"]["evidence"] if r["ref"]=="codex:user:message")["workspace"] = []
+            elif variant == "authority_targets":
+                next(r for r in request["context"]["evidence"] if r["ref"]=="codex:user:message")["workspace"]["target_task_refs"] = "codex:thread:review-task"
+            else:
+                import hashlib
+                text=json.dumps({"goal_ref":"codex:user:whole-goal","step_ids":"diagnose"})
+                record=next(r for r in request["context"]["evidence"] if r["kind"]=="goal_review")
+                record["digest"]=hashlib.sha256(text.encode()).hexdigest()
+                item=next(i for i in request["context"]["native_sources"][0]["turns"][0]["items"] if i["id"]==record["ref"])
+                item["text"]=text
+            with self.subTest(variant=variant):
+                output=io.StringIO()
+                with contextlib.redirect_stdout(output), unittest.mock.patch("sys.stdin",io.StringIO(json.dumps(request))):
+                    self.assertEqual(framework.main(["check"]),1)
+                self.assertEqual(json.loads(output.getvalue())["status"],"invalid")
+
+    def test_result_return_is_not_global_completion_and_retains_coordinator(self):
+        request = self.handoff("returned")
+        h = request["progress"]["continuation"]["handoff"]
+        h["result_ref"] = "codex:result:one"
+        _, item = self.add(request, h["result_ref"], "handoff_result", "failed "+h["version"],
+                           thread=h["target_task_ref"], version=h["version"])
+        item["phase"] = "final_answer"
+        result = check.evaluate(request)
+        self.assertEqual(result["continuation_state"], "returned")
+        self.assertFalse(result["continuous_eligible"])
+        self.assertEqual(result["coordination_owner"], request["task"]["native_ref"])
+
+    def test_cancelled_action_stops_without_blocking_independent_work(self):
+        request = self.base()
+        action = request["progress"]["steps"][0]["action"]
+        request["context"]["tool_failures"] = [{"kind": "user_cancelled", "resource": copy.deepcopy(action["resource"]),
+            "action_kind": "read", "side_effect": "read"}]
+        request["progress"]["continuation"]["selected_step_id"] = "diagnose"
+        result = check.evaluate(request)
+        self.assertIn("user_cancelled_action", result["steps"][0]["blocked"])
+        self.assertIn("selected_step_not_executable", result["blocked"])
+        action["resource"]["path"] = "scripts/independent.py"
+        self.assertEqual(check.evaluate(request)["status"], "ready")
+
+    def test_in_flight_same_effect_is_not_dispatched_again(self):
+        request = self.selected()
+        action = request["progress"]["steps"][0]["action"]
+        action.update(kind="write",effect_key="same-effect")
+        action["workspace"].update(side_effect="local_change",authorization_ref="codex:user:local-maintenance")
+        request["context"]["node_snapshot_observed_at"] = datetime.now(timezone.utc).isoformat()
+        request["context"]["node_snapshot_max_age_seconds"] = 900
+        request["context"]["native_operations"] = [{"ref":"codex:work:running","project_id":"framework",
+            "task_ref":request["task"]["native_ref"],"resource":action["resource"],"effect_key":"same-effect","state":"running"}]
+        result = check.evaluate(request)
+        self.assertIn("duplicate_or_uncertain_effect",result["steps"][0]["blocked"])
+        self.assertIn("selected_step_not_executable",result["blocked"])
 
 
 if __name__ == "__main__":
