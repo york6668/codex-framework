@@ -9,6 +9,9 @@ import sys
 import tempfile
 import unittest
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from test_execution_check import attach_independent_verification
+
 
 CLI = Path(__file__).resolve().parents[1] / "scripts/codex_framework.py"
 THREAD = "codex:thread:isolated-project-task"
@@ -240,6 +243,7 @@ class CorrectionLoop(unittest.TestCase):
                 "plan_ref": "codex:plan:local",
                 "cases": [{"id": "boundary", "resource": RESOURCE,
                            "expected_ref": "codex:expect:local", "observed_ref": "codex:run:local"}]}
+            attach_independent_verification(request, fixed_version)
             self.assertIn("followup_used_correction", cli(request)[1]["missing"])
             request["context"]["evidence"].append(
                 evidence("codex:run:next-turn", "followup", result="used_correction",

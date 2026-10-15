@@ -12,6 +12,13 @@ from pathlib import Path
 
 def _body(item):
     if item.get("type") in ("agentMessage", "userMessage"):
+        content = item.get("content")
+        if isinstance(content, list):
+            blocks = [block.get("text") for block in content
+                      if isinstance(block, dict) and block.get("type") == "text"
+                      and isinstance(block.get("text"), str)]
+            if blocks:
+                return "\n".join(blocks)
         return item.get("text", "")
     output = item.get("output")
     return output.get("text", "") if isinstance(output, dict) else ""
@@ -47,6 +54,14 @@ def source_text(context, record):
         return None
     item = _native_item(context, record)
     return _body(item) if item is not None and item.get("type") in ("agentMessage", "userMessage") else None
+
+
+def source_body(context, record):
+    """Return verified native text or command output without treating it as acceptance."""
+    if not verify(context, {}, record):
+        return None
+    item = _native_item(context, record)
+    return _body(item) if item is not None else None
 
 
 def native_precedes(context, earlier, later):
@@ -96,6 +111,10 @@ def verify(context, project, record):
     if source == "codex":
         item = _native_item(context, record)
         if item is None:
+            return False
+        if (record.get("kind") == "verification_verdict"
+                and record.get("result") == "not_run"
+                and item.get("type") != "agentMessage"):
             return False
         if record.get("kind") in ("goal", "authorization", "confirmation") and item.get("type") != "userMessage":
             return False

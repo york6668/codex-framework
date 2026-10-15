@@ -19,7 +19,8 @@ def scope(project, path, access="write"):
 def action_case():
     return {
         "project": {"id": "framework", "preferences_ref": "repo:framework:AGENTS.md",
-                    "scopes": [scope("framework", "")]},
+                    "scopes": [scope("framework", "")],
+                    "independent_verification_required": True},
         "task": {"native_ref": "codex:thread:framework-task", "project_id": "framework",
                  "scopes": [scope("framework", "scripts")]},
         "context": {"task_ref": "codex:thread:framework-task", "capabilities": ["python"],
@@ -97,6 +98,56 @@ def attach_local_verification(request, target, version):
             "expected_ref": expected_ref, "observed_ref": result_ref}]}
 
 
+def attach_independent_verification(request, version, outcome="passed", *, verifier="codex:thread:review-task",
+                                    suffix="1", revision_ref=None):
+    """Synthetic, bounded second-task evidence; it is not a real review."""
+    target = request["issue"]["resource"]
+    lock_ref, verdict_ref = "codex:review:lock:" + suffix, "codex:review:verdict:" + suffix
+    digests = [hashlib.sha256((suffix + part).encode()).hexdigest()
+               for part in ("data", "environment", "criteria")]
+    lock_text = "\n".join(("code:" + version, "data:" + digests[0],
+                           "environment:" + digests[1], "criteria:" + digests[2]))
+    lock_digest = hashlib.sha256(lock_text.encode()).hexdigest()
+    verdict_text = "\n".join(("version:" + version, "lock:" + lock_digest,
+                              "outcome:" + outcome))
+    for ref, kind, body, result in ((lock_ref, "verification_lock", lock_text, None),
+                                    (verdict_ref, "verification_verdict", verdict_text, outcome)):
+        record = {"ref": ref, "source": "codex", "kind": kind,
+                  "project_id": request["project"]["id"], "task_ref": verifier,
+                  "resource": target, "version": version, "native_item_id": ref,
+                  "digest": hashlib.sha256(body.encode()).hexdigest()}
+        if result is not None:
+            record.update(result=result, related_ref=lock_ref)
+        request["context"]["evidence"].append(record)
+    items = [{"id": lock_ref, "type": "agentMessage", "text": lock_text}]
+    if outcome == "not_run":
+        items.append({"id": verdict_ref, "type": "agentMessage", "text": verdict_text})
+    else:
+        items.append({"id": verdict_ref, "type": "commandExecution",
+                      "status": "completed" if outcome == "passed" else "failed",
+                      "exitCode": 0 if outcome == "passed" else 1,
+                      "command": "synthetic independent probe " + version,
+                      "output": {"text": verdict_text, "truncated": False}})
+    snapshots = request["context"].setdefault("native_sources", [])
+    existing = next((entry for entry in snapshots
+                     if entry.get("thread", {}).get("id") == verifier.removeprefix("codex:thread:")), None)
+    if existing is None:
+        snapshots.append({"schemaVersion": 1,
+                          "thread": {"id": verifier.removeprefix("codex:thread:")},
+                          "turns": [{"items": items}]})
+    else:
+        existing["turns"][0]["items"].extend(items)
+    attempt = {"task_ref": verifier, "version": version, "lock_ref": lock_ref,
+               "verdict_ref": verdict_ref, "data_digest": digests[0],
+               "environment_digest": digests[1], "criteria_digest": digests[2],
+               "outcome": outcome}
+    if revision_ref:
+        attempt["revision_ref"] = revision_ref
+    request["issue"].setdefault("independent_verification", {"attempts": []})["attempts"].append(attempt)
+    request["issue"]["acceptance_owner"] = verifier
+    return attempt
+
+
 class ActionChecks(unittest.TestCase):
     def test_resume_flags_newer_user_goal_without_deciding_its_meaning(self):
         request = action_case()
@@ -127,6 +178,17 @@ class ActionChecks(unittest.TestCase):
                              "goal_ref": "codex:agent:goal"}
         self.assertIn("unverified_goal_source", check.evaluate(request)["missing"])
 
+    def test_native_user_content_blocks_preserve_goal_source(self):
+        request = action_case()
+        WorkspaceBoundaryChecks().add_user_evidence(
+            request, "codex:user:goal", "goal", "Current resource goal")
+        item = request["context"]["native_sources"][0]["turns"][0]["items"][0]
+        item["content"] = [{"type": "text", "text": item.pop("text")}]
+        request["phase"] = "resume"
+        request["resume"] = {"resource": request["action"]["resource"],
+                             "goal_ref": "codex:user:goal"}
+        self.assertEqual(check.evaluate(request)["status"], "ready")
+
     def test_project_isolation_and_task_scope(self):
         request = action_case()
         self.assertEqual(check.evaluate(request)["status"], "ready")
@@ -138,6 +200,17 @@ class ActionChecks(unittest.TestCase):
         self.assertIn("outside_task_scope", check.evaluate(request)["blocked"])
         request["context"]["task_ref"] = "codex:thread:other-framework-task"
         self.assertIn("resume_original_task", check.evaluate(request)["blocked"])
+
+    def test_cross_project_shared_resource_conflict_uses_physical_overlap(self):
+        request = action_case()
+        request["context"]["native_operations"] = [{
+            "ref": "codex:other:write", "project_id": "another-project",
+            "task_ref": "codex:thread:other", "effect_key": "unrelated-effect",
+            "resource": {"kind": "repo", "id": "framework", "path": "scripts/check.py"},
+            "state": "running"}]
+        self.assertIn("concurrent_resource_conflict", check.evaluate(request)["blocked"])
+        request["context"]["native_operations"][0]["resource"]["path"] = "docs/unrelated.md"
+        self.assertEqual(check.evaluate(request)["status"], "ready")
 
     def test_context_failure_does_not_prove_absent_capability(self):
         request = action_case()
@@ -211,6 +284,13 @@ class ActionChecks(unittest.TestCase):
         self.assertIn("tested_release_version", check.evaluate(request)["missing"])
         request["context"]["evidence"][0]["version"] = "commit:abc"
         bind_native_sources(request)
+        self.assertIn("independent_verification_not_run", check.evaluate(request)["missing"])
+        WorkspaceBoundaryChecks().add_user_evidence(
+            request, "codex:user:publish-goal", "goal", "Publish this accepted framework version")
+        request["action"]["release"]["goal_ref"] = "codex:user:publish-goal"
+        request["issue"] = {"resource": request["action"]["resource"]}
+        attach_independent_verification(request, "commit:abc")
+        request["action"]["release"]["independent_verification"] = request.pop("issue")["independent_verification"]
         self.assertEqual(check.evaluate(request)["status"], "ready")
 
 
@@ -310,6 +390,18 @@ class WorkspaceBoundaryChecks(unittest.TestCase):
         request["action"]["resource"] = {"kind": "repo", "id": "framework", "path": "scripts/other.py"}
         request["action"]["effect_key"] = "independent-repair"
         self.assertEqual(check.evaluate(request)["status"], "ready")
+
+    def test_denial_survives_write_to_invoke_with_same_effect(self):
+        request = self.local_case()
+        request["context"]["tool_failure"] = {
+            "kind": "platform_denied", "ref": "codex:tool:denied",
+            "resource": request["action"]["resource"], "action_kind": "write",
+            "effect_key": request["action"]["effect_key"],
+            "destination_node": "mac-mini", "side_effect": "local_change"}
+        request["action"]["kind"] = "invoke"
+        self.assertIn("platform_denied_action", check.evaluate(request)["blocked"])
+        request["action"]["effect_key"] = "different-independent-effect"
+        self.assertNotIn("platform_denied_action", check.evaluate(request)["blocked"])
 
     def test_local_capacity_does_not_authorize_other_project_shutdown(self):
         request = self.local_case()
@@ -425,7 +517,119 @@ class ClosureChecks(unittest.TestCase):
         bind_native_sources(request)
         request["issue"]["local_verification"] = attach_local_verification(
             request, request["issue"]["resource"], "commit:abc")
+        attach_independent_verification(request, "commit:abc")
         return request
+
+    def test_self_test_cannot_sign_independent_acceptance(self):
+        request = self.close_case()
+        request["issue"].pop("independent_verification")
+        result = check.evaluate(request)
+        self.assertIn("independent_verification_not_run", result["missing"])
+        self.assertEqual(result["verification_outcome"], "not_run")
+        request = self.close_case()
+        attempt = request["issue"]["independent_verification"]["attempts"][0]
+        attempt["task_ref"] = request["task"]["native_ref"]
+        self.assertIn("verification_not_independent", check.evaluate(request)["blocked"])
+        request = self.close_case()
+        request["issue"]["acceptance_owner"] = request["task"]["native_ref"]
+        self.assertIn("completion_responsibility", check.evaluate(request)["missing"])
+
+    def test_verification_freezes_inputs_and_exact_version(self):
+        request = self.close_case()
+        attempt = request["issue"]["independent_verification"]["attempts"][0]
+        self.assertEqual(check.evaluate(request)["status"], "ready")
+        attempt["data_digest"] = hashlib.sha256(b"different-data").hexdigest()
+        self.assertIn("verification_lock_unverified", check.evaluate(request)["missing"])
+        request = self.close_case()
+        attempt = request["issue"]["independent_verification"]["attempts"][0]
+        attempt["version"] = "commit:old"
+        self.assertIn("independent_verification_version_mismatch", check.evaluate(request)["missing"])
+        request = self.close_case()
+        attempt = request["issue"]["independent_verification"]["attempts"][0]
+        request["context"]["native_sources"][-1]["turns"][0]["items"].reverse()
+        self.assertIn("verification_verdict_unverified", check.evaluate(request)["missing"])
+
+    def test_failed_and_not_run_are_not_acceptance_and_failed_revision_is_preserved(self):
+        request = self.close_case()
+        request["issue"].pop("independent_verification")
+        attach_independent_verification(request, "commit:abc", "failed", suffix="fail")
+        result = check.evaluate(request)
+        self.assertIn("independent_verification_failed", result["deviations"])
+        self.assertEqual(result["verification_outcome"], "failed")
+        attach_independent_verification(request, "commit:abc", suffix="retry")
+        self.assertIn("failed_version_reused_without_revision", check.evaluate(request)["blocked"])
+        request = self.close_case()
+        request["issue"].pop("independent_verification")
+        attach_independent_verification(request, "commit:abc", "not_run", suffix="pending")
+        result = check.evaluate(request)
+        self.assertIn("independent_verification_not_run", result["missing"])
+        self.assertEqual(result["verification_outcome"], "not_run")
+
+    def test_failed_verification_returns_to_implementation_then_tests_new_version(self):
+        request = self.close_case()
+        latest = request["issue"]["independent_verification"]["attempts"][0]
+        old = attach_independent_verification(request, "commit:old", "failed", suffix="old")
+        request["issue"]["independent_verification"]["attempts"] = [old, latest]
+        review_items = request["context"]["native_sources"][-1]["turns"][0]["items"]
+        review_items[:] = review_items[-2:] + review_items[:-2]
+        latest["revision_ref"] = request["issue"]["fix_ref"]
+        fix = next(record for record in request["context"]["evidence"] if record["ref"] == latest["revision_ref"])
+        fix["version"] = "commit:abc"
+        fix_item = next(item for item in request["context"]["native_sources"][0]["turns"][0]["items"]
+                        if item["id"] == latest["revision_ref"])
+        fix_item["output"]["text"] = "result commit:abc"
+        result = check.evaluate(request)
+        self.assertEqual(result["status"], "ready")
+        self.assertEqual(result["verification_outcome"], "passed")
+        latest.pop("revision_ref")
+        self.assertIn("failed_verification_revision", check.evaluate(request)["missing"])
+
+    def test_old_failed_version_stays_invalid_after_revised_pass(self):
+        request = self.close_case()
+        first = request["issue"]["independent_verification"]["attempts"][0]
+        first["outcome"] = "failed"
+        first_record = next(record for record in request["context"]["evidence"]
+                            if record["ref"] == first["verdict_ref"])
+        first_record["result"] = "failed"
+        first_item = request["context"]["native_sources"][-1]["turns"][0]["items"][1]
+        first_item["status"], first_item["exitCode"] = "failed", 1
+        old_text = first_item["output"]["text"].replace("outcome:passed", "outcome:failed")
+        first_item["output"]["text"] = old_text
+        first_record["digest"] = hashlib.sha256(old_text.encode()).hexdigest()
+        revised = attach_independent_verification(request, "commit:new", suffix="revised",
+                                                  revision_ref="codex:commit:new")
+        request["context"]["evidence"].append(fact("codex:commit:new", "fix", version="commit:new"))
+        # The old code is presented again after the revised candidate passed.
+        attach_independent_verification(request, "commit:abc", suffix="old-again")
+        self.assertIn("failed_version_reused_without_revision", check.evaluate(request)["blocked"])
+
+    def test_attempt_array_cannot_reverse_native_verdict_order(self):
+        request = self.close_case()
+        earlier_pass = request["issue"]["independent_verification"]["attempts"][0]
+        later_fail = attach_independent_verification(request, "commit:old", "failed", suffix="later")
+        request["issue"]["independent_verification"]["attempts"] = [later_fail, earlier_pass]
+        self.assertIn("verification_attempt_order_unverified", check.evaluate(request)["missing"])
+
+    def test_ordinary_closure_does_not_require_unrequested_independent_task(self):
+        request = self.close_case()
+        request["project"]["independent_verification_required"] = False
+        request["issue"].pop("independent_verification")
+        request["issue"]["acceptance_owner"] = request["task"]["native_ref"]
+        self.assertEqual(check.evaluate(request)["status"], "ready")
+
+    def test_not_run_between_failure_and_old_pass_cannot_clear_failure(self):
+        request = self.close_case()
+        request["issue"].pop("independent_verification")
+        attach_independent_verification(request, "commit:old", "failed", suffix="old-fail")
+        attach_independent_verification(request, "commit:new", "not_run", suffix="new-pending")
+        attach_independent_verification(request, "commit:old", "passed", suffix="old-reused")
+        self.assertIn("failed_version_reused_without_revision", check.evaluate(request)["blocked"])
+
+    def test_close_issue_rechecks_newer_user_goal(self):
+        request = self.close_case()
+        WorkspaceBoundaryChecks().add_user_evidence(
+            request, "codex:user:new-goal", "goal", "Newly corrected framework outcome")
+        self.assertIn("newer_goal_requires_scope_review", check.evaluate(request)["missing"])
 
     def test_closure_requires_actual_links_tested_adoption_and_effect(self):
         request = self.close_case()

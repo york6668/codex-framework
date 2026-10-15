@@ -13,10 +13,57 @@ import test_execution_check as fixtures
 
 
 class ProgressChecks(unittest.TestCase):
+    def test_five_synthetic_restarts_keep_new_goal_and_scoped_work(self):
+        for restart in range(1, 6):
+            with self.subTest(restart=restart):
+                request = self.base()
+                helper = fixtures.WorkspaceBoundaryChecks()
+                helper.add_user_evidence(request, "codex:user:old-goal", "goal", "Old scheduling goal")
+                helper.add_user_evidence(request, "codex:user:new-goal", "goal", "Current resource goal")
+                request["phase"] = "resume"
+                request["resume"] = {"resource": request["action"]["resource"],
+                                     "goal_ref": "codex:user:old-goal"}
+                self.assertIn("newer_goal_requires_scope_review", check.evaluate(request)["missing"])
+                request["resume"]["goal_ref"] = "codex:user:new-goal"
+                self.assertEqual(check.evaluate(request)["status"], "ready")
+                progress = self.progress(request)
+                progress["progress"]["checkpoint"] = "handoff"
+                result = check.evaluate(progress)
+                self.assertEqual({step["id"]: step["state"] for step in result["steps"]},
+                                 {"restore": "direct_refusal", "verify": "dependency_blocked",
+                                  "diagnose": "ready"})
+
     def test_after_failure_cannot_claim_working_without_remaining_steps(self):
         request = self.progress(self.base())
         request["progress"]["steps"] = []
         self.assertIn("remaining_steps_unlisted", check.evaluate(request)["missing"])
+
+    def test_handoff_rechecks_selected_goal_after_new_direct_message(self):
+        request = self.base()
+        helper = fixtures.WorkspaceBoundaryChecks()
+        helper.add_user_evidence(request, "codex:user:old-goal", "goal", "Old scheduling goal")
+        helper.add_user_evidence(request, "codex:user:new-goal", "goal", "New framework goal")
+        request = self.progress(request)
+        request["progress"]["checkpoint"] = "handoff"
+        request["resume"] = {"goal_ref": "codex:user:old-goal"}
+        self.assertIn("newer_goal_requires_scope_review", check.evaluate(request)["missing"])
+
+    def test_completed_requires_matching_goal_version_independent_review_and_scope(self):
+        request = fixtures.ClosureChecks().close_case()
+        request["phase"] = "progress"
+        request["progress"] = {"checkpoint": "handoff", "claim": "completed", "steps": [],
+                               "goal_ref": request["issue"]["goal_ref"],
+                               "version": "commit:abc", "acceptance_ref": request["issue"]["acceptance_ref"],
+                               "resource": request["issue"]["resource"],
+                               "independent_verification": request["issue"]["independent_verification"]}
+        self.assertEqual(check.evaluate(request)["status"], "ready")
+        request["progress"].pop("independent_verification")
+        request.pop("issue")
+        self.assertIn("independent_verification_not_run", check.evaluate(request)["missing"])
+        request["progress"]["version"] = "commit:older"
+        self.assertIn("goal_acceptance_unverified", check.evaluate(request)["missing"])
+        request["progress"]["resource"] = {"kind": "repo", "id": "another-project"}
+        self.assertIn("progress_outside_scope", check.evaluate(request)["blocked"])
 
     def test_new_goal_and_scoped_refusal_require_both_resume_and_progress(self):
         request = self.base()

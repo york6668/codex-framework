@@ -10,7 +10,7 @@ import re
 import sys
 from datetime import datetime, timezone
 
-from source_evidence import native_precedes, source_text, verify as verify_source
+from source_evidence import native_precedes, source_body, source_text, verify as verify_source
 
 
 class CheckError(ValueError):
@@ -78,8 +78,15 @@ def tool_failures(context):
 def denied_action_matches(failure, action, target, workspace):
     if (failure.get("kind") != "platform_denied"
             or failure.get("resource") is None
-            or failure.get("action_kind") != action.get("kind")
             or not overlaps(resource(failure["resource"]), target)):
+        return False
+    # Tool labels are entrances, not effect identities.
+    denied_kind = failure.get("action_kind")
+    current_kind = action.get("kind")
+    if (denied_kind == "read" or current_kind == "read") and denied_kind != current_kind:
+        return False
+    denied_effect = failure.get("effect_key")
+    if denied_effect is not None and denied_effect != action.get("effect_key"):
         return False
     if not isinstance(workspace, dict):
         return True  # Missing workspace facts cannot clear a refusal.
@@ -173,6 +180,29 @@ def evaluate(payload):
             return None
         return record
 
+    def check_current_goal(ref, required=False):
+        """Review the selected goal at every handoff or completion boundary."""
+        candidates = [record for record in evidence.values()
+                      if record.get("kind") == "goal" and record.get("project_id") == project_id
+                      and record.get("task_ref") == task_ref]
+        if not ref:
+            if required or candidates:
+                need("current_goal_unselected")
+            return None
+        goal = linked(ref, "goal")
+        if goal is None:
+            return None
+        for candidate in candidates:
+            if candidate.get("ref") == goal["ref"]:
+                continue
+            if not verify_source(context, project, candidate):
+                need("goal_source_unverified")
+            elif native_precedes(context, goal, candidate):
+                need("newer_goal_requires_scope_review")
+            elif not native_precedes(context, candidate, goal):
+                need("goal_order_unverified")
+        return goal
+
     def check_corrections(target, selected):
         selected = items(selected, "selected accepted corrections")
         corrections = items(project.get("accepted_corrections", []), "project.accepted_corrections")
@@ -245,6 +275,98 @@ def evaluate(payload):
         if not version:
             need("local_verification_version")
 
+    def check_independent_verification(validation, target, version):
+        """Check a separate task's frozen inputs and each recorded verdict."""
+        if not isinstance(validation, dict):
+            need("independent_verification_not_run")
+            return
+        attempts = items(validation.get("attempts", []), "independent_verification.attempts")
+        if not attempts:
+            need("independent_verification_not_run")
+            return
+        if len(attempts) > 16:
+            raise CheckError("too many independent verification attempts")
+        previous = None
+        attempted_versions = set()
+        versions_before_failure = set()
+        unresolved_failures = set()
+        historically_failed_versions = set()
+        for attempt in attempts:
+            attempt = obj(attempt, "independent verification attempt")
+            verifier = identifier(attempt.get("task_ref"), "verification task_ref")
+            if not verifier.startswith("codex:thread:") or verifier == task_ref:
+                block("verification_not_independent")
+            tested_version = identifier(attempt.get("version"), "verification version")
+            outcome = attempt.get("outcome")
+            if outcome not in ("passed", "failed", "not_run"):
+                raise CheckError("verification outcome must be passed, failed or not_run")
+            digests = []
+            for key in ("data_digest", "environment_digest", "criteria_digest"):
+                value = attempt.get(key)
+                if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value):
+                    need("verification_lock_incomplete")
+                else:
+                    digests.append(value)
+
+            def independent(ref, kind):
+                record = evidence.get(ref)
+                if (record is None or record.get("kind") != kind
+                        or record.get("project_id") != project_id
+                        or record.get("task_ref") != verifier
+                        or record.get("source") != "codex"):
+                    need("independent_" + kind + "_source")
+                    return None
+                if not verify_source(context, project, record):
+                    need("independent_" + kind + "_source")
+                    return None
+                if record.get("resource") != target:
+                    need("verification_resource_mismatch")
+                return record
+
+            lock = independent(attempt.get("lock_ref"), "verification_lock")
+            verdict = independent(attempt.get("verdict_ref"), "verification_verdict")
+            locked = source_text(context, lock) if lock is not None else None
+            if (len(digests) != 3 or lock is None or not locked
+                    or lock.get("version") != tested_version
+                    or "\n".join(("code:" + tested_version, "data:" + digests[0],
+                                  "environment:" + digests[1], "criteria:" + digests[2])) not in locked):
+                need("verification_lock_unverified")
+            observed = source_body(context, verdict) if verdict is not None else None
+            if (verdict is None or lock is None or not observed
+                    or verdict.get("version") != tested_version
+                    or verdict.get("result") != outcome
+                    or verdict.get("related_ref") != attempt.get("lock_ref")
+                    or "\n".join(("version:" + tested_version, "lock:" + str(lock.get("digest")),
+                                  "outcome:" + outcome)) not in observed
+                    or not native_precedes(context, lock, verdict)):
+                need("verification_verdict_unverified")
+            if previous is not None:
+                prior_verdict = evidence.get(previous.get("verdict_ref"))
+                if (prior_verdict is None or verdict is None
+                        or not native_precedes(context, prior_verdict, verdict)):
+                    need("verification_attempt_order_unverified")
+            if tested_version in historically_failed_versions or tested_version in versions_before_failure:
+                block("failed_version_reused_without_revision")
+            if unresolved_failures:
+                revision = linked(attempt.get("revision_ref"), "fix")
+                if revision is None or revision.get("version") != tested_version:
+                    need("failed_verification_revision")
+            if outcome == "failed":
+                if not unresolved_failures:
+                    versions_before_failure.update(attempted_versions)
+                historically_failed_versions.add(tested_version)
+                unresolved_failures.add(tested_version)
+            elif outcome == "passed" and unresolved_failures:
+                unresolved_failures.clear()
+            attempted_versions.add(tested_version)
+            previous = attempt
+        if previous["version"] != version:
+            need("independent_verification_version_mismatch")
+        if previous["outcome"] == "failed":
+            deviate("independent_verification_failed")
+        elif previous["outcome"] == "not_run":
+            need("independent_verification_not_run")
+
     if phase == "progress":
         progress = obj(payload.get("progress"), "progress")
         checkpoint = progress.get("checkpoint")
@@ -258,6 +380,11 @@ def evaluate(payload):
             raise CheckError("progress has too many remaining steps")
         if claim == "working" and not steps:
             need("remaining_steps_unlisted")
+        earlier_resume = payload.get("resume")
+        selected_goal = check_current_goal(
+            progress.get("goal_ref") or (earlier_resume.get("goal_ref")
+                                         if isinstance(earlier_resume, dict) else None),
+            required=claim == "completed")
         decisions = []
         by_id = {}
         for entry in steps:
@@ -313,12 +440,29 @@ def evaluate(payload):
             if context.get("incident") is not None:
                 need("incident_closure_required")
             acceptance = linked(progress.get("acceptance_ref"), "acceptance") if progress.get("acceptance_ref") else None
-            if acceptance is None or acceptance.get("result") != "passed":
+            version = progress.get("version")
+            if (acceptance is None or acceptance.get("result") != "passed"
+                    or selected_goal is None or acceptance.get("related_ref") != selected_goal.get("ref")
+                    or not version or acceptance.get("version") != version):
                 need("goal_acceptance_unverified")
+            target = progress.get("resource") or (action_input.get("resource") if isinstance(action_input, dict) else None)
+            if target is None:
+                need("verification_resource")
+            else:
+                completed_target = resource(target)
+                if (not any(covers(scope, completed_target, False) for scope in project_scopes)
+                        or not any(covers(scope, completed_target, False) for scope in task_scopes)):
+                    block("progress_outside_scope")
+                validation = progress.get("independent_verification")
+                if validation is None and isinstance(payload.get("issue"), dict):
+                    validation = payload["issue"].get("independent_verification")
+                if validation is not None or project.get("independent_verification_required") is True:
+                    check_independent_verification(validation, target, version)
         elif claim == "continuous_tracking":
             # A static task snapshot cannot promise future model executions.
             need("active_execution_unverified")
-        status = ("blocked" if blocked else "needs_evidence" if missing else "ready")
+        status = ("blocked" if blocked else "needs_evidence" if missing else
+                  "deviation" if deviations else "ready")
         return {"status": status, "blocked": blocked, "missing": missing,
                 "deviations": deviations, "steps": decisions,
                 "wait_allowed": claim == "waiting" and status == "ready",
@@ -331,19 +475,7 @@ def evaluate(payload):
         if (not any(covers(scope, target, False) for scope in project_scopes)
                 or not any(covers(scope, target, False) for scope in task_scopes)):
             block("resume_outside_scope")
-        goal = linked(resume.get("goal_ref"), "goal")
-        if goal is not None:
-            for candidate in evidence.values():
-                if (candidate.get("kind") != "goal" or candidate.get("ref") == goal["ref"]
-                        or candidate.get("project_id") != project_id
-                        or candidate.get("task_ref") != task_ref):
-                    continue
-                if not verify_source(context, project, candidate):
-                    need("goal_source_unverified")
-                elif native_precedes(context, goal, candidate):
-                    need("newer_goal_requires_scope_review")
-                elif not native_precedes(context, candidate, goal):
-                    need("goal_order_unverified")
+        check_current_goal(resume.get("goal_ref"), required=True)
         check_corrections(target, resume.get("accepted_corrections", []))
         if resume.get("stage") == "continuous":
             check_local_verification(resume.get("local_verification"), target,
@@ -435,9 +567,11 @@ def evaluate(payload):
                 state = record.get("state")
                 if state not in ("succeeded", "running", "failed", "unknown"):
                     raise CheckError("native operation.state is invalid")
-                if record.get("project_id") != project_id:
-                    continue
-                if record.get("effect_key") == effect_key:
+                if (state in ("running", "unknown") and record.get("task_ref") != task_ref
+                        and record.get("resource") is not None
+                        and overlaps(resource(record["resource"]), target)):
+                    block("concurrent_resource_conflict")
+                if record.get("project_id") == project_id and record.get("effect_key") == effect_key:
                     if state in ("succeeded", "running", "unknown"):
                         block("duplicate_or_uncertain_effect")
                     elif state == "failed":
@@ -453,10 +587,6 @@ def evaluate(payload):
                             correction = linked(recovery["correction_ref"], "correction")
                             if correction is None or correction.get("result") != "verified":
                                 need("verified_correction")
-                if (state in ("running", "unknown") and record.get("task_ref") != task_ref
-                        and record.get("resource") is not None
-                        and overlaps(resource(record["resource"]), target)):
-                    block("concurrent_resource_conflict")
         for failure in tool_failures(context):
             if (failure.get("kind") == "context_unavailable"
                     and action.get("assertion") == "capability_missing"):
@@ -571,13 +701,19 @@ def evaluate(payload):
                 block("tool_context_is_not_implementation_defect")
         if kind == "publish":
             release = obj(action.get("release", {}), "action.release")
+            check_current_goal(release.get("goal_ref"), required=True)
             test = linked(release.get("test_ref"), "release_test")
             if (not release.get("version") or test is None
                     or test.get("version") != release.get("version")
                     or test.get("result") != "passed"):
                 need("tested_release_version")
+            if (release.get("independent_verification") is not None
+                    or project.get("independent_verification_required") is True):
+                check_independent_verification(release.get("independent_verification"),
+                                               action.get("resource"), release.get("version"))
     else:
         issue = obj(payload.get("issue"), "issue")
+        check_current_goal(issue.get("goal_ref"), required=True)
         if issue.get("task_ref") != task_ref or issue.get("project_id") != project_id:
             block("issue_owner_mismatch")
         if issue.get("resource") is None:
@@ -592,6 +728,11 @@ def evaluate(payload):
         if target is not None:
             check_local_verification(issue.get("local_verification"), target,
                                      obj(issue.get("regression", {}), "issue.regression").get("version"))
+            if (issue.get("independent_verification") is not None
+                    or project.get("independent_verification_required") is True
+                    or (issue.get("acceptance_owner") not in (None, task_ref))):
+                check_independent_verification(issue.get("independent_verification"), issue["resource"],
+                                               obj(issue.get("regression", {}), "issue.regression").get("version"))
 
         for key in ("goal_ref", "failure_ref", "cause_ref", "fix_ref", "acceptance_ref"):
             if not issue.get(key):
@@ -649,7 +790,11 @@ def evaluate(payload):
                 or continuation.get("version") != regression.get("version")
                 or continuation.get("related_ref") != issue.get("fix_ref")):
             need("followup_used_correction")
-        if not issue.get("acceptance_owner") or not issue.get("followup_owner"):
+        verification = issue.get("independent_verification")
+        attempts = verification.get("attempts", []) if isinstance(verification, dict) else []
+        verifier = attempts[-1].get("task_ref") if attempts and isinstance(attempts[-1], dict) else None
+        if (not issue.get("acceptance_owner") or not issue.get("followup_owner")
+                or (verifier and issue.get("acceptance_owner") != verifier)):
             need("completion_responsibility")
 
     status = ("blocked" if blocked else "needs_evidence" if missing else
@@ -657,9 +802,18 @@ def evaluate(payload):
     continuous_eligible = (status == "ready" and
                            (phase == "verify_local" or phase == "close_issue" or
                             (phase == "resume" and payload["resume"].get("stage") == "continuous")))
-    return {"status": status, "blocked": blocked, "missing": missing, "deviations": deviations,
-            "continuous_eligible": continuous_eligible,
-            "meaning": "source_excerpt_and_input_consistency_only; provenance, authorization and goal semantics remain external"}
+    result = {"status": status, "blocked": blocked, "missing": missing, "deviations": deviations,
+              "continuous_eligible": continuous_eligible,
+              "meaning": "source_excerpt_and_input_consistency_only; provenance, authorization and goal semantics remain external"}
+    if phase == "close_issue":
+        validation = payload["issue"].get("independent_verification")
+        attempts = validation.get("attempts", []) if isinstance(validation, dict) else []
+        result["verification_outcome"] = (attempts[-1].get("outcome")
+                                          if attempts and isinstance(attempts[-1], dict) else
+                                          "not_run" if (project.get("independent_verification_required") is True
+                                                        or payload["issue"].get("acceptance_owner") not in (None, task_ref))
+                                          else "not_required")
+    return result
 
 
 def dispatch():
