@@ -8,6 +8,7 @@ history or grants permissions that the underlying platform has not granted.
 import json
 import re
 import sys
+from datetime import datetime, timezone
 
 from source_evidence import native_precedes, source_text, verify as verify_source
 
@@ -63,6 +64,47 @@ def overlaps(left, right):
              or right[2].startswith(left[2] + "/")))
 
 
+def tool_failures(context):
+    """Read all supplied failures; a later failure never replaces an earlier denial."""
+    failures = items(context.get("tool_failures", []), "context.tool_failures")
+    previous = context.get("tool_failure")
+    if previous is not None:
+        failures = [obj(previous, "context.tool_failure"), *failures]
+    if len(failures) > 64:
+        raise CheckError("too many tool failures")
+    return [obj(failure, "tool failure") for failure in failures]
+
+
+def denied_action_matches(failure, action, target, workspace):
+    if (failure.get("kind") != "platform_denied"
+            or failure.get("resource") is None
+            or failure.get("action_kind") != action.get("kind")
+            or not overlaps(resource(failure["resource"]), target)):
+        return False
+    if not isinstance(workspace, dict):
+        return True  # Missing workspace facts cannot clear a refusal.
+    effect = failure.get("side_effect")
+    destination = failure.get("destination_node")
+    return ((effect is None or effect == workspace.get("side_effect"))
+            and (destination is None or destination == workspace.get("destination_node")))
+
+
+def node_snapshot_fresh(context):
+    """Use the source observation time, never the time it was reread."""
+    observed = context.get("node_snapshot_observed_at")
+    maximum = context.get("node_snapshot_max_age_seconds")
+    if not isinstance(observed, str) or not isinstance(maximum, int) or not 1 <= maximum <= 86400:
+        return False
+    try:
+        instant = datetime.fromisoformat(observed.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if instant.tzinfo is None:
+        return False
+    age = (datetime.now(timezone.utc) - instant).total_seconds()
+    return -60 <= age <= maximum
+
+
 def evaluate(payload):
     """Return an advisory decision. Missing facts never become success."""
     payload = obj(payload, "input")
@@ -80,8 +122,8 @@ def evaluate(payload):
     for scope in project_scopes + task_scopes:
         covers(scope, resource(scope), False)
     phase = payload.get("phase", "action")
-    if phase not in ("resume", "action", "feedback", "verify_local", "close_issue"):
-        raise CheckError("phase must be resume, action, feedback, verify_local or close_issue")
+    if phase not in ("resume", "action", "feedback", "verify_local", "close_issue", "progress"):
+        raise CheckError("phase must be resume, action, feedback, verify_local, close_issue or progress")
     blocked, missing, deviations = [], [], []
 
     def block(code):
@@ -113,7 +155,7 @@ def evaluate(payload):
         evidence[ref] = record
 
     action_input = payload.get("action")
-    strict_sources = (phase in ("resume", "feedback", "verify_local", "close_issue")
+    strict_sources = (phase in ("resume", "feedback", "verify_local", "close_issue", "progress")
                       or (phase == "action" and isinstance(action_input, dict)
                           and (action_input.get("kind") in ("repair", "publish")
                                or "recovery" in action_input or "workspace" in action_input
@@ -203,6 +245,84 @@ def evaluate(payload):
         if not version:
             need("local_verification_version")
 
+    if phase == "progress":
+        progress = obj(payload.get("progress"), "progress")
+        checkpoint = progress.get("checkpoint")
+        if checkpoint not in ("after_failure", "wait", "stage_end", "handoff"):
+            raise CheckError("progress.checkpoint is invalid")
+        claim = progress.get("claim", "working")
+        if claim not in ("working", "waiting", "completed", "continuous_tracking"):
+            raise CheckError("progress.claim is invalid")
+        steps = items(progress.get("steps", []), "progress.steps")
+        if len(steps) > 32:
+            raise CheckError("progress has too many remaining steps")
+        decisions = []
+        by_id = {}
+        for entry in steps:
+            entry = obj(entry, "progress step")
+            step_id = identifier(entry.get("id"), "progress step.id")
+            if step_id in by_id:
+                raise CheckError("progress step IDs must be unique")
+            dependencies = items(entry.get("depends_on", []), "progress step.depends_on")
+            if len(set(dependencies)) != len(dependencies) or any(d not in by_id for d in dependencies):
+                raise CheckError("progress dependencies must name earlier steps once")
+            action = obj(entry.get("action"), "progress step.action")
+            single = evaluate({**payload, "phase": "action", "action": action})
+            if "platform_denied_action" in single["blocked"]:
+                state = "direct_refusal"
+            elif any(by_id[d]["state"] != "ready" for d in dependencies):
+                state = "dependency_blocked"
+            elif (action.get("capabilities") or action.get("cost", 0)) and not node_snapshot_fresh(context):
+                state = "needs_evidence"
+                single["missing"] = [*single["missing"], "node_snapshot_stale_or_unverified"]
+            elif single["status"] == "ready":
+                state = "ready"
+            elif single["status"] == "needs_evidence":
+                state = "needs_evidence"
+            else:
+                state = "blocked"
+            decision = {"id": step_id, "state": state,
+                        "blocked": single["blocked"], "missing": single["missing"]}
+            decisions.append(decision)
+            by_id[step_id] = decision
+        if claim == "working" and any(s["state"] == "needs_evidence" for s in decisions):
+            need("remaining_step_status_unresolved")
+        if claim == "waiting":
+            if any(s["state"] == "ready" for s in decisions):
+                block("independent_work_remaining")
+            if not decisions or not any(s["state"] == "direct_refusal" for s in decisions):
+                block("waiting_without_verified_blocker")
+            if any(s["state"] in ("needs_evidence", "blocked") for s in decisions):
+                need("remaining_step_status_unresolved")
+            for entry, decision in zip(steps, decisions):
+                if decision["state"] != "direct_refusal":
+                    continue
+                action = entry["action"]
+                target = resource(action["resource"])
+                workspace = action.get("workspace")
+                matching = [f for f in tool_failures(context)
+                            if denied_action_matches(f, action, target, workspace)]
+                if not any((record := linked(f.get("ref"), "failure")) is not None
+                           and record.get("result") == "failed" for f in matching):
+                    need("wait_refusal_unverified")
+        elif claim == "completed":
+            if decisions:
+                block("remaining_steps_not_complete")
+            if context.get("incident") is not None:
+                need("incident_closure_required")
+            acceptance = linked(progress.get("acceptance_ref"), "acceptance") if progress.get("acceptance_ref") else None
+            if acceptance is None or acceptance.get("result") != "passed":
+                need("goal_acceptance_unverified")
+        elif claim == "continuous_tracking":
+            # A static task snapshot cannot promise future model executions.
+            need("active_execution_unverified")
+        status = ("blocked" if blocked else "needs_evidence" if missing else "ready")
+        return {"status": status, "blocked": blocked, "missing": missing,
+                "deviations": deviations, "steps": decisions,
+                "wait_allowed": claim == "waiting" and status == "ready",
+                "continuous_eligible": False,
+                "meaning": "advisory_progress_from_supplied_native_sources; no runtime interception"}
+
     if phase == "resume":
         resume = obj(payload.get("resume"), "resume")
         target = resource(resume.get("resource"))
@@ -275,6 +395,11 @@ def evaluate(payload):
                 block("budget_exceeded")
         if (required or cost) and not context.get("node_snapshot_ref"):
             need("node_runtime_snapshot")
+        if ((required or cost)
+                and ("node_snapshot_observed_at" in context
+                     or "node_snapshot_max_age_seconds" in context)
+                and not node_snapshot_fresh(context)):
+            need("node_snapshot_stale_or_unverified")
         observations = items(context.get("native_operations", []), "context.native_operations")
         by_ref = {}
         for record in observations:
@@ -318,9 +443,7 @@ def evaluate(payload):
                         and record.get("resource") is not None
                         and overlaps(resource(record["resource"]), target)):
                     block("concurrent_resource_conflict")
-        failure = context.get("tool_failure")
-        if failure is not None:
-            failure = obj(failure, "context.tool_failure")
+        for failure in tool_failures(context):
             if (failure.get("kind") == "context_unavailable"
                     and action.get("assertion") == "capability_missing"):
                 block("tool_context_is_not_capability_absence")
@@ -337,13 +460,8 @@ def evaluate(payload):
                     if (source is None or cause is None or correction is None
                             or correction.get("result") != "verified"):
                         need("local_resource_diagnosis_before_retry")
-            if failure.get("kind") == "platform_denied" and failure.get("resource") is not None:
-                denied = resource(failure["resource"])
-                if (denied == target and failure.get("action_kind") == kind
-                        and (failure.get("side_effect") is None
-                             or not isinstance(action.get("workspace"), dict)
-                             or failure.get("side_effect") == action["workspace"].get("side_effect"))):
-                    block("platform_denied_action")
+            if denied_action_matches(failure, action, target, action.get("workspace")):
+                block("platform_denied_action")
         workspace = action.get("workspace")
         incident = context.get("incident")
         incident_target = None
@@ -433,8 +551,9 @@ def evaluate(payload):
                 if (not any(covers(scope, candidate, False) for scope in project_scopes)
                         or not any(covers(scope, candidate, False) for scope in task_scopes)):
                     block("affected_scope_outside_task")
-            if (failure and failure.get("kind") == "context_unavailable"
-                    and defect.get("cause_layer") == "implementation"):
+            if (defect.get("cause_layer") == "implementation"
+                    and any(f.get("kind") == "context_unavailable"
+                            for f in tool_failures(context))):
                 block("tool_context_is_not_implementation_defect")
         if kind == "publish":
             release = obj(action.get("release", {}), "action.release")

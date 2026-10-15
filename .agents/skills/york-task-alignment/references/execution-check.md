@@ -2,6 +2,14 @@
 
 当任务涉及跨端接续、重复副作用、共享资源冲突、预算、故障恢复或缺陷关闭，而现有事实不能一眼判断时，可运行框架仓库的 `scripts/codex_framework.py check`。先由当前任务读取项目契约、原目标与原生/节点记录，检查器消费本次临时输入，不创建任务、持久日志、权限或业务数据，也不替代 Codex 原生审批。普通明确且低风险的动作不必为此建立记录。
 
+工具失败后重排、进入等待、阶段收尾和交接均沿用该 `check` 命令，以 `phase: progress` 检查本轮剩余步骤。输入的 `progress.checkpoint` 为 `after_failure|wait|stage_end|handoff`，`claim` 为 `working|waiting|completed|continuous_tracking`；`steps` 最多 32 项，每项有唯一 `id`、现有 `action` 结构及引用前面步骤 ID 的 `depends_on`。输出逐项为 `direct_refusal`、`dependency_blocked`、`ready`、`needs_evidence` 或 `blocked`。这是当前剩余工作的有界投影，模型仍需从原任务核对是否遗漏步骤，不能把 `status: ready` 误读为全部步骤均可执行。
+
+`context.tool_failures` 可列出多条仍有效的失败；原有单条 `tool_failure` 输入继续兼容，若两者同时存在会合并检查。每条平台拒绝按资源、动作类别、实际目的地与副作用匹配，通道和线程变化不会消除同一拒绝；资源路径的父子范围也会匹配。只把直接拒绝及其已证依赖标为暂停，其他获准动作单独检查。调用者须从原生记录保留所有仍有效的失败，检查器不能从省略的输入恢复历史；权限或事实确实改变时依原目标和平台规则复核，不能借输入删去拒绝来重试。
+
+`claim: waiting` 仅在没有独立可执行或待取证步骤、剩余步骤均直接受拒或依赖受阻，且直接拒绝的 `ref` 有可核原生 `failure` 证据时返回 `wait_allowed: true`。缺少失败原件、仍可本地归因或仍需核对旧资源测量时不能宣布全面等待。资源与额度动作在 `progress` 中须提供当前节点观察的 `node_snapshot_observed_at`（带时区）及 `node_snapshot_max_age_seconds`，过期或缺失不会给出 `ready`；单动作输入若提供这两个字段也检查时效。观察时间必须来自节点原件，不因重新读取而刷新；程序只比较所给值，来源真实性仍须用工作站检查和原生记录核实。
+
+`claim: completed` 仍需目标验收来源，且不能留下剩余步骤；本地事故还须使用 `close_issue` 核对实际节点采用和效果，合成 CI 不能替代。`continuous_tracking` 始终返回未验证：静态检查与 SessionStart Hook 不提供空闲时模型执行或未来唤醒保证。若没有实际执行机会，只能报告当前无法持续跟踪。此入口不自动拦截计划工具、等待或交接，使用点依任务规范由模型执行，真实行为仍需正常任务入口复测。
+
 先从 Codex 原生 `read_thread(includeOutputs=true)` 定位原线程、用户目标与相关工具调用；从节点实际入口读取能力、预算、数据状态及采用版本。项目规范、Git 提交和节点事实仍在原处。把适用规范引用、项目与任务范围、原线程、拟执行动作及相关来源放入临时 JSON，经标准输入调用：
 
 ```sh
