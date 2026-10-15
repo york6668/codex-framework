@@ -249,18 +249,13 @@ class Framework:
             return results
 
     def launcher(self):
-        destination = self.home / ".local/bin/codex-framework"
-        safe_path(self.home, ".local/bin")
-        target = self.repo / "scripts/codex_framework.py"
-        if destination.is_symlink():
-            if destination.resolve() == target.resolve():
-                return destination
-            raise SyncError("命令入口已指向其他位置: " + str(destination))
-        if destination.exists():
-            raise SyncError("命令入口已存在；未覆盖: " + str(destination))
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.symlink_to(target)
-        return destination
+        import framework_runtime as runtime
+        path = runtime.launcher_path(self)
+        current = runtime.active(self)
+        if not current or read_file(path) != runtime.loader_bytes(self):
+            raise SyncError("先 install 固定运行包；不再生成可变源码链接")
+        runtime.validate(runtime.version_path(self, current["revision"]), current["manifest_sha256"])
+        return path
 
     def pull(self):
         remote = git(self.repo, "config", "--get", "remote.origin.url")
@@ -291,12 +286,13 @@ def main(argv=None):
     parser.add_argument("--codex-home", type=Path, help="显式指定目标 Codex home")
     parser.add_argument("command", choices=("status", "install", "apply", "pull", "export",
                         "sync-status", "refresh", "install-hook", "session-start", "check",
-                        "workstation-check", "workstation-entry"))
+                        "workstation-check", "workstation-entry", "runtime-recover", "runtime-rollback"))
     parser.add_argument("--apply", action="store_true", help="pull 后应用；否则仅预览差异")
     parser.add_argument("--snapshot", type=Path, help="原生连接取得的完整共享内容快照")
     parser.add_argument("--revision", help="原生连接刚读取的发布提交 SHA")
     parser.add_argument("--cloud-error", help="云端入口不可用的简短原因；随后使用本机 Git")
     parser.add_argument("--expected-revision", help="访问远端前 sync-status 的 observed_revision；无版本用 none")
+    parser.add_argument("--expected-runtime", help="安装或回退前观察到的运行版本；首次为 none")
     args = parser.parse_args(argv)
     if args.apply and args.command != "pull":
         parser.error("--apply 仅用于 pull")
@@ -310,10 +306,21 @@ def main(argv=None):
     if args.command == "workstation-entry":
         from workstation_entry import dispatch
         return dispatch(codex_home or (args.home or Path.home()) / ".codex")
-    framework = Framework(args.repo or Path(__file__).resolve().parent.parent,
-                          args.home or Path.home(), codex_home)
+    import framework_runtime as runtime
     try:
+        framework = Framework(args.repo or runtime.default_repo(),
+                              args.home or Path.home(), codex_home)
         import framework_refresh as refresh
+        if args.command in ("install", "runtime-rollback", "runtime-recover"):
+            if args.command == "runtime-recover":
+                output = runtime.recover(framework)
+            else:
+                if args.command == "runtime-rollback" and not args.revision:
+                    raise SyncError("runtime-rollback 要求 --revision 指定已保留版本")
+                output = runtime.install(framework, args.revision, args.expected_runtime,
+                                         rollback=args.command == "runtime-rollback")
+            print(json.dumps(output, ensure_ascii=False, indent=2))
+            return 2 if output.get("conflicts") else 0
         if args.command in ("sync-status", "refresh", "install-hook", "session-start"):
             return refresh.dispatch(framework, args)
         if args.command == "pull":
@@ -331,8 +338,6 @@ def main(argv=None):
         source = refresh.cached_files(framework) if args.repo is None and args.command in ("status", "apply") else None
         results = framework.reconcile(apply=applying, export=args.command == "export", source=source)
         code = report(results)
-        if args.command == "install":
-            print("命令入口: " + str(framework.launcher()))
         if args.command == "export":
             print("仅更新本地审核仓库；未暂存、提交或推送")
         elif applying:

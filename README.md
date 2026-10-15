@@ -35,11 +35,11 @@ Mac mini 上的全局文档和 Skills 是部署副本，供 Codex 加载使用�
 | [日志](.agents/skills/york-log-query/SKILL.md)、[本地数据](.agents/skills/york-local-data/SKILL.md)、[工作站](.agents/skills/york-workstation/SKILL.md) | 按疑点取证、隔离数据及节点资源方法；真实系统操作仍按原授权。 |
 | [交付](.agents/skills/york-safe-delivery/SKILL.md)、[框架维护](.agents/skills/york-codex-policy-maintenance/SKILL.md) | 工作区/Git 交付及共同规则/分发；正式独立验收不由实施自签。 |
 | `check` → `execution_check` → `source_evidence` | 对给定输入关系和来源形状做确定性检查；不自主发现遗漏任务、不认证原件，不证明语义规划或真实完成。 |
-| `install/refresh` → 分发正文；`SessionStart` → 启动提示/节点摘要 | 白名单及三方更新保护未发布修改；Hook 不在空闲时唤醒模型。launcher 当前仍指向可变检出脚本，正文 applied_revision 不证明运行工具同版。 |
+| `install/refresh` → 分发正文；`SessionStart` → 启动提示/节点摘要 | 白名单及三方更新保护未发布修改；Hook 不在空闲时唤醒模型。`install` 将明确 Git 版本部署为受管理运行包，稳定 loader 固定物理目录后导入；`sync-status.runtime` 核对实际工具、正文和输入契约。普通正文 `refresh` 不获得代码执行权限。 |
 
 通用验证正文由工程方法持有，Java 与交付入口引用；生命周期正文由任务方法持有，跨仓只补契约共存顺序与组合边界。规则索引见 [正文归属](.agents/skills/york-codex-policy-maintenance/references/policy-owners.yaml)。方法存在及可安装只证明静态/分发能力；真实模型发现、规划和执行须由正常获授权交互独立判断。
 
-后续依赖仍包括固定版本的执行工具与正文/输入兼容关系、原生来源适配与统一有界读取、结果后的主动协调及真实采用证据。当前方法重构不声称这些程序或行为已经实现，不移动 BTC 额度权威或节点实际配置。
+运行版本链实现与隔离回归见下节；独立验收、发布、真实安装及采用各自取证。原生来源适配与统一有界读取、结果后的主动协调及真实采用仍按后续工作包推进，不移动 BTC 额度权威或节点实际配置。
 
 ## 在另一台电脑安装
 
@@ -52,9 +52,35 @@ python3 "$HOME/work/codex-framework/scripts/codex_framework.py" install
 "$HOME/.local/bin/codex-framework" status
 ```
 
-安装将偏好与说明放到 `${CODEX_HOME:-$HOME/.codex}`，将 York Skills 放到 `$HOME/.agents/skills`，并创建上述命令入口。源码仓库需保留，入口直接指向其中的脚本；不修改 shell 配置。若 `$HOME/.local/bin` 未加入 PATH，使用下方完整命令路径。
+安装将偏好与说明放到 `${CODEX_HOME:-$HOME/.codex}`，将 York Skills 放到 `$HOME/.agents/skills`，并创建上述命令入口。源码只承担明确的安装/更新引导，正常入口不再指向检出脚本。安装从已核对的发布分支头 Git 对象取代码与正文，未提交差异保留并单列；不修改 shell 配置。更新需要可用的获准源码位置，日常运行不依赖检出仍存在。若 `$HOME/.local/bin` 未加入 PATH，使用下方完整命令路径。
 
 首次安装遇到已有不同内容会标记 `conflict` 并保留双方文件。比较节点副本与 GitHub 发布内容：共享规范修订归回本仓，BTC 专属方法归回 BTC 项目，设备路径与资源线索留在设备说明。保留有效偏好和 BTC 例外，按所属项目授权发布后再刷新；尚未发布的差异明确标为未发布修改，不覆盖、不伪造共同基线，也不将其当成另一套权威规范。不要整目录覆盖。其他 Skill 和设备说明保持原样。
+
+## 固定版本运行与恢复
+
+`install` 部署六个原有 CLI 模块及新增的 `framework_runtime` 管理模块；`acceptance_capture` 是独立工具，不在运行闭包。每个完整提交在 Codex home 的 `framework-sync/runtime/versions/<commit>/` 保存模块、正文快照和 hash/模式/输入契约 manifest。`active.json` 指向一个已校验版本，`approved.json` 保存已校验版本的 manifest hash。正常 `$HOME/.local/bin/codex-framework` 是无仓库导入的稳定 loader，每次先固定物理目录、核对整个包，再导入；旧进程继续使用原目录。
+
+```sh
+# 已核对且存在于本地 Git 的发布分支头；首次 expected-runtime 使用 none。
+python3 /path/to/codex-framework/scripts/codex_framework.py install \
+  --revision <完整发布SHA> --expected-runtime <先前active_revision或none>
+"$HOME/.local/bin/codex-framework" sync-status
+# 明确恢复上次未完成的安装；不覆盖中断后新增的本地内容。
+"$HOME/.local/bin/codex-framework" runtime-recover
+# 回退到仍保留且先前校验过的完整版本；不从任意目录执行旧代码。
+"$HOME/.local/bin/codex-framework" runtime-rollback \
+  --revision <保留版本SHA> --expected-runtime <当前active_revision>
+```
+
+`--home`、`--codex-home` 和现有 `CODEX_HOME` 选择语义保留，显式 `--home` 不采用环境中的 `CODEX_HOME`。共享的稳定入口属于安装时选定的 Codex home；操作其他目标继续显式传参数，不改平台变量或搬运行数据。来源仓库换位置时，更新显式传 `--repo <新检出>`；正常检查、状态及已安装 Hook 不要求原检出可访问。
+
+运行安装先验证获准来源、完整模块闭包、代码模式/编译、正文快照及契约，再用临时 home 烟测，之后才更新。现有正文白名单仍只接受数据；`refresh --snapshot` 和 `pull --apply` 沿用正文更新语义，不隐式执行快照脚本。工具更新明确使用 `install`。正文到了 Q、工具还在 P 时，`sync-status` 分别报告 `document_status`、实际 `runtime.tool_revision`、活动版本、契约及 override，不冒充整体采用完成。
+
+更新与恢复沿用原同步锁。新调用遇到写锁会返回未就绪，SessionStart 则输出有界未知提示且退出 0；不会为 Hook 等待更新。跨文档、状态、入口和指针的写入前先持久化 `transaction.json`，中断后报告 `update-incomplete`。指针、包 manifest、恢复记录和错误诊断读取均先校验对象及字段形状；坏状态由 CLI 报结构化未就绪，Hook 输出有界未知并退出 0。恢复只还原仍等于本次写入值的内容；中断后的其他成果保留为具体冲突。首次安装若指针尚未切换，稳定 loader 仅允许从已准备包进入 `sync-status`/`runtime-recover`，不以开发源码作日常后备入口。
+
+已识别的旧源码 launcher 会原位迁移；未知入口保持不动。已有本框架 SessionStart 命令在运行安装中迁到稳定入口，匹配同时核对有效 home/Codex home，保留原解释器、参数和属性；异目标、缺少明确目标或无法解析的命令不改写。显式 `install-hook` 也按同一身份判断，仅合并同一匹配器内执行参数和属性相同的重复项；缺少当前处理器时才添加默认项。首次启用仍用 `install-hook`。命令定义变化仍须原生 Hook 审阅，工具不修改信任库或安全设置，手动 Hook 合成验证不证明真实冷启动已信任或注入。
+
+回退一起恢复相容的正文、工具和契约，保留已知远端版本与明确的 `rolled-back` 状态；本地有效修订继续保护。运行中、冻结复现或未决恢复可能引用的旧目录和失败准备内容不自动删除，退出引用后再按明确范围清理；它们不是另一套活动实现。失败入口诊断保留在运行目录的 `failures/`，不进入源码仓库。
 
 ## 任务启动与变更刷新
 
@@ -62,7 +88,7 @@ python3 "$HOME/work/codex-framework/scripts/codex_framework.py" install
 
 先复用当前任务可用的 Codex 仓库能力或 GitHub 原生连接，当前入口不可用时回退到本机已有 Git 配置；两边失败标记待用户处理并保留现用规范。不同入口访问的是同一 GitHub 项目，Codex 云端执行环境不是必经中转。具体命令、快照格式、冲突处理与当前任务重读动作见 [同步方法](.agents/skills/york-codex-policy-maintenance/references/framework-sync.md)。普通追加消息和上下文压缩不联网；后续仅明确已发布的规范变化、当前任务完成长期规范发布或用户要求时刷新，不注册每轮 Hook、后台轮询或跨任务通知。
 
-`sync-status` 返回当前已观察与已应用版本；`refresh` 统一接收原生连接内容或本机 Git 内容。默认 `status` / `apply` 使用最后取得的发布内容缓存，避免维护检出较旧时意外退回旧规范；维护本地源码时显式使用 `--repo <路径>`，这只是开发验证，不代表已经发布。同步器程序、测试和 Codex 云端安装脚本在维护仓库更新，不当成共享正文自动执行。
+`sync-status` 返回当前已观察与已应用版本；`refresh` 统一接收原生连接内容或本机 Git 内容。默认 `status` / `apply` 使用最后取得的发布内容缓存，避免维护检出较旧时意外退回旧规范；维护本地源码时显式使用 `--repo <路径>`，这只是开发验证，不代表已经发布。同步器运行代码只由上述明确的版本化 `install` 更新，不当成普通共享正文快照自动执行；测试及云端 bootstrap 脚本留在维护仓库。
 
 ## 手动维护与同步
 

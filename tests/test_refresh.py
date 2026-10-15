@@ -5,7 +5,7 @@ import subprocess
 import sys
 from unittest import mock
 
-from test_framework import FixtureCase, GitFixtureCase, put, run_git
+from test_framework import FixtureCase, GitFixtureCase, put, run_git, install_runtime
 import codex_framework as cf
 import framework_refresh as rf
 
@@ -157,6 +157,7 @@ class RefreshTests(FixtureCase):
         self.assertEqual(self.a.target(".codex/memory-framework.md").read_text(), "native newer\n")
 
     def test_hook_install_merges_existing_handlers_and_is_idempotent(self):
+        install_runtime(self.a)
         config = {"description": "existing", "hooks": {"SessionStart": [
             {"matcher": "resume", "hooks": [{"type": "command", "command": "echo existing"}]}],
             "Stop": [{"hooks": [{"type": "command", "command": "echo stopped"}]}]}}
@@ -176,6 +177,7 @@ class RefreshTests(FixtureCase):
         self.assertFalse(any("trust" in p.name for p in self.a.home.rglob("*")))
 
     def test_hook_emits_context_only_for_start_resume_clear_and_never_blocks(self):
+        install_runtime(self.a)
         self.install_snapshot()
         spec = rf.install_hook(self.a)
         for source in ("startup", "resume", "clear", "compact", "ordinary-message"):

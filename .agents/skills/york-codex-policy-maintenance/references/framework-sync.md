@@ -69,4 +69,12 @@ GitHub 项目是内容来源，Codex 云端执行环境是可选运行位置。�
 
 `install-hook` 在实际 Codex home 的 `hooks.json` 合并一个 `SessionStart` handler，匹配 `startup|resume|clear`，保留其他 Hook。它只输出本方法的发现提示，不联网、不调用模型、不装规则、不阻断任务；不注册 `UserPromptSubmit`，也不匹配 `compact`。
 
-首次启用或定义变化须通过 [Codex 原生 Hook 信任界面](https://learn.chatgpt.com/docs/hooks#review-and-trust-hooks) 审阅。CLI 使用 `/hooks`；没有完成原生信任和真实启动验证时，分别报告这两个缺口，不能仅凭手动运行脚本宣称自动触发成功。安装器不改写信任库或开启绕过选项。框架源码升级后，按本次改动需要更新维护检出与命令入口，再核对 Hook 定义；共享文档刷新不假定完成了程序升级。
+首次启用或定义变化须通过 [Codex 原生 Hook 信任界面](https://learn.chatgpt.com/docs/hooks#review-and-trust-hooks) 审阅。CLI 使用 `/hooks`；没有完成原生信任和真实启动验证时，分别报告这两个缺口，不能仅凭手动运行脚本宣称自动触发成功。安装器不改写信任库或开启绕过选项。框架工具升级后，从已核对的发布 Git 提交运行明确的 `install --revision <SHA> --expected-runtime <已观察值或none>`；稳定 loader 与现有本框架 Hook 迁到受管理版本入口，再核对原生信任。共享文档刷新不完成程序升级。
+
+## 正文版本与实际运行版本
+
+`sync-status` 保留 v1 同步状态与 `expected_revision`，另返回 `document_status` 和 `runtime`：实际进程的 `tool_revision`/物理目录、指针的 `active_revision`、正文已应用版本、输入契约及本机 override。正文同步 `current` 不能单独证明工具采用；运行未绑定、缺件/坏 hash、契约不兼容、源码 bootstrap 调用、仍运行旧版本或更新未完成分别报告。稳定入口启动校验失败时也报告正文与尝试的活动版本，且不导入损坏代码。
+
+代码安装只从明确的本地 Git 发布分支头及规定模块集合取对象，并校验普通文件模式、完整性、输入契约和隔离烟测；普通 `refresh` 快照仍只承载原白名单正文，不能加入脚本获得执行权。源码未提交差异不被打包或重置；若其中有应发布成果，先按当前目标整合并独立验证，而不是把它们当作已发布输入。
+
+完整运行包、原子指针、更新恢复与回退命令见仓库 README 的“固定版本运行与恢复”。运行安装发现正文冲突时保留原活动入口和本地成果，已有正文更新仍可交付无冲突部分，独立检查仍可执行。真实安装、Hook 原生审阅、实际冷启动与模型采用分别验收；本地隔离回归不能代替它们。

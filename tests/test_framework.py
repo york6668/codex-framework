@@ -29,6 +29,23 @@ def run_git(repo, *args):
     return result.stdout.strip()
 
 
+def seed_runtime(repo):
+    if not (repo / ".git").exists():
+        run_git(repo, "init", "-b", cf.BRANCH)
+        run_git(repo, "config", "user.email", "fixture@example.invalid")
+        run_git(repo, "config", "user.name", "Fixture")
+        run_git(repo, "remote", "add", "origin", cf.REMOTE)
+        run_git(repo, "add", ".")
+        run_git(repo, "commit", "-m", "approved isolated runtime fixture")
+    return run_git(repo, "rev-parse", "HEAD")
+
+
+def install_runtime(framework):
+    import framework_runtime as runtime
+    revision = seed_runtime(framework.repo)
+    return runtime.install(framework, revision)
+
+
 class FixtureCase(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="framework-test-")
@@ -164,6 +181,7 @@ class SyncTests(FixtureCase):
         self.assertTrue((self.root / "custom-codex/AGENTS.md").exists())
         self.assertFalse((self.a.home / ".codex/AGENTS.md").exists())
         self.assertTrue((self.a.home / ".agents/skills/york-java-test/SKILL.md").exists())
+        seed_runtime(self.repo)
         with mock.patch.dict(os.environ, {"CODEX_HOME": str(self.root / "never-touch")}):
             with contextlib.redirect_stdout(io.StringIO()):
                 code = cf.main(["--repo", str(self.repo), "--home", str(self.b.home), "install"])
@@ -194,6 +212,7 @@ class SyncTests(FixtureCase):
         target = cf.Framework(self.repo, self.b.home, installed)
         arguments = ["--repo", str(self.repo), "--home", str(self.b.home),
                      "--codex-home", str(installed)]
+        seed_runtime(self.repo)
         with mock.patch.dict(os.environ, {"CODEX_HOME": str(runtime)}):
             with contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(cf.main(arguments + ["install"]), 0)
@@ -234,7 +253,7 @@ class SyncTests(FixtureCase):
             self.a.reconcile(apply=True)
 
     def test_launcher_executes_from_another_working_directory(self):
-        self.apply()
+        install_runtime(self.a)
         launcher = self.a.launcher()
         self.assertEqual(self.a.launcher(), launcher)
         result = subprocess.run([sys.executable, str(launcher), "--home", str(self.a.home), "status"],

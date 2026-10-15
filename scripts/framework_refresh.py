@@ -62,9 +62,20 @@ def cached_files(framework):
 
 
 def sync_status(framework):
-    state = framework.read_state().get("sync", {})
-    return dict(state, source=cf.REMOTE, branch=cf.BRANCH,
-                expected_revision=state.get("observed_revision") or "none")
+    import framework_runtime as runtime
+    try:
+        state = runtime.sync_state(framework)
+        binding = runtime.describe(framework, state)
+    except (cf.SyncError, OSError) as exc:
+        return {"status": "runtime-unavailable", "document_status": "unknown",
+                "source": cf.REMOTE, "branch": cf.BRANCH, "expected_revision": "none",
+                "runtime": {"status": "unknown", "reason": str(exc)}}
+    result = dict(state, source=cf.REMOTE, branch=cf.BRANCH,
+                  expected_revision=state.get("observed_revision") or "none", runtime=binding,
+                  document_status=state.get("status", "unknown"))
+    if binding["status"] not in ("matched", "unmanaged"):
+        result["status"] = "runtime-" + binding["status"]
+    return result
 
 
 def local_snapshot(framework):
@@ -161,26 +172,38 @@ def refresh(framework, *, snapshot=None, revision=None, cloud_error=None, expect
 
 def install_hook(framework):
     """Merge only our handler. Native Codex trust is deliberately left to its UI."""
+    import framework_runtime as runtime
+    command = runtime.stable_command(framework)
     path = cf.safe_path(framework.codex_home, "hooks.json")
     raw = cf.read_file(path)
     try:
         config = json.loads(raw) if raw is not None else {}
-        groups = config.setdefault("hooks", {}).setdefault("SessionStart", [])
-        if not isinstance(groups, list):
-            raise ValueError("SessionStart 必须是数组")
-        command = shlex.join([sys.executable, str(framework.repo / "scripts/codex_framework.py"),
-                              "--home", str(framework.home), "--codex-home", str(framework.codex_home),
-                              "session-start"])
-        handler = {"type": "command", "command": command, "timeout": 5,
-                   "statusMessage": HOOK_LABEL, "additionalContextLimit": 1800}
-        # Identify by our executable/subcommand, not a potentially shared display label.
+        groups = runtime.hook_groups(config)
+        found = False
         for group in groups:
-            group["hooks"] = [h for h in group.get("hooks", [])
-                              if not (h.get("type") == "command" and
-                                      "codex_framework.py" in h.get("command", "") and
-                                      h.get("command", "").endswith(" session-start"))]
-        groups[:] = [g for g in groups if g.get("hooks")]
-        groups.append({"matcher": "^(startup|resume|clear)$", "hooks": [handler]})
+            if not isinstance(group, dict) or not isinstance(group.get("hooks", []), list):
+                continue
+            kept, seen = [], set()
+            for handler in group.get("hooks", []):
+                identity = runtime.hook_identity(framework, handler)
+                if identity is None:
+                    kept.append(handler)
+                    continue
+                found = True
+                handler = dict(handler, command=runtime.migrated_hook_command(framework, handler, identity))
+                # Only equivalent current-target handlers within the same matcher,
+                # with the same runner and non-command attributes, are duplicates.
+                key = json.dumps({"runner": identity["runner"], "repo": identity["repo"],
+                                  "target": identity["target"],
+                                  "properties": {k:v for k,v in handler.items() if k != "command"}}, sort_keys=True)
+                if key not in seen:
+                    kept.append(handler)
+                    seen.add(key)
+            group["hooks"] = kept
+        if not found:
+            handler = {"type": "command", "command": command, "timeout": 5,
+                       "statusMessage": HOOK_LABEL, "additionalContextLimit": 1800}
+            groups.append({"matcher": "^(startup|resume|clear)$", "hooks": [handler]})
     except (TypeError, ValueError, AttributeError) as exc:
         raise cf.SyncError("现有 hooks.json 格式无法安全合并；未覆盖") from exc
     encoded = (json.dumps(config, ensure_ascii=False, indent=2) + "\n").encode()
@@ -188,7 +211,10 @@ def install_hook(framework):
         if cf.read_file(path) != raw:
             raise cf.SyncError("hooks.json 在安装期间被修改；保留当前内容")
         cf.write_file(path, encoded)
-    return {"path": str(path), "trust": "native-review-required", "command": command}
+    commands = [h["command"] for g in groups if isinstance(g, dict) and isinstance(g.get("hooks", []), list)
+                for h in g.get("hooks", []) if runtime.hook_identity(framework, h) is not None]
+    return {"path": str(path), "trust": "native-review-required",
+            "command": commands[0] if commands else command, "commands": commands}
 
 
 def session_start(framework, event):
