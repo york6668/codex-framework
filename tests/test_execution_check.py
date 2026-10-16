@@ -288,6 +288,8 @@ class ActionChecks(unittest.TestCase):
         WorkspaceBoundaryChecks().add_user_evidence(
             request, "codex:user:publish-goal", "goal", "Publish this accepted framework version")
         request["action"]["release"]["goal_ref"] = "codex:user:publish-goal"
+        request["context"]["evidence"][0].update(
+            resource=dict(request["action"]["resource"]), related_ref="codex:user:publish-goal")
         request["issue"] = {"resource": request["action"]["resource"]}
         attach_independent_verification(request, "commit:abc")
         request["action"]["release"]["independent_verification"] = request.pop("issue")["independent_verification"]
@@ -698,6 +700,10 @@ class ClosureChecks(unittest.TestCase):
         request["context"]["evidence"][4]["related_ref"] = "codex:tool:failure"
         request["context"]["evidence"][6]["related_ref"] = "codex:user:goal"
         request["context"]["evidence"][9]["related_ref"] = "codex:commit:fix"
+        for record in request["context"]["evidence"]:
+            if record["kind"] in ("regression_original", "regression_affected", "acceptance",
+                                  "adoption", "effect", "followup"):
+                record["resource"] = dict(request["issue"]["resource"])
         bind_native_sources(request)
         request["issue"]["local_verification"] = attach_local_verification(
             request, request["issue"]["resource"], "commit:abc")
@@ -934,6 +940,159 @@ class ClosureChecks(unittest.TestCase):
         items[-3], items[-1] = items[-1], items[-3]
         local["cases"] = []
         self.assertIn("local_verification_cases", check.evaluate(request)["missing"])
+
+
+class AuthorizationScopeChecks(unittest.TestCase):
+    """Original human directory grants cover safe children, not new objects."""
+
+    def setUp(self):
+        import tempfile
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.container = Path(self.temp.name).resolve()
+        self.root = self.container / "repo"
+        for name in ("scripts/foo", "scripts/foobar", "scripts/real"):
+            (self.root / name).mkdir(parents=True, exist_ok=True)
+        (self.root / "scripts/check.py").write_text("fixture")
+        self.outside = self.container / "outside"
+        self.outside.mkdir()
+
+    def request(self, grant="scripts", target="scripts/check.py"):
+        request = WorkspaceBoundaryChecks().local_case()
+        request["project"]["root"] = str(self.root)
+        request["action"]["resource"] = {"kind": "repo", "id": "framework", "path": target}
+        authorization = next(r for r in request["context"]["evidence"] if r["kind"] == "authorization")
+        authorization["resource"] = {"kind": "repo", "id": "framework", "path": grant}
+        return request
+
+    def test_original_directory_grant_covers_existing_and_new_children(self):
+        for grant in ("", "scripts"):
+            for target in ("scripts/check.py", "scripts/new/deeper.py"):
+                with self.subTest(grant=grant, target=target):
+                    self.assertEqual(check.evaluate(self.request(grant, target))["status"], "ready")
+
+    def test_equivalent_root_resource_does_not_require_another_grant(self):
+        request = self.request("", "")
+        request["task"]["scopes"][0]["path"] = ""
+        authorization = next(r for r in request["context"]["evidence"] if r["kind"] == "authorization")
+        authorization["resource"].pop("path")
+        self.assertEqual(check.evaluate(request)["status"], "ready")
+
+    def test_file_grant_siblings_and_prefix_lookalikes_remain_outside(self):
+        for grant, target in (("scripts/check.py", "scripts/other.py"),
+                              ("scripts/foo", "scripts/foobar/new.py"),
+                              ("scripts/check.py", "scripts/check.py/child")):
+            with self.subTest(grant=grant, target=target):
+                self.assertIn("outside_authorized_workspace", check.evaluate(self.request(grant, target))["blocked"])
+
+    def test_parent_grant_needs_local_directory_facts_not_new_user_authority(self):
+        for root in (None, "relative/repo", str(self.root / "missing")):
+            with self.subTest(root=root):
+                request = self.request()
+                request["project"]["root"] = root
+                result = check.evaluate(request)
+                self.assertIn("authorized_resource_path_unverified", result["missing"])
+                self.assertNotIn("local_action_authorization", result["missing"])
+                self.assertNotEqual(result["status"], "ready")
+        request = self.request("scripts/not-established", "scripts/not-established/new.py")
+        self.assertIn("authorized_resource_path_unverified", check.evaluate(request)["missing"])
+
+    def test_symlink_escape_is_rejected_for_child_and_declared_directory(self):
+        (self.root / "scripts/escape").symlink_to(self.outside, target_is_directory=True)
+        for grant in ("scripts", "scripts/escape"):
+            with self.subTest(grant=grant):
+                result = check.evaluate(self.request(grant, "scripts/escape/new.py"))
+                self.assertIn("outside_authorized_workspace", result["blocked"])
+        (self.root / "scripts/linked.py").symlink_to(self.outside / "file.py")
+        self.assertIn("outside_authorized_workspace", check.evaluate(
+            self.request("scripts/linked.py", "scripts/linked.py"))["blocked"])
+
+    def test_symlink_to_an_object_still_within_authorized_directory_is_allowed(self):
+        (self.root / "scripts/alias").symlink_to(self.root / "scripts/real", target_is_directory=True)
+        self.assertEqual(check.evaluate(self.request("scripts", "scripts/alias/new.py"))["status"], "ready")
+
+    def test_path_escape_is_invalid_and_foreign_drive_paths_are_not_covered(self):
+        for target in ("../outside", "scripts/../outside", "/outside", "//host/share"):
+            with self.subTest(target=target), self.assertRaises(check.CheckError):
+                check.evaluate(self.request("", target))
+        for target in ("C:/outside", "C:relative", "scripts\\outside", "scripts/\x00"):
+            with self.subTest(target=target):
+                request = self.request("", target)
+                request["task"]["scopes"][0]["path"] = ""
+                self.assertIn("outside_authorized_workspace", check.evaluate(request)["blocked"])
+
+    def test_unknown_resource_identity_cannot_supply_authority(self):
+        for field in ("kind", "id"):
+            with self.subTest(field=field):
+                request = self.request()
+                for resource in (request["action"]["resource"], request["project"]["scopes"][0],
+                                 request["task"]["scopes"][0], request["context"]["evidence"][0]["resource"]):
+                    resource[field] = "unknown"
+                self.assertIn("authorized_resource_path_unverified", check.evaluate(request)["missing"])
+
+    def test_directory_observation_does_not_cover_another_node_or_destination(self):
+        request = self.request()
+        request["action"]["workspace"]["execution_node"] = "another-node"
+        self.assertIn("outside_authorized_workspace", check.evaluate(request)["blocked"])
+        request = self.request()
+        request["action"]["workspace"]["destination_node"] = "another-node"
+        self.assertIn("cross_environment_authorization", check.evaluate(request)["missing"])
+
+    def test_cross_volume_child_is_rejected_even_inside_lexical_directory(self):
+        from types import SimpleNamespace
+        original = Path.stat
+        target = self.root / "scripts/check.py"
+        def other_volume(path, *args, **kwargs):
+            value = original(path, *args, **kwargs)
+            return SimpleNamespace(st_mode=value.st_mode, st_dev=value.st_dev + 1) if path == target else value
+        with mock.patch.object(Path, "stat", other_volume):
+            self.assertIn("outside_authorized_workspace", check.evaluate(self.request())["blocked"])
+
+    def test_directory_grant_does_not_clear_refusal_or_specific_confirmation(self):
+        request = self.request()
+        request["context"]["tool_failures"] = [{"kind": "platform_denied", "resource": dict(request["action"]["resource"]), "action_kind": "write"}]
+        self.assertIn("platform_denied_action", check.evaluate(request)["blocked"])
+        request = self.request()
+        request["action"]["access"] = {"resource_owner": "managed_workstation", "identity_role": "maintenance",
+            "authentication_path": "existing_session", "permission_change": "none", "secret_handling": "provider_only",
+            "platform_requirement": "confirmation"}
+        self.assertIn("native_action_confirmation", check.evaluate(request)["missing"])
+
+
+    def test_directory_grant_rejects_all_proposed_nodes_changed_together(self):
+        request = self.request()
+        for key in ("execution_node", "data_node", "destination_node"):
+            request["action"]["workspace"][key] = "foreign-node"
+        result = check.evaluate(request)
+        self.assertIn("outside_authorized_workspace", result["blocked"])
+
+    def test_verified_alias_reuses_local_authority_without_clearing_denial(self):
+        request = self.request()
+        body = json.dumps({"node_id":"mac-mini", "aliases":["known-host.local"], "root":str(self.root)})
+        ref = "codex:node:identity"
+        request["context"]["evidence"].append({"ref":ref,"kind":"node_identity","source":"codex",
+            "project_id":"framework","task_ref":request["task"]["native_ref"],"node_id":"mac-mini",
+            "result":"observed","native_item_id":ref,"digest":hashlib.sha256(body.encode()).hexdigest()})
+        request["context"]["native_sources"][0]["turns"][0]["items"].append({"id":ref,
+            "type":"commandExecution","status":"completed","exitCode":0,"command":"observe node identity",
+            "output":{"text":body,"truncated":False}})
+        request["context"]["node_identity_ref"] = ref
+        for key in ("execution_node", "data_node", "destination_node"):
+            request["action"]["workspace"][key] = "known-host.local"
+        self.assertEqual(check.evaluate(request)["status"], "ready")
+        request["context"]["tool_failures"] = [{"kind":"platform_denied","action_kind":"write",
+            "resource":dict(request["action"]["resource"]),"destination_node":"mac-mini","side_effect":"local_change"}]
+        self.assertIn("platform_denied_action", check.evaluate(request)["blocked"])
+
+
+    def test_unknown_original_node_cannot_supply_exact_local_authority(self):
+        request = self.request("scripts/check.py", "scripts/check.py")
+        authorization = next(r for r in request["context"]["evidence"] if r["kind"] == "authorization")
+        for actual, permitted in (("execution_node", "execution_nodes"), ("data_node", "data_nodes"),
+                                  ("destination_node", "destination_nodes")):
+            request["action"]["workspace"][actual] = "unknown"
+            authorization["workspace"][permitted] = ["unknown"]
+        self.assertIn("outside_authorized_workspace", check.evaluate(request)["blocked"])
 
 
 if __name__ == "__main__":

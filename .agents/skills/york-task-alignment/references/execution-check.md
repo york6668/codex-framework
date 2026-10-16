@@ -12,7 +12,7 @@
 
 `claim: working` 却没有列出剩余步骤时返回 `remaining_steps_unlisted`；这不能说明已全部完成或正在持续跟踪。未尝试的消费者只读核对等独立步骤应列为待做，不能伪造成平台拒绝。检查只覆盖调用者列出的步骤，仍须对照原任务核实完整性。
 
-`progress` 的交接、等待及阶段收尾也核对本轮选定的 `goal_ref`（如已给 `resume.goal_ref`，可沿用），不能只在 `resume` 审查较新用户目标。`claim: completed` 须明确目标、版本、相同目标及版本的验收原件；当前有效用户目标或项目验收契约要求独立验收时，再提供该资源的独立验证历史。只给开发自测、旧目标验收或空步骤不能表示完成。`publish` 同样需要 `release.goal_ref` 和已通过的开发测试；独立验收适用时，另需与发布版本一致的 `release.independent_verification`。这两个入口复用下面的独立验证关系检查；局部失败仍只影响有依赖的步骤。
+`progress` 的交接、等待及阶段收尾也核对本轮选定的 `goal_ref`（如已给 `resume.goal_ref`，可沿用），不能只在 `resume` 审查较新用户目标。`claim: completed` 须明确目标、版本、相同目标/资源及版本的验收原件，并提供 `continuation.review_ref`；该本轮 `goal_review` 正文除 `goal_ref/step_ids` 外还须绑定 `version/resource`。缺少回看不能用空 steps 表示完成，已给同目标较新回看时不能选旧空回看跳过；当前有效用户目标或项目验收契约要求独立验收时，再提供该资源的独立验证历史。只给开发自测、旧目标验收或空步骤不能表示完成。`publish` 同样需要 `release.goal_ref` 和已通过的开发测试；`release_test.related_ref` 关联该原目标，`resource` 精确匹配发布对象，不能复用另一目标/资源的成功；独立验收适用时，另需与发布版本一致的 `release.independent_verification`。这两个入口复用下面的独立验证关系检查；局部失败仍只影响有依赖的步骤。
 
 `claim: completed` 仍需目标验收来源，且不能留下剩余步骤；本地事故还须使用 `close_issue` 核对实际节点采用和效果，合成 CI 不能替代。`continuous_tracking` 始终返回未验证：静态检查与 SessionStart Hook 不提供空闲时模型执行或未来唤醒保证。若没有实际执行机会，只能报告当前无法持续跟踪。此入口不自动拦截计划工具、等待或交接，使用点依任务规范由模型执行，真实行为仍需正常任务入口复测。
 
@@ -38,7 +38,9 @@ python3 scripts/codex_framework.py check < /tmp/current-action.json
 
 目的地与数据节点不同即属跨环境，需单独的 `transfer_authorization_ref` 和 `risk_review_ref`，后者指向说明必要性、数据/权限/运行影响及目的地的原生证据；本地维护授权不能自动覆盖。`irreversible_delete` 即使仍在本机，也需要针对确切资源的 `confirmation_ref`。`context.tool_failure` 若为 `platform_denied`，以被拒资源、`action_kind` 和可选的 `side_effect` 关联本动作；同一动作改通道仍是 `blocked`，另一独立获准动作不会因此整体失权。证据改变时只按实际平台规则复核，检查器结果从不解除平台拒绝或批准传输、删除。`ready` 仍只表示临时输入内部一致，不是审批回执。
 
-`authorization` 与 `confirmation` 的原生来源须是用户消息；助手说明或命令成功不能变成用户许可。证据摘要只绑定所给原文，程序不自动理解自然语言中的范围，执行者必须核对对象、节点、目的地与副作用确在原授权内。已有授权仍适用时复用原引用，不为每个内部操作创建新批准记录。
+`authorization` 与 `confirmation` 的原生来源须是用户消息；助手说明或命令成功不能变成用户许可。证据摘要只绑定所给原文，程序不自动理解自然语言中的范围，执行者必须核对对象、节点、目的地与副作用确在原授权内。已有授权仍适用时复用原引用，不为每个内部操作创建新批准记录。 用户批准的需求及明确限制决定边界，普通内部方案、步骤、顺序或候选版本变化不要求重批；新版仍须有对应验收证据。授权资源按规范身份匹配；明确授权的本项目目录可覆盖安全子路径，仅在已有 `project.root` 和同一执行/数据/目的节点能核实实际目录、解析后仍在授权对象内且未跨卷时扩展。缺本地路径事实为 `authorized_resource_path_unverified`（交接为 `handoff_authorized_resource_unverified`），由模型沿获准入口补事实，不改作缺用户许可；未知身份、模糊非目录资源、兄弟路径和符号链接越界不会获准。原接收任务、原授权节点和副作用及平台单独确认仍分别核对；不能以待执行三节点相同替换原节点边界。目录继承须保留原授权的节点/副作用字段；缺原节点与目录关联为待取证，不推导成新增用户批准。
+
+节点确有别名时，可用可选 `context.node_identity_ref` 引用当前任务的 `node_identity` 原生观察：成功、完整的节点命令结果 JSON 恰含 `node_id/aliases/root`，记录为同一 `node_id` 的 `result: observed`，且实际目录与 `project.root` 相同。该事实只归一已证明相同的节点名称，原用户授权、拒绝、目的地和副作用仍独立比较；助手文字、自报映射或不同目录/节点的观察不提供同一性。模型须核实原件确为实际节点观察，不能用 echo、自造输出或另一任务代造证明；检查器不认证任意调用者 JSON。无别名需求的旧输入不新增此必填字段。
 
 同一操作遇到 `resource_exhausted` 时，检查器要求原失败、原因与已验证纠正的引用后才允许作为恢复重试；输出 `local_resource_diagnosis_before_retry` 指向本地取证和修复缺口，不代表需要再次找用户批准。读取获准的日志或执行独立修复不依赖该重试；`platform_denied` 则始终保留为外部拒绝，不能用本地诊断或更换通道消除。
 
@@ -50,7 +52,7 @@ python3 scripts/codex_framework.py check < /tmp/current-action.json
 
 项目原有契约、修正代码及回归测试是后续接续的来源；不另建纠正台账。下一轮从这些来源和原生任务记录读出适用纠正，在本次输入的 `project.accepted_corrections` 放入其引用、资源、版本，并以 `project.corrections_source_ref` 指向所核对来源。`resume` 或 `action` 的 `accepted_corrections` 应包含同一资源的纠正及同版依据；程序会要求临时证据中有可核验的旧修正原件，遗漏、旧版或来源缺失不会得到 `ready`。空数组本身不证明没有历史偏差。
 
-缺陷修复后用 `phase: close_issue` 核对本地准入、原目标、原失败、根因、修正、原场景及受影响路径复测、独立目标验收、正式采用版本、实际效果与后续接续。`issue.goal_ref` 和 `acceptance_ref` 必须关联；目标验收不能复用局部回归命令。原场景复测的 `related_ref` 指向原失败，目标验收指向原目标，后续接续指向修正；本地验证、回归、验收、采用、效果及接续版本须一致。仅命令退出 0 不证明业务目标完成，执行者须核对实际输出和目标语义。修后尚未正式采用、没有效果或没有后续使用证据时为 `needs_evidence`，但不得把可本地复测的部分推迟到后续任务。
+缺陷修复后用 `phase: close_issue` 核对本地准入、原目标、原失败、根因、修正、原场景及受影响路径复测、独立目标验收、正式采用版本、实际效果与后续接续。`issue.goal_ref` 和 `acceptance_ref` 必须关联；目标验收不能复用局部回归命令。原场景复测的 `related_ref` 指向原失败，目标验收指向原目标，后续接续指向修正；本地验证、回归、验收、采用、效果及接续版本须一致。原场景与受影响回归、目标验收、采用、效果和后续接续的证据还须给出与问题相同的 `resource`；缺范围为待证，明确异域证据阻断，不能用同版本命令退出 0 接受另一对象。仅命令退出 0 不证明业务目标完成，执行者须核对实际输出和目标语义。修后尚未正式采用、没有效果或没有后续使用证据时为 `needs_evidence`，但不得把可本地复测的部分推迟到后续任务。
 
 当前有效用户目标或项目验收契约要求独立验收时，完整关闭还需 `issue.independent_verification.attempts`，按发生顺序保留每次独立任务的 `task_ref`、`version`、`lock_ref`、`verdict_ref`、`data_digest`、`environment_digest`、`criteria_digest` 和 `outcome: passed|failed|not_run`。验证任务须不同于实施任务；`verification_lock` 原生消息先固定 `code:<version>`、`data:<SHA-256>`、`environment:<SHA-256>`、`criteria:<SHA-256>`，`verification_verdict` 原生结果再引用该锁的摘要、相同版本及结果。通过和失败须有对应退出状态的命令原件，未运行须有验证任务的原生说明。失败后的下一次尝试须换经实施任务修订的版本，并用 `revision_ref` 引用该版本修正；旧失败仍保留在 `attempts`。最后一次通过版本须与回归、正式采用和效果所用版本相同，`acceptance_owner` 指向独立验证任务，`followup_owner` 仍说明后续接续责任。检查器只能核对给定来源、顺序、摘要和版本，不能自行发现被省略的失败或判断测试覆盖、数据脱敏及业务语义；独立任务据原件判定，不能把实施者自测或合成夹具结果写成真实效果。
 

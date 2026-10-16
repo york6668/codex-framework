@@ -56,6 +56,7 @@ class ProgressChecks(unittest.TestCase):
                                "version": "commit:abc", "acceptance_ref": request["issue"]["acceptance_ref"],
                                "resource": request["issue"]["resource"],
                                "independent_verification": request["issue"]["independent_verification"]}
+        ContinuationChecks().review(request, goal=request["issue"]["goal_ref"])
         self.assertEqual(check.evaluate(request)["status"], "ready")
         request["progress"].pop("independent_verification")
         request.pop("issue")
@@ -222,13 +223,16 @@ class ContinuationChecks(unittest.TestCase):
         snapshot["turns"][0]["items"].append(item)
         return record, item
 
-    def review(self, request):
+    def review(self, request, goal=None):
         import json
-        goal = "codex:user:whole-goal"
-        self.add(request, goal, "goal", "Continue the whole authorized goal", item_type="userMessage")
+        goal = goal or "codex:user:whole-goal"
+        if not any(record["ref"] == goal for record in request["context"].get("evidence", [])):
+            self.add(request, goal, "goal", "Continue the whole authorized goal", item_type="userMessage")
         request["progress"]["goal_ref"] = goal
-        self.add(request, "codex:review:remaining", "goal_review", json.dumps({"goal_ref": goal,
-            "step_ids": [s["id"] for s in request["progress"]["steps"]]}))
+        projection = {"goal_ref": goal, "step_ids": [s["id"] for s in request["progress"]["steps"]]}
+        if request["progress"]["claim"] == "completed":
+            projection.update(version=request["progress"].get("version"), resource=request["progress"].get("resource"))
+        self.add(request, "codex:review:remaining", "goal_review", json.dumps(projection))
         request["progress"]["continuation"] = {"review_ref": "codex:review:remaining"}
 
     def base(self):
@@ -753,13 +757,321 @@ class TaskBoundaryChecks(unittest.TestCase):
         self.assertIn('tested_release_version', result['missing'])
         request['context']['native_operations'][0]['state'] = 'succeeded'
         record, item = ContinuationChecks().add(request, 'codex:test:combined', 'release_test',
-            'combination regression commit:merged', item_type='commandExecution', version='commit:merged', result='passed')
+            'combination regression commit:merged', item_type='commandExecution', version='commit:merged', result='passed',
+            resource=copy.deepcopy(target), related_ref=request['issue']['goal_ref'])
         item.update(status='completed', exitCode=0, command='combination regression commit:merged')
         self.assertIn('independent_verification_version_mismatch', check.evaluate(request)['missing'])
         fixtures.attach_independent_verification(request, 'commit:merged', suffix='combined')
         self.assertEqual(check.evaluate(request)['status'], 'ready')
         item['exitCode'] = 1
         self.assertIn('tested_release_version', check.evaluate(request)['missing'])
+
+
+
+class DeliveryAcceptanceChecks(unittest.TestCase):
+    """Completion evidence must describe the requested target, not just a run."""
+
+    def completed(self):
+        request = fixtures.ClosureChecks().close_case()
+        issue = request['issue']
+        request['phase'] = 'progress'
+        request['progress'] = {'checkpoint': 'stage_end', 'claim': 'completed', 'steps': [],
+            'goal_ref': issue['goal_ref'], 'version': issue['regression']['version'],
+            'acceptance_ref': issue['acceptance_ref'], 'resource': copy.deepcopy(issue['resource']),
+            'independent_verification': copy.deepcopy(issue['independent_verification'])}
+        ContinuationChecks().review(request, goal=issue['goal_ref'])
+        return request
+
+    def publish(self):
+        request = self.completed()
+        issue = request['issue']
+        request['phase'] = 'action'
+        request['action'] = {'kind': 'publish', 'resource': copy.deepcopy(issue['resource']),
+            'effect_key': 'publish-fixed', 'release': {'goal_ref': issue['goal_ref'],
+                'version': issue['regression']['version'], 'test_ref': 'codex:test:release',
+                'independent_verification': copy.deepcopy(issue['independent_verification'])}}
+        _, item = ContinuationChecks().add(request, 'codex:test:release', 'release_test',
+            'test commit:abc', item_type='commandExecution', result='passed', version='commit:abc',
+            resource=copy.deepcopy(issue['resource']), related_ref=issue['goal_ref'])
+        item.update(status='completed', exitCode=0, command='test commit:abc')
+        return request
+
+    def rewrite_review(self, request, **changes):
+        import hashlib
+        import json
+        record = next(r for r in request['context']['evidence']
+                      if r['ref'] == request['progress']['continuation']['review_ref'])
+        item = next(i for src in request['context']['native_sources'] for turn in src['turns']
+                    for i in turn['items'] if i['id'] == record['native_item_id'])
+        body = json.loads(item['text'])
+        body.update(changes)
+        item['text'] = json.dumps(body)
+        record['digest'] = hashlib.sha256(item['text'].encode()).hexdigest()
+
+    def test_completion_acceptance_scope_is_required_and_exact(self):
+        request = self.completed()
+        self.assertEqual(check.evaluate(request)['status'], 'ready')
+        record = next(r for r in request['context']['evidence'] if r['kind'] == 'acceptance')
+        record['resource'] = {'kind': 'repo', 'id': 'framework', 'path': 'scripts/scheduler.py'}
+        self.assertIn('goal_acceptance_resource_mismatch', check.evaluate(request)['blocked'])
+        record.pop('resource')
+        self.assertIn('goal_acceptance_scope', check.evaluate(request)['missing'])
+
+    def test_final_message_or_terminal_command_is_not_goal_acceptance(self):
+        request = self.completed()
+        record = next(r for r in request['context']['evidence'] if r['kind'] == 'acceptance')
+        item = next(i for i in request['context']['native_sources'][0]['turns'][0]['items']
+                    if i['id'] == record['native_item_id'])
+        item.update(type='agentMessage', phase='final_answer', text='completed scheduler investigation commit:abc')
+        self.assertIn('unverified_acceptance_source', check.evaluate(request)['missing'])
+        item.update(type='commandExecution', status='completed', exitCode=1)
+        self.assertIn('unverified_acceptance_source', check.evaluate(request)['missing'])
+
+    def test_all_issue_outcomes_keep_the_same_resource(self):
+        kinds = ['regression_original', 'regression_affected', 'adoption', 'effect', 'acceptance', 'followup']
+        for kind in kinds:
+            with self.subTest(kind=kind):
+                request = fixtures.ClosureChecks().close_case()
+                record = next(r for r in request['context']['evidence'] if r['kind'] == kind)
+                record['resource'] = {'kind': 'repo', 'id': 'framework', 'path': 'scripts/other.py'}
+                label = 'goal_acceptance' if kind == 'acceptance' else kind
+                self.assertIn(label + '_resource_mismatch', check.evaluate(request)['blocked'])
+                record.pop('resource')
+                self.assertIn(label + '_scope', check.evaluate(request)['missing'])
+
+    def test_release_test_goal_resource_and_version_are_independent_bindings(self):
+        request = self.publish()
+        self.assertEqual(check.evaluate(request)['status'], 'ready')
+        record = next(r for r in request['context']['evidence'] if r['kind'] == 'release_test')
+        record['related_ref'] = 'codex:user:another-goal'
+        self.assertIn('release_test_goal_mismatch', check.evaluate(request)['blocked'])
+        record['related_ref'] = request['issue']['goal_ref']
+        record['resource'] = {'kind': 'repo', 'id': 'framework', 'path': 'scripts/scheduler.py'}
+        self.assertIn('release_test_resource_mismatch', check.evaluate(request)['blocked'])
+        record['resource'] = copy.deepcopy(request['issue']['resource'])
+        record.pop('related_ref')
+        self.assertIn('release_test_goal_reference', check.evaluate(request)['missing'])
+        record['related_ref'] = request['issue']['goal_ref']
+        request['action']['release']['version'] = 'commit:merged'
+        self.assertIn('tested_release_version', check.evaluate(request)['missing'])
+
+    def test_completed_cannot_omit_a_supplied_unfinished_goal_review(self):
+        request = self.completed()
+        self.rewrite_review(request, step_ids=['farside-repair'])
+        self.assertIn('remaining_goals_omitted_or_unreviewed', check.evaluate(request)['blocked'])
+        request['progress'].pop('continuation')
+        self.assertIn('remaining_goal_review', check.evaluate(request)['missing'])
+        self.assertFalse(check.evaluate(request)['wait_allowed'])
+
+    def test_completion_review_matches_candidate_version_and_resource(self):
+        request = self.completed()
+        self.rewrite_review(request, version='commit:older')
+        self.assertIn('goal_review_version_mismatch', check.evaluate(request)['missing'])
+        self.rewrite_review(request, version='commit:abc', resource={'kind': 'repo', 'id': 'framework', 'path': 'other'})
+        self.assertIn('goal_review_resource_mismatch', check.evaluate(request)['blocked'])
+        self.rewrite_review(request, resource=None)
+        self.assertIn('goal_review_resource', check.evaluate(request)['missing'])
+
+    def test_newer_remaining_review_prevents_old_empty_finish_and_selects_next_action(self):
+        import json
+        request = self.completed()
+        goal = request['issue']['goal_ref']
+        ContinuationChecks().add(request, 'codex:review:after-return', 'goal_review', json.dumps({
+            'goal_ref': goal, 'version': 'commit:abc', 'resource': request['issue']['resource'],
+            'step_ids': ['remaining-fix']}))
+        self.assertIn('newer_goal_review_requires_scope_review', check.evaluate(request)['missing'])
+        request['progress']['continuation']['review_ref'] = 'codex:review:after-return'
+        self.assertIn('remaining_goals_omitted_or_unreviewed', check.evaluate(request)['blocked'])
+        request['progress']['claim'] = 'working'
+        request['progress']['steps'] = [{'id': 'remaining-fix', 'action': {
+            'kind': 'read', 'resource': copy.deepcopy(request['issue']['resource'])}}]
+        self.assertIn('next_step_not_selected', check.evaluate(request)['missing'])
+        request['progress']['continuation']['selected_step_id'] = 'remaining-fix'
+        result = check.evaluate(request)
+        self.assertEqual(result['status'], 'ready')
+        self.assertEqual(result['work_partition']['ready_step_ids'], ['remaining-fix'])
+        self.assertFalse(result['continuous_eligible'])
+
+    def test_unordered_or_unverified_other_review_cannot_silently_validate_completion(self):
+        import json
+        request = self.completed()
+        record, item = ContinuationChecks().add(request, 'codex:review:ambiguous', 'goal_review', json.dumps({
+            'goal_ref': request['issue']['goal_ref'], 'step_ids': ['still-open']}))
+        source = request['context']['native_sources'][0]
+        source['turns'][0]['items'].remove(item)
+        request['context']['native_sources'].append({'schemaVersion': 1,
+            'thread': {'id': request['task']['native_ref'].removeprefix('codex:thread:')},
+            'turns': [{'items': [item]}]})
+        self.assertIn('goal_review_order_unverified', check.evaluate(request)['missing'])
+        record['digest'] = '0' * 64
+        self.assertIn('goal_review_source_unverified', check.evaluate(request)['missing'])
+
+    def test_malformed_outcome_scope_has_structured_cli_error(self):
+        import json
+        import subprocess
+        request = self.completed()
+        next(r for r in request['context']['evidence'] if r['kind'] == 'acceptance')['resource'] = []
+        frozen = json.dumps(request)
+        p = subprocess.run([sys.executable, '-B', str(Path(__file__).resolve().parents[1] /
+            'scripts/codex_framework.py'), 'check'], input=frozen, text=True, capture_output=True, timeout=10)
+        self.assertEqual(p.returncode, 1)
+        self.assertEqual(p.stderr, '')
+        self.assertEqual(json.loads(p.stdout)['status'], 'invalid')
+
+
+class AuthorizationScopeContinuationChecks(unittest.TestCase):
+    """A scoped handoff reuses a covering grant to the same actual recipient."""
+
+    def setUp(self):
+        import tempfile
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name).resolve() / "repo"
+        (self.root / "scripts").mkdir(parents=True)
+
+    def request(self):
+        request = ContinuationChecks().handoff("received")
+        request["project"]["root"] = str(self.root)
+        h = request["progress"]["continuation"]["handoff"]
+        authorization = next(r for r in request["context"]["evidence"] if r["ref"] == h["authorization_ref"])
+        authorization["resource"] = {"kind": "repo", "id": "framework", "path": "scripts"}
+        authorization["workspace"].update(execution_nodes=["mac-mini"], data_nodes=["mac-mini"],
+            destination_nodes=["mac-mini"], side_effects=["read"])
+        return request
+
+    def test_same_authorized_recipient_accepts_safe_child_scope(self):
+        result = check.evaluate(self.request())
+        self.assertEqual(result["status"], "ready")
+        self.assertEqual(result["continuation_state"], "received")
+
+    def test_missing_path_facts_requests_evidence_without_new_message_authority(self):
+        request = self.request()
+        request["project"].pop("root")
+        result = check.evaluate(request)
+        self.assertIn("handoff_authorized_resource_unverified", result["missing"])
+        self.assertNotIn("handoff_message_authorization", result["missing"])
+        self.assertNotEqual(result["status"], "ready")
+
+    def test_covering_directory_does_not_authorize_another_recipient(self):
+        request = self.request()
+        request["progress"]["continuation"]["handoff"]["target_task_ref"] = "codex:thread:another-task"
+        self.assertIn("handoff_message_authorization", check.evaluate(request)["missing"])
+
+    def test_handoff_child_cannot_escape_grant_through_symlink_or_node(self):
+        outside = self.root.parent / "outside"
+        outside.mkdir()
+        (self.root / "scripts/escape").symlink_to(outside, target_is_directory=True)
+        request = self.request()
+        request["progress"]["steps"][0]["action"]["resource"]["path"] = "scripts/escape/new.py"
+        self.assertIn("handoff_message_authorization", check.evaluate(request)["missing"])
+        request = self.request()
+        request["progress"]["steps"][0]["action"]["workspace"]["execution_node"] = "another-node"
+        self.assertIn("handoff_outside_authorized_workspace", check.evaluate(request)["blocked"])
+
+
+    def bound_request(self):
+        request = self.request()
+        h = request["progress"]["continuation"]["handoff"]
+        ref = h["authorization_ref"]
+        text = "Send only this scripts directory scope on mac-mini to the existing review task. No other execution, data or destination node is authorized."
+        native = next(i for s in request["context"]["native_sources"] for t in s["turns"] for i in t["items"] if i["id"] == ref)
+        native["text"] = text
+        import hashlib
+        next(r for r in request["context"]["evidence"] if r["ref"] == ref)["digest"] = hashlib.sha256(text.encode()).hexdigest()
+        return request
+
+    def identity_proof(self, request, aliases, node="mac-mini", item_type="commandExecution", root=None):
+        import json
+        body = json.dumps({"node_id": node, "aliases": aliases, "root": str(root or self.root)})
+        record, native = ContinuationChecks().add(request, "codex:node:identity", "node_identity", body,
+            item_type=item_type, result="observed", node_id=node)
+        if item_type == "commandExecution":
+            native.update(status="completed", exitCode=0, command="observe existing node and checkout identity")
+        request["context"]["node_identity_ref"] = record["ref"]
+
+    def test_original_grant_nodes_survive_all_or_single_proposed_node_changes(self):
+        import json
+        keys = ["execution_node", "data_node", "destination_node"]
+        for changed in ([key] for key in keys):
+            request = self.bound_request()
+            for key in changed:
+                request["progress"]["steps"][0]["action"]["workspace"][key] = "foreign-node"
+            before = json.dumps(request, sort_keys=True)
+            result = check.evaluate(request)
+            self.assertIn("handoff_outside_authorized_workspace", result["blocked"])
+            self.assertFalse(result["handoff_received"])
+            self.assertEqual(json.dumps(request, sort_keys=True), before)
+        request = self.bound_request()
+        for key in keys:
+            request["progress"]["steps"][0]["action"]["workspace"][key] = "foreign-node"
+        result = check.evaluate(request)
+        self.assertIn("handoff_outside_authorized_workspace", result["blocked"])
+        self.assertFalse(result["handoff_received"])
+
+    def test_original_node_and_effect_bounds_apply_also_to_exact_resource(self):
+        request = self.bound_request()
+        h = request["progress"]["continuation"]["handoff"]
+        grant = next(r for r in request["context"]["evidence"] if r["ref"] == h["authorization_ref"])
+        grant["resource"] = dict(request["progress"]["steps"][0]["action"]["resource"])
+        for key in ["execution_node", "data_node", "destination_node"]:
+            request["progress"]["steps"][0]["action"]["workspace"][key] = "foreign-node"
+        self.assertFalse(check.evaluate(request)["handoff_received"])
+        request = self.bound_request()
+        request["progress"]["steps"][0]["action"]["workspace"]["side_effect"] = "local_change"
+        self.assertIn("handoff_outside_authorized_workspace", check.evaluate(request)["blocked"])
+
+    def test_verified_node_alias_keeps_the_original_machine_and_directory(self):
+        request = self.bound_request()
+        for key in ["execution_node", "data_node", "destination_node"]:
+            request["progress"]["steps"][0]["action"]["workspace"][key] = "known-host.local"
+        self.identity_proof(request, ["known-host.local"])
+        result = check.evaluate(request)
+        self.assertEqual(result["status"], "ready")
+        self.assertTrue(result["handoff_received"])
+
+    def test_unknown_self_asserted_or_wrong_source_alias_cannot_change_machine(self):
+        for mode in ("absent", "self_asserted", "assistant", "other_node", "other_root"):
+            with self.subTest(mode=mode):
+                request = self.bound_request()
+                for key in ["execution_node", "data_node", "destination_node"]:
+                    request["progress"]["steps"][0]["action"]["workspace"][key] = "unknown-host.local"
+                if mode == "self_asserted":
+                    request["context"]["node_aliases"] = {"unknown-host.local": "mac-mini"}
+                elif mode == "assistant":
+                    self.identity_proof(request, ["unknown-host.local"], item_type="agentMessage")
+                elif mode == "other_node":
+                    self.identity_proof(request, ["unknown-host.local"], node="foreign-node")
+                elif mode == "other_root":
+                    self.identity_proof(request, ["unknown-host.local"], root=self.root.parent)
+                result = check.evaluate(request)
+                self.assertNotEqual(result["status"], "ready")
+                self.assertFalse(result["handoff_received"])
+
+    def test_alias_resolution_retains_platform_refusal_and_recipient_bounds(self):
+        request = self.bound_request()
+        action = request["progress"]["steps"][0]["action"]
+        for key in ["execution_node", "data_node", "destination_node"]:
+            action["workspace"][key] = "known-host.local"
+        self.identity_proof(request, ["known-host.local"])
+        request["context"]["tool_failures"] = [{"kind": "platform_denied", "action_kind": "read",
+            "resource": dict(action["resource"]), "destination_node": "mac-mini", "side_effect": "read"}]
+        result = check.evaluate(request)
+        self.assertEqual(result["steps"][0]["state"], "direct_refusal")
+        self.assertFalse(result["handoff_received"])
+
+
+    def test_old_exact_message_grant_without_node_fields_stays_compatible(self):
+        request = ContinuationChecks().handoff("received")
+        request["progress"]["steps"][0]["action"].pop("workspace")
+        result = check.evaluate(request)
+        self.assertEqual(result["status"], "ready")
+        self.assertTrue(result["handoff_received"])
+
+    def test_malformed_identity_reference_is_structured_input_error(self):
+        request = self.bound_request()
+        request["context"]["node_identity_ref"] = []
+        with self.assertRaises(check.CheckError):
+            check.evaluate(request)
 
 
 if __name__ == "__main__":

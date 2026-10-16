@@ -8,6 +8,7 @@ history or grants permissions that the underlying platform has not granted.
 import json
 import re
 import sys
+from pathlib import Path, PureWindowsPath
 from datetime import datetime, timezone
 
 from source_evidence import native_item, native_precedes, source_body, source_text, verify as verify_source
@@ -55,6 +56,89 @@ def covers(scope, target, write):
     return (base[:2] == target[:2]
             and (not base[2] or target[2] == base[2] or target[2].startswith(base[2] + "/"))
             and (access == "write" or not write))
+
+
+def workspace_covers(authorized, proposed, required=False):
+    """Keep the original grant's explicit node/effect bounds, including reads."""
+    if not isinstance(authorized, dict):
+        return None
+    bounds = ("execution_nodes", "data_nodes", "destination_nodes", "side_effects")
+    if not required and not any(key in authorized for key in bounds):
+        return True  # Older exact-resource message grants need no new node fields.
+    if not isinstance(proposed, dict):
+        return None
+    for actual, permitted in (("execution_node", "execution_nodes"), ("data_node", "data_nodes"),
+                              ("destination_node", "destination_nodes"), ("side_effect", "side_effects")):
+        if permitted not in authorized:
+            if required:
+                return None
+            continue
+        values = items(authorized[permitted], "authorized " + permitted)
+        for value in values:
+            identifier(value, "authorized " + permitted + " entry")
+        if any(value.strip().casefold() in {"unknown", "unspecified", "?", "*"} for value in values):
+            return None
+        if proposed.get(actual) not in values:
+            return False
+    return True
+
+
+def authorization_covers(declared, target, project, workspace=None, authorized=None, root_node=None):
+    """Compare an existing grant; None means local path identity is unverified.
+
+    Only a known, existing directory in this project's local checkout can
+    extend a resource grant to descendants. No filesystem names grant authority.
+    """
+    if declared is None or target is None:
+        return False
+    allowed, requested = resource(declared), resource(target)
+    unknown = {"unknown", "unspecified", "?", "*"}
+    if any(part.strip().casefold() in unknown for part in (*allowed[:2], *requested[:2])):
+        return None
+    if allowed[:2] != requested[:2]:
+        return False
+    if allowed[2] and requested[2] != allowed[2] and not requested[2].startswith(allowed[2] + "/"):
+        return False
+    exact = allowed == requested
+    if allowed[0] != "repo":
+        return True if exact else None
+    if any("\\" in path or "\x00" in path or PureWindowsPath(path).drive
+           for path in (allowed[2], requested[2])):
+        return False
+    checkout = project.get("root")
+    if allowed[1] != project.get("id") or not checkout:
+        return True if exact else None
+    if not isinstance(checkout, str) or not Path(checkout).is_absolute():
+        return None
+    if not exact:
+        bounds = workspace_covers(authorized, workspace, required=True)
+        if bounds is not True:
+            return bounds
+        nodes = [workspace.get(key) for key in ("execution_node", "data_node", "destination_node")]
+        original_nodes = set(authorized["data_nodes"])
+        anchor = root_node or (next(iter(original_nodes)) if len(original_nodes) == 1 else None)
+        if anchor is None:
+            return None
+        if anchor not in original_nodes or any(node != anchor for node in nodes):
+            return False
+    try:
+        base = Path(checkout).resolve(strict=True)
+        if not base.is_dir():
+            return None
+        directory = (base / allowed[2]).resolve(strict=not exact)
+        destination = (base / requested[2]).resolve(strict=False)
+        if not directory.is_relative_to(base) or not destination.is_relative_to(directory):
+            return False
+        if not exact and not directory.is_dir():
+            return False
+        existing = destination
+        while not existing.exists() and existing != base:
+            existing = existing.parent
+        if existing.stat().st_dev != base.stat().st_dev:
+            return False
+        return True
+    except (OSError, ValueError, RuntimeError):
+        return None
 
 
 def overlaps(left, right):
@@ -308,6 +392,57 @@ def evaluate(payload):
             return None
         return record
 
+    # Optional node facts resolve names, never enlarge the original user grant.
+    node_aliases, observed_root_node = {}, None
+    identity_ref = context.get("node_identity_ref")
+    if identity_ref is not None:
+        identifier(identity_ref, "context.node_identity_ref")
+        identity_record = linked(identity_ref, "node_identity")
+        identity_item = native_item(context, identity_record) if identity_record else None
+        identity_body = source_body(context, identity_record) if identity_record else None
+        try:
+            observed = json.loads(identity_body) if identity_body else None
+            valid = (isinstance(observed, dict) and set(observed) == {"node_id", "aliases", "root"}
+                     and identity_item is not None and identity_item.get("type") == "commandExecution"
+                     and identity_item.get("status") == "completed" and identity_item.get("exitCode") == 0
+                     and identity_record.get("result") == "observed"
+                     and observed.get("node_id") == identity_record.get("node_id")
+                     and isinstance(observed.get("node_id"), str) and bool(observed["node_id"].strip())
+                     and isinstance(observed.get("aliases"), list)
+                     and all(isinstance(v, str) and bool(v.strip()) for v in observed["aliases"])
+                     and len(set(observed["aliases"])) == len(observed["aliases"])
+                     and not any(v.strip().casefold() in {"unknown", "unspecified", "?", "*"}
+                                 for v in [observed["node_id"], *observed["aliases"]])
+                     and isinstance(observed.get("root"), str) and Path(observed["root"]).is_absolute()
+                     and isinstance(project.get("root"), str) and Path(project["root"]).is_absolute()
+                     and Path(observed["root"]).resolve(strict=True) == Path(project["root"]).resolve(strict=True))
+        except (OSError, ValueError, RuntimeError):
+            valid = False
+        if valid:
+            observed_root_node = observed["node_id"]
+            node_aliases = {v: observed_root_node for v in [observed_root_node, *observed["aliases"]]}
+        else:
+            need("node_identity_unverified")
+
+    def node_identity(value):
+        return node_aliases.get(value, value) if isinstance(value, str) else value
+
+    def workspace_identity(value, plural=False):
+        if not isinstance(value, dict):
+            return value
+        result = dict(value)
+        for key in (("execution_nodes", "data_nodes", "destination_nodes") if plural else
+                    ("execution_node", "data_node", "destination_node", "responsible_node")):
+            if key in result:
+                result[key] = [node_identity(v) for v in items(result[key], "authorized " + key)] if plural else node_identity(result[key])
+        return result
+
+    def denied_matches(failure, action, target, workspace):
+        original = dict(failure)
+        if "destination_node" in original:
+            original["destination_node"] = node_identity(original["destination_node"])
+        return denied_action_matches(original, action, target, workspace_identity(workspace))
+
     def check_current_goal(ref, required=False):
         """Review the selected goal at every handoff or completion boundary."""
         candidates = [record for record in evidence.values()
@@ -352,6 +487,16 @@ def evaluate(payload):
                         or source_record.get("version") != version
                         or not verify_source(context, project, source_record)):
                     need("accepted_correction_unverified")
+
+    def check_outcome_scope(record, target, label):
+        """A successful result for another resource cannot accept this target."""
+        if record is None:
+            return
+        declared = record.get("resource")
+        if declared is None:
+            need(label + "_scope")
+        elif resource(declared) != target:
+            block(label + "_resource_mismatch")
 
     def check_local_verification(validation, target, version):
         """Check fixed expectations against manually observed local outputs."""
@@ -558,7 +703,7 @@ def evaluate(payload):
                 target = resource(action["resource"])
                 workspace = action.get("workspace")
                 matching = [f for f in tool_failures(context)
-                            if denied_action_matches(f, action, target, workspace)]
+                            if denied_matches(f, action, target, workspace)]
                 if not any((record := linked(f.get("ref"), "failure")) is not None
                            and record.get("result") == "failed" for f in matching):
                     need("wait_refusal_unverified")
@@ -578,6 +723,7 @@ def evaluate(payload):
                 need("verification_resource")
             else:
                 completed_target = resource(target)
+                check_outcome_scope(acceptance, completed_target, "goal_acceptance")
                 if (not any(covers(scope, completed_target, False) for scope in project_scopes)
                         or not any(covers(scope, completed_target, False) for scope in task_scopes)):
                     block("progress_outside_scope")
@@ -595,7 +741,7 @@ def evaluate(payload):
         continuation_state, selected_step = "not_checked", None
         received = False
         if continuation is None:
-            if claim == "waiting":
+            if claim in ("waiting", "completed"):
                 need("remaining_goal_review")
         else:
             continuation = obj(continuation, "progress.continuation")
@@ -620,6 +766,36 @@ def evaluate(payload):
                     need("remaining_goal_review_for_current_goal")
                 if set(remaining) != set(by_id):
                     block("remaining_goals_omitted_or_unreviewed")
+                if claim == "completed":
+                    if not progress.get("version") or projection.get("version") != progress.get("version"):
+                        need("goal_review_version_mismatch")
+                    reviewed_resource = projection.get("resource")
+                    if reviewed_resource is None:
+                        need("goal_review_resource")
+                    elif target is not None and resource(reviewed_resource) != resource(target):
+                        block("goal_review_resource_mismatch")
+                    # Do not accept an older empty review while a supplied later
+                    # review of this same goal still has work. This remains a
+                    # comparison of provided sources, not goal discovery.
+                    for candidate in evidence.values():
+                        if (candidate.get("kind") != "goal_review" or candidate == review
+                                or candidate.get("project_id") != project_id
+                                or candidate.get("task_ref") != task_ref):
+                            continue
+                        candidate_body = source_body(context, candidate)
+                        try:
+                            candidate_review = json.loads(candidate_body) if candidate_body else None
+                        except ValueError:
+                            candidate_review = None
+                        if not isinstance(candidate_review, dict):
+                            need("goal_review_source_unverified")
+                            continue
+                        if candidate_review.get("goal_ref") != projection.get("goal_ref"):
+                            continue
+                        if native_precedes(context, review, candidate):
+                            need("newer_goal_review_requires_scope_review")
+                        elif not native_precedes(context, candidate, review):
+                            need("goal_review_order_unverified")
             selected_step = continuation.get("selected_step_id")
             if selected_step is not None:
                 identifier(selected_step, "continuation.selected_step_id")
@@ -652,17 +828,30 @@ def evaluate(payload):
                     raise CheckError("authorization message content must be an array")
                 delegated = ("<codex_delegation>" in (authority_text or "") or
                              any(isinstance(b, dict) and b.get("codexDelegation") for b in blocks))
-                authority_scope = obj(authorization.get("workspace", {}), "message authorization.workspace") if authorization else {}
+                authority_scope = workspace_identity(obj(authorization.get("workspace", {}), "message authorization.workspace"), plural=True) if authorization else {}
                 targets = items(authority_scope.get("target_task_refs", []), "authorized target_task_refs")
                 for target in targets:
                     identifier(target, "authorized target task")
-                selected_resource = next((entry["action"]["resource"] for entry in steps
-                                          if entry["id"] == selected_step), None)
-                allowed = (authorization is not None and authorization.get("result") == "granted"
-                           and authority_item is not None and authority_item.get("type") == "userMessage"
-                           and not delegated and target_task in targets
-                           and authorization.get("resource") == selected_resource)
-                if not allowed:
+                selected_action = next((entry["action"] for entry in steps
+                                        if entry["id"] == selected_step), None)
+                authority_valid = (authorization is not None and authorization.get("result") == "granted"
+                                   and authority_item is not None and authority_item.get("type") == "userMessage"
+                                   and not delegated and target_task in targets)
+                selected_workspace = workspace_identity(selected_action.get("workspace")) if selected_action else None
+                node_bounds = workspace_covers(authority_scope, selected_workspace) if authority_valid else False
+                coverage = (authorization_covers(authorization.get("resource"), selected_action.get("resource"),
+                                                 project, selected_workspace, authority_scope, observed_root_node)
+                            if authority_valid and selected_action else False)
+                allowed = authority_valid and coverage is True and node_bounds is True
+                if authority_valid and node_bounds is False:
+                    block("handoff_outside_authorized_workspace")
+                elif authority_valid and node_bounds is None:
+                    need("handoff_authorized_workspace_unverified")
+                if authority_valid and coverage is None:
+                    need("handoff_authorized_resource_unverified")
+                elif not allowed and node_bounds is not False:
+                    need("handoff_message_authorization")
+                elif not authority_valid:
                     need("handoff_message_authorization")
 
                 def event(ref, kind, owner):
@@ -775,6 +964,8 @@ def evaluate(payload):
         check_local_verification(validation, target, validation.get("version"))
     elif phase == "action":
         action = obj(payload.get("action"), "action")
+        if "workspace" in action:
+            action = {**action, "workspace": workspace_identity(action["workspace"])}
         kind = action.get("kind")
         if kind not in ("read", "write", "invoke", "repair", "publish"):
             raise CheckError("action.kind is invalid")
@@ -863,16 +1054,18 @@ def evaluate(payload):
                     if (source is None or cause is None or correction is None
                             or correction.get("result") != "verified"):
                         need("local_resource_diagnosis_before_retry")
-            if denied_action_matches(failure, action, target, action.get("workspace")):
+            if denied_matches(failure, action, target, action.get("workspace")):
                 block("platform_denied_action")
-            if (failure.get("kind") == "user_cancelled" and denied_action_matches(
+            if (failure.get("kind") == "user_cancelled" and denied_matches(
                     {**failure, "kind": "platform_denied"}, action, target, action.get("workspace"))):
                 block("user_cancelled_action")
         workspace = action.get("workspace")
         incident = context.get("incident")
         incident_target = None
         if incident is not None:
-            incident = obj(incident, "context.incident")
+            incident = workspace_identity(obj(incident, "context.incident"))
+            if "destination_nodes" in incident:
+                incident["destination_nodes"] = [node_identity(v) for v in items(incident["destination_nodes"], "incident.destination_nodes")]
             incident_target = resource(incident.get("resource"))
             if overlaps(incident_target, target) and workspace is None:
                 need("workspace_boundary_for_incident")
@@ -919,12 +1112,13 @@ def evaluate(payload):
                     need("cross_environment_authorization" if cross_environment
                          else "local_action_authorization")
                 else:
-                    authorized = obj(authorization.get("workspace", {}), "authorization.workspace")
-                    if (authorization.get("resource") != action.get("resource")
-                            or executor not in items(authorized.get("execution_nodes", []), "authorized execution_nodes")
-                            or data_node not in items(authorized.get("data_nodes", []), "authorized data_nodes")
-                            or destination not in items(authorized.get("destination_nodes", []), "authorized destination_nodes")
-                            or side_effect not in items(authorized.get("side_effects", []), "authorized side_effects")):
+                    authorized = workspace_identity(obj(authorization.get("workspace", {}), "authorization.workspace"), plural=True)
+                    coverage = authorization_covers(authorization.get("resource"), action.get("resource"),
+                                                     project, workspace, authorized, observed_root_node)
+                    if coverage is None:
+                        need("authorized_resource_path_unverified")
+                    if (coverage is False
+                            or workspace_covers(authorized, workspace, required=True) is not True):
                         block("outside_authorized_workspace")
             if cross_environment:
                 review = linked(workspace.get("risk_review_ref"), "risk_review") if workspace.get("risk_review_ref") else None
@@ -1044,12 +1238,18 @@ def evaluate(payload):
                 block("tool_context_is_not_implementation_defect")
         if kind == "publish":
             release = obj(action.get("release", {}), "action.release")
-            check_current_goal(release.get("goal_ref"), required=True)
+            release_goal = check_current_goal(release.get("goal_ref"), required=True)
             test = linked(release.get("test_ref"), "release_test")
             if (not release.get("version") or test is None
                     or test.get("version") != release.get("version")
                     or test.get("result") != "passed"):
                 need("tested_release_version")
+            check_outcome_scope(test, target, "release_test")
+            if test is not None:
+                if not test.get("related_ref") or release_goal is None:
+                    need("release_test_goal_reference")
+                elif test.get("related_ref") != release_goal.get("ref"):
+                    block("release_test_goal_mismatch")
             if (release.get("independent_verification") is not None
                     or project.get("independent_verification_required") is True):
                 check_independent_verification(release.get("independent_verification"),
@@ -1133,6 +1333,11 @@ def evaluate(payload):
                 or continuation.get("version") != regression.get("version")
                 or continuation.get("related_ref") != issue.get("fix_ref")):
             need("followup_used_correction")
+        if target is not None:
+            for record, label in ((original, "regression_original"), (affected, "regression_affected"),
+                                  (applied, "adoption"), (observed, "effect"),
+                                  (acceptance, "goal_acceptance"), (continuation, "followup")):
+                check_outcome_scope(record, target, label)
         verification = issue.get("independent_verification")
         attempts = verification.get("attempts", []) if isinstance(verification, dict) else []
         verifier = attempts[-1].get("task_ref") if attempts and isinstance(attempts[-1], dict) else None

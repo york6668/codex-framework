@@ -26,6 +26,9 @@ def evidence(ref, kind, *, source="codex", result=None, version=None, related_re
              value_digest=None, resource=None):
     record = {"ref": ref, "source": source, "kind": kind,
               "project_id": "isolated-project", "task_ref": THREAD}
+    if resource is None and kind in ("regression_original", "regression_affected", "acceptance",
+                                    "adoption", "effect", "followup"):
+        resource = dict(RESOURCE)
     for key, value in (("result", result), ("version", version),
                        ("related_ref", related_ref), ("digest", value_digest),
                        ("resource", resource)):
