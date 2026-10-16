@@ -36,6 +36,17 @@ def identifier(value, name):
     return value
 
 
+def direct_user_message(item, body):
+    """Filter known delegation forms from an already verified native item."""
+    if item is None or item.get("type") != "userMessage":
+        return False
+    blocks = item.get("content", [])
+    if not isinstance(blocks, list):
+        raise CheckError("user message content must be an array")
+    return ("<codex_delegation>" not in (body or "")
+            and not any(isinstance(block, dict) and "codexDelegation" in block for block in blocks))
+
+
 def resource(value):
     value = obj(value, "resource")
     kind = identifier(value.get("kind"), "resource.kind")
@@ -838,7 +849,7 @@ def evaluate(payload):
         if checkpoint not in ("after_failure", "wait", "stage_end", "handoff"):
             raise CheckError("progress.checkpoint is invalid")
         claim = progress.get("claim", "working")
-        if claim not in ("working", "waiting", "completed", "continuous_tracking"):
+        if claim not in ("working", "waiting", "paused", "completed", "continuous_tracking"):
             raise CheckError("progress.claim is invalid")
         steps = items(progress.get("steps", []), "progress.steps")
         if len(steps) > 32:
@@ -881,6 +892,8 @@ def evaluate(payload):
                 state = "blocked"
             decision = {"id": step_id, "state": state,
                         "blocked": single["blocked"], "missing": single["missing"]}
+            if "access_route" in single:
+                decision["access_route"] = single["access_route"]
             decisions.append(decision)
             by_id[step_id] = decision
         if claim == "working" and any(s["state"] == "needs_evidence" for s in decisions):
@@ -935,14 +948,18 @@ def evaluate(payload):
         # It never discovers omitted user goals or sends a message itself.
         continuation = progress.get("continuation")
         continuation_state, selected_step = "not_checked", None
-        received = False
+        received, executed = False, False
+        review = None
         if continuation is None:
-            if claim in ("waiting", "completed"):
+            if claim in ("waiting", "paused", "completed") or checkpoint in ("stage_end", "handoff"):
                 need("remaining_goal_review")
         else:
             continuation = obj(continuation, "progress.continuation")
-            if set(continuation) - {"review_ref", "selected_step_id", "handoff"}:
-                raise CheckError("continuation may contain only review, selection and handoff references")
+            if set(continuation) - {"review_ref", "selected_step_id", "handoff", "event_ref", "execution_ref"}:
+                raise CheckError("continuation may contain only review, event, selection, execution and handoff references")
+            for key in ("review_ref", "event_ref", "execution_ref"):
+                if key in continuation:
+                    identifier(continuation[key], "continuation." + key)
             review = linked(continuation.get("review_ref"), "goal_review")
             body = source_body(context, review) if review else None
             try:
@@ -960,8 +977,20 @@ def evaluate(payload):
                     raise CheckError("goal review step IDs must be unique")
                 if selected_goal is None or projection.get("goal_ref") != selected_goal.get("ref"):
                     need("remaining_goal_review_for_current_goal")
+                elif not native_precedes(context, selected_goal, review):
+                    need("goal_review_order_unverified")
                 if set(remaining) != set(by_id):
                     block("remaining_goals_omitted_or_unreviewed")
+                # A supplied current event must be followed by this review, not
+                # an older pre-dispatch plan reused after a worker returns.
+                if "event_ref" in continuation:
+                    current_event = linked(continuation["event_ref"], "continuation_event")
+                    event_item = native_item(context, current_event) if current_event else None
+                    if (event_item is None or event_item.get("type") not in
+                            ("userMessage", "functionCallOutput", "commandExecution")
+                            or current_event.get("related_ref") != projection.get("goal_ref")
+                            or not native_precedes(context, current_event, review)):
+                        need("post_event_goal_review_unverified")
                 if claim == "completed":
                     if not progress.get("version") or projection.get("version") != progress.get("version"):
                         need("goal_review_version_mismatch")
@@ -970,42 +999,63 @@ def evaluate(payload):
                         need("goal_review_resource")
                     elif target is not None and resource(reviewed_resource) != resource(target):
                         block("goal_review_resource_mismatch")
-                    # Do not accept an older empty review while a supplied later
-                    # review of this same goal still has work. This remains a
-                    # comparison of provided sources, not goal discovery.
-                    for candidate in evidence.values():
-                        if (candidate.get("kind") != "goal_review" or candidate == review
-                                or candidate.get("project_id") != project_id
-                                or candidate.get("task_ref") != task_ref):
-                            continue
-                        candidate_body = source_body(context, candidate)
-                        try:
-                            candidate_review = json.loads(candidate_body) if candidate_body else None
-                        except ValueError:
-                            candidate_review = None
-                        if not isinstance(candidate_review, dict):
-                            need("goal_review_source_unverified")
-                            continue
-                        if candidate_review.get("goal_ref") != projection.get("goal_ref"):
-                            continue
-                        if native_precedes(context, review, candidate):
-                            need("newer_goal_review_requires_scope_review")
-                        elif not native_precedes(context, candidate, review):
-                            need("goal_review_order_unverified")
+                # Do not reuse a pre-result review when a supplied later review
+                # of this goal exists. This compares supplied sources only.
+                for candidate in evidence.values():
+                    if (candidate.get("kind") != "goal_review" or candidate == review
+                            or candidate.get("project_id") != project_id
+                            or candidate.get("task_ref") != task_ref):
+                        continue
+                    candidate_body = source_body(context, candidate)
+                    try:
+                        candidate_review = json.loads(candidate_body) if candidate_body else None
+                    except ValueError:
+                        candidate_review = None
+                    if not isinstance(candidate_review, dict):
+                        need("goal_review_source_unverified")
+                        continue
+                    if candidate_review.get("goal_ref") != projection.get("goal_ref"):
+                        continue
+                    if native_precedes(context, review, candidate):
+                        need("newer_goal_review_requires_scope_review")
+                    elif not native_precedes(context, candidate, review):
+                        need("goal_review_order_unverified")
             selected_step = continuation.get("selected_step_id")
             if selected_step is not None:
                 identifier(selected_step, "continuation.selected_step_id")
                 if selected_step not in by_id or by_id[selected_step]["state"] != "ready":
                     block("selected_step_not_executable")
             elif any(s["state"] == "ready" for s in decisions):
-                need("next_step_not_selected")
+                if claim != "paused":
+                    need("next_step_not_selected")
             continuation_state = "selected" if selected_step else "reviewed"
+            if "execution_ref" in continuation:
+                execution = linked(continuation["execution_ref"], "continuation_execution")
+                execution_item = native_item(context, execution) if execution else None
+                selected_action = next((entry["action"] for entry in steps
+                                        if entry["id"] == selected_step), None)
+                executed = bool(selected_action and by_id[selected_step]["state"] == "ready"
+                    and review is not None and execution is not None
+                    and execution.get("related_ref") == review.get("ref")
+                    and execution.get("result") == "observed"
+                    and execution.get("resource") is not None
+                    and resource(execution["resource"]) == resource(selected_action["resource"])
+                    and execution_item is not None and execution_item.get("type") == "commandExecution"
+                    and execution_item.get("status") == "completed" and execution_item.get("exitCode") == 0
+                    and native_precedes(context, review, execution))
+                if executed:
+                    continuation_state = "executed"
+                else:
+                    need("continuation_execution_unverified")
             handoff = continuation.get("handoff")
             if handoff is not None:
                 handoff = obj(handoff, "continuation.handoff")
                 if set(handoff) - {"target_task_ref", "version", "claim", "authorization_ref",
                                    "sent_ref", "received_ref", "execution_ref", "result_ref"}:
                     raise CheckError("handoff may contain only identity, state and evidence references")
+                for key in ("authorization_ref", "sent_ref", "received_ref", "execution_ref", "result_ref"):
+                    if handoff.get(key) is not None:
+                        identifier(handoff[key], "handoff." + key)
                 target_task = identifier(handoff.get("target_task_ref"), "handoff.target_task_ref")
                 version = identifier(handoff.get("version"), "handoff.version")
                 if not target_task.startswith("codex:thread:") or target_task == task_ref:
@@ -1019,11 +1069,7 @@ def evaluate(payload):
                 authority_item = native_item(context, authorization) if authorization else None
                 authority_text = source_body(context, authorization) if authorization else ""
                 # A relayed delegation is input, not direct human message authority.
-                blocks = authority_item.get("content", []) if authority_item else []
-                if not isinstance(blocks, list):
-                    raise CheckError("authorization message content must be an array")
-                delegated = ("<codex_delegation>" in (authority_text or "") or
-                             any(isinstance(b, dict) and b.get("codexDelegation") for b in blocks))
+                direct_authority = direct_user_message(authority_item, authority_text)
                 authority_scope = workspace_identity(obj(authorization.get("workspace", {}), "message authorization.workspace"), plural=True) if authorization else {}
                 targets = items(authority_scope.get("target_task_refs", []), "authorized target_task_refs")
                 for target in targets:
@@ -1031,8 +1077,7 @@ def evaluate(payload):
                 selected_action = next((entry["action"] for entry in steps
                                         if entry["id"] == selected_step), None)
                 authority_valid = (authorization is not None and authorization.get("result") == "granted"
-                                   and authority_item is not None and authority_item.get("type") == "userMessage"
-                                   and not delegated and target_task in targets)
+                                   and direct_authority and target_task in targets)
                 selected_workspace = workspace_identity(selected_action.get("workspace")) if selected_action else None
                 node_bounds = workspace_covers(authority_scope, selected_workspace) if authority_valid else False
                 coverage = (authorization_covers(authorization.get("resource"), selected_action.get("resource"),
@@ -1062,6 +1107,8 @@ def evaluate(payload):
                 sent, sent_text = event(handoff.get("sent_ref"), "handoff_sent", task_ref)
                 target_id, sender_id = target_task.removeprefix("codex:thread:"), task_ref.removeprefix("codex:thread:")
                 sent_ok = (allowed and selected_step is not None and by_id.get(selected_step, {}).get("state") == "ready"
+                           and review is not None and handoff.get("sent_ref") in evidence
+                           and native_precedes(context, review, evidence[handoff["sent_ref"]])
                            and message_receipt_matches(sent, sent_text, target_id))
                 if sent_ok:
                     continuation_state = "sent"
@@ -1094,8 +1141,52 @@ def evaluate(payload):
                     continuation_state = "returned"
                 if stages.index(declared) > stages.index(continuation_state):
                     need("handoff_" + declared + "_unverified")
+        if claim == "paused":
+            pause_ref = progress.get("pause_ref")
+            if pause_ref is not None:
+                identifier(pause_ref, "progress.pause_ref")
+            pause = linked(pause_ref, "pause") if pause_ref else None
+            pause_item = native_item(context, pause) if pause else None
+            direct_pause = direct_user_message(pause_item, source_body(context, pause) if pause else "")
+            paused_target = progress.get("resource")
+            if (pause is None or not direct_pause
+                    or selected_goal is None or pause.get("related_ref") != selected_goal.get("ref")
+                    or paused_target is None or pause.get("resource") is None
+                    or resource(pause["resource"]) != resource(paused_target)
+                    or not native_precedes(context, selected_goal, pause)
+                    or review is None or not native_precedes(context, pause, review)):
+                need("current_user_pause_unverified")
+            elif any(not covers({**pause["resource"], "access": "write"}, resource(entry["action"]["resource"]), False)
+                     for entry in steps):
+                block("independent_work_outside_pause")
+            if paused_target is not None and (not any(covers(scope, resource(paused_target), False) for scope in project_scopes)
+                    or not any(covers(scope, resource(paused_target), False) for scope in task_scopes)):
+                block("progress_outside_scope")
+            if selected_step is not None or executed or received:
+                block("paused_work_must_not_execute")
+        if claim == "working" and checkpoint in ("stage_end", "handoff"):
+            if continuation_state == "returned":
+                need("returned_result_requires_next_action")
+            elif not executed and not received:
+                need("continuation_action_unverified")
         status = ("blocked" if blocked else "needs_evidence" if missing else
                   "deviation" if deviations else "ready")
+        stop_allowed = claim in ("waiting", "paused", "completed") and status == "ready"
+        if stop_allowed:
+            next_operation = {"waiting": "report_scoped_blockers", "paused": "respect_user_pause",
+                              "completed": "deliver_accepted_goal"}[claim]
+        elif claim != "working":
+            next_operation = "resolve_stop_evidence_and_continue_independent_work"
+        elif continuation_state == "returned":
+            next_operation = "review_returned_result_and_continue"
+        elif continuation_state == "sent":
+            next_operation = "verify_original_handoff_receipt"
+        elif received or executed:
+            next_operation = "review_remaining_work"
+        elif selected_step and by_id.get(selected_step, {}).get("state") == "ready":
+            next_operation = "execute_selected_step_or_authorized_handoff"
+        else:
+            next_operation = "review_goal_and_select_allowed_step"
         return {"status": status, "blocked": blocked, "missing": missing,
                 "deviations": deviations, "steps": decisions,
                 # Per-step conditions are separate from the aggregate review.
@@ -1107,6 +1198,8 @@ def evaluate(payload):
                     "unresolved_step_ids": [s["id"] for s in decisions if s["state"] == "needs_evidence"]},
                 "continuation_state": continuation_state, "selected_step_id": selected_step,
                 "handoff_received": received,
+                "local_action_observed": executed,
+                "stop_allowed": stop_allowed, "next_operation": next_operation,
                 "coordination_owner": task_ref,
                 "step_owner": (continuation["handoff"]["target_task_ref"] if received else task_ref),
                 "wait_allowed": claim == "waiting" and status == "ready",

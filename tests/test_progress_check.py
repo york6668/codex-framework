@@ -276,7 +276,8 @@ class ContinuationChecks(unittest.TestCase):
         self.assertFalse(result["handoff_received"])
         request["progress"]["continuation"]["selected_step_id"] = "diagnose"
         result = check.evaluate(request)
-        self.assertEqual(result["status"], "ready")
+        self.assertIn("continuation_action_unverified", result["missing"])
+        self.assertFalse(result["stop_allowed"])
         self.assertEqual(result["continuation_state"], "selected")
         self.assertEqual(result["coordination_owner"], request["task"]["native_ref"])
 
@@ -288,11 +289,12 @@ class ContinuationChecks(unittest.TestCase):
         self.assertIn("remaining_goals_omitted_or_unreviewed", result["blocked"])
         self.assertFalse(result["wait_allowed"])
 
-    def test_old_progress_ready_does_not_claim_receipt_or_continuation(self):
+    def test_stage_end_without_review_cannot_claim_continuation(self):
         request = self.base()
         request["progress"].pop("continuation")
         result = check.evaluate(request)
-        self.assertEqual(result["status"], "ready")
+        self.assertIn("remaining_goal_review", result["missing"])
+        self.assertFalse(result["stop_allowed"])
         self.assertEqual(result["continuation_state"], "not_checked")
         self.assertFalse(result["handoff_received"])
 
@@ -375,7 +377,8 @@ class ContinuationChecks(unittest.TestCase):
                 else:item["namespace"]=namespace
                 with self.subTest(name=name,namespace=namespace):
                     result=check.evaluate(request)
-                    self.assertEqual(result["status"],"ready" if accepted else "needs_evidence")
+                    self.assertEqual(result["status"],"needs_evidence")
+                    self.assertFalse(result["stop_allowed"])
                     self.assertEqual(result["continuation_state"],"sent" if accepted else "suggested")
 
     def test_receipt_schema_strict_boolean_types_in_every_supported_channel(self):
@@ -518,7 +521,7 @@ class ContinuationChecks(unittest.TestCase):
         self.assertIn("user_cancelled_action", result["steps"][0]["blocked"])
         self.assertIn("selected_step_not_executable", result["blocked"])
         action["resource"]["path"] = "scripts/independent.py"
-        self.assertEqual(check.evaluate(request)["status"], "ready")
+        self.assertEqual(check.evaluate(request)["work_partition"]["ready_step_ids"], ["diagnose"])
 
     def test_in_flight_same_effect_is_not_dispatched_again(self):
         request = self.selected()
@@ -888,7 +891,7 @@ class DeliveryAcceptanceChecks(unittest.TestCase):
         self.assertIn('next_step_not_selected', check.evaluate(request)['missing'])
         request['progress']['continuation']['selected_step_id'] = 'remaining-fix'
         result = check.evaluate(request)
-        self.assertEqual(result['status'], 'ready')
+        self.assertIn('continuation_action_unverified', result['missing'])
         self.assertEqual(result['work_partition']['ready_step_ids'], ['remaining-fix'])
         self.assertFalse(result['continuous_eligible'])
 
@@ -1072,6 +1075,332 @@ class AuthorizationScopeContinuationChecks(unittest.TestCase):
         request["context"]["node_identity_ref"] = []
         with self.assertRaises(check.CheckError):
             check.evaluate(request)
+
+
+
+
+class ActiveOpportunityChecks(unittest.TestCase):
+    """Synthetic relationships only; actual manager continuation needs native evidence."""
+
+    def rewrite(self, request, record, text):
+        import hashlib
+        record['digest'] = hashlib.sha256(text.encode()).hexdigest()
+        # Find without verifying the now intentionally changed digest.
+        item = next(i for s in request['context']['native_sources'] for t in s['turns']
+                    for i in t['items'] if i['id'] == record['native_item_id'])
+        if item['type'] in ('userMessage', 'agentMessage'):
+            item['text'] = text
+        else:
+            item['output']['text'] = text
+
+    def event(self, request, name='codex:event:child-return'):
+        helper = ContinuationChecks()
+        record, item = helper.add(request, name, 'continuation_event', 'Finite child result or ledger merge returned',
+            item_type='functionCallOutput', related_ref=request['progress']['goal_ref'])
+        source = request['context']['native_sources'][0]['turns'][0]['items']
+        source.remove(item)
+        review = request['progress']['continuation']['review_ref']
+        source.insert(next(i for i, x in enumerate(source) if x['id'] == review), item)
+        request['progress']['continuation']['event_ref'] = name
+        return record, item
+
+    def execution(self, request, name='codex:execution:next'):
+        c = request['progress']['continuation']
+        record, item = ContinuationChecks().add(request, name, 'continuation_execution', 'Allowed scoped action finished',
+            item_type='commandExecution', result='observed', related_ref=c['review_ref'],
+            resource=copy.deepcopy(request['progress']['steps'][0]['action']['resource']))
+        item.update(command='inspect registered manager entry', status='completed', exitCode=0)
+        c['execution_ref'] = name
+        return record, item
+
+    def test_four_original_boundary_gaps_cannot_authorize_stop(self):
+        for mode in ('stage_end', 'handoff', 'selected', 'returned'):
+            request = ContinuationChecks().selected()
+            if mode in ('stage_end', 'handoff'):
+                request['progress']['checkpoint'] = mode
+                request['progress'].pop('continuation')
+            elif mode == 'returned':
+                request = ContinuationChecks().handoff('returned')
+                h = request['progress']['continuation']['handoff']
+                h['result_ref'] = 'codex:child:finite-result'
+                _, item = ContinuationChecks().add(request, h['result_ref'], 'handoff_result', 'failed '+h['version'],
+                    thread=h['target_task_ref'], version=h['version'])
+                item['phase'] = 'final_answer'
+            with self.subTest(mode=mode):
+                result = check.evaluate(request)
+                self.assertEqual(result['status'], 'needs_evidence')
+                self.assertFalse(result['stop_allowed'])
+                self.assertEqual(result['work_partition']['ready_step_ids'], ['diagnose'])
+                if mode == 'returned':
+                    self.assertEqual(result['next_operation'], 'review_returned_result_and_continue')
+
+    def test_actual_scoped_action_after_review_advances_only_one_step(self):
+        request = ContinuationChecks().selected()
+        self.event(request)
+        self.execution(request)
+        result = check.evaluate(request)
+        self.assertEqual(result['status'], 'ready')
+        self.assertTrue(result['local_action_observed'])
+        self.assertFalse(result['stop_allowed'])
+        self.assertEqual(result['next_operation'], 'review_remaining_work')
+
+    def test_second_return_needs_a_new_review_and_new_action(self):
+        import json
+        request = ContinuationChecks().selected()
+        self.event(request)
+        self.execution(request)
+        helper = ContinuationChecks()
+        helper.add(request, 'codex:event:second-return', 'continuation_event', 'A later finite result returned',
+                   item_type='functionCallOutput', related_ref=request['progress']['goal_ref'])
+        request['progress']['continuation']['event_ref'] = 'codex:event:second-return'
+        self.assertIn('post_event_goal_review_unverified', check.evaluate(request)['missing'])
+        helper.add(request, 'codex:review:second', 'goal_review', json.dumps({
+            'goal_ref': request['progress']['goal_ref'], 'step_ids': ['diagnose']}))
+        request['progress']['continuation']['review_ref'] = 'codex:review:second'
+        self.assertFalse(check.evaluate(request)['local_action_observed'])
+        self.execution(request, 'codex:execution:second')
+        result = check.evaluate(request)
+        self.assertEqual(result['status'], 'ready')
+        self.assertFalse(result['stop_allowed'])
+
+    def test_event_must_be_actual_current_goal_input_before_review(self):
+        for variant in ('assistant_promise', 'other_goal', 'after_review', 'missing_source'):
+            request = ContinuationChecks().selected()
+            record, item = self.event(request)
+            self.execution(request)
+            if variant == 'assistant_promise':
+                item.update(type='agentMessage', text=item['output']['text'])
+                item.pop('output')
+            elif variant == 'other_goal':
+                record['related_ref'] = 'codex:user:other-goal'
+            elif variant == 'after_review':
+                source = request['context']['native_sources'][0]['turns'][0]['items']
+                source.remove(item); source.append(item)
+            else:
+                record['native_item_id'] = 'codex:missing:event'
+            with self.subTest(variant=variant):
+                result = check.evaluate(request)
+                self.assertIn('post_event_goal_review_unverified', result['missing'])
+                self.assertFalse(result['stop_allowed'])
+
+    def test_failed_unknown_stale_wrong_scope_and_self_reported_execution_do_not_advance(self):
+        for variant in ('failed', 'running', 'unknown', 'old', 'wrong_resource', 'wrong_review', 'assistant', 'no_source'):
+            request = ContinuationChecks().selected()
+            record, item = self.execution(request)
+            if variant == 'failed': item.update(status='failed', exitCode=1)
+            elif variant == 'running': item.update(status='inProgress', exitCode=None)
+            elif variant == 'unknown': item.pop('exitCode')
+            elif variant == 'old':
+                source = request['context']['native_sources'][0]['turns'][0]['items']
+                source.remove(item); source.insert(0, item)
+            elif variant == 'wrong_resource': record['resource']['path'] = 'other-task/object'
+            elif variant == 'wrong_review': record['related_ref'] = 'codex:review:old'
+            elif variant == 'assistant':
+                item.update(type='agentMessage', text=item['output']['text']); item.pop('output')
+            else: record['native_item_id'] = 'missing'
+            with self.subTest(variant=variant):
+                result = check.evaluate(request)
+                self.assertFalse(result['local_action_observed'])
+                self.assertIn('continuation_execution_unverified', result['missing'])
+                self.assertFalse(result['stop_allowed'])
+
+    def test_sent_waits_for_receipt_and_received_does_not_release_whole_goal(self):
+        request = ContinuationChecks().handoff('sent')
+        request['progress']['continuation']['handoff'].pop('received_ref')
+        result = check.evaluate(request)
+        self.assertEqual(result['next_operation'], 'verify_original_handoff_receipt')
+        self.assertFalse(result['stop_allowed'])
+        request = ContinuationChecks().handoff('received')
+        result = check.evaluate(request)
+        self.assertEqual(result['status'], 'ready')
+        self.assertTrue(result['handoff_received'])
+        self.assertFalse(result['stop_allowed'])
+
+    def test_old_sent_receipt_cannot_prove_a_new_post_return_dispatch(self):
+        import json
+        request = ContinuationChecks().handoff('received')
+        ContinuationChecks().add(request, 'codex:review:new', 'goal_review', json.dumps({
+            'goal_ref': request['progress']['goal_ref'], 'step_ids': ['diagnose']}))
+        request['progress']['continuation']['review_ref'] = 'codex:review:new'
+        result = check.evaluate(request)
+        self.assertFalse(result['handoff_received'])
+        self.assertFalse(result['stop_allowed'])
+
+    def test_new_goal_or_supplied_newer_review_invalidates_old_action_plan(self):
+        import json
+        for variant in ('goal', 'review'):
+            request = ContinuationChecks().selected()
+            self.execution(request)
+            if variant == 'goal':
+                ContinuationChecks().add(request, 'codex:user:changed', 'goal', 'New direct requirement', item_type='userMessage')
+            else:
+                ContinuationChecks().add(request, 'codex:review:changed', 'goal_review', json.dumps({
+                    'goal_ref': request['progress']['goal_ref'], 'step_ids': ['diagnose', 'uncreated-derived-work']}))
+            with self.subTest(variant=variant):
+                result = check.evaluate(request)
+                self.assertNotEqual(result['status'], 'ready')
+                self.assertFalse(result['stop_allowed'])
+
+    def paused(self):
+        import json
+        request = ContinuationChecks().base()
+        target = copy.deepcopy(request['progress']['steps'][0]['action']['resource'])
+        helper = ContinuationChecks()
+        helper.add(request, 'codex:user:pause', 'pause', 'Pause this entire authorized scope', item_type='userMessage',
+                   related_ref=request['progress']['goal_ref'], resource=target)
+        helper.add(request, 'codex:review:paused', 'goal_review', json.dumps({
+            'goal_ref': request['progress']['goal_ref'], 'step_ids': ['diagnose']}))
+        request['progress'].update(claim='paused', resource=target, pause_ref='codex:user:pause',
+            continuation={'review_ref': 'codex:review:paused'})
+        return request
+
+    def test_current_user_pause_is_a_legitimate_stop_without_dispatch(self):
+        result = check.evaluate(self.paused())
+        self.assertEqual(result['status'], 'ready')
+        self.assertTrue(result['stop_allowed'])
+        self.assertEqual(result['next_operation'], 'respect_user_pause')
+
+    def test_pause_cannot_cover_unrelated_work_or_execute_paused_work(self):
+        request = self.paused()
+        request['progress']['steps'][0]['action']['resource']['path'] = 'scripts/unrelated.py'
+        self.assertIn('independent_work_outside_pause', check.evaluate(request)['blocked'])
+        request = self.paused()
+        request['progress']['continuation']['selected_step_id'] = 'diagnose'
+        self.assertIn('paused_work_must_not_execute', check.evaluate(request)['blocked'])
+
+    def test_old_or_assistant_pause_is_not_a_direct_current_user_pause(self):
+        for variant in ('assistant', 'old', 'missing'):
+            request = self.paused()
+            record = next(r for r in request['context']['evidence'] if r['kind'] == 'pause')
+            item = check.native_item(request['context'], record)
+            if variant == 'assistant': item['type'] = 'agentMessage'
+            elif variant == 'old':
+                source = request['context']['native_sources'][0]['turns'][0]['items']
+                source.remove(item); source.insert(0, item)
+            else: request['progress'].pop('pause_ref')
+            with self.subTest(variant=variant):
+                self.assertFalse(check.evaluate(request)['stop_allowed'])
+
+    def test_true_verified_wait_and_accepted_goal_are_legitimate_stop_controls(self):
+        request = ProgressChecks().progress(ProgressChecks().base(), 'waiting')
+        request['progress']['steps'] = request['progress']['steps'][:2]
+        ContinuationChecks().review(request)
+        result = check.evaluate(request)
+        self.assertTrue(result['wait_allowed'])
+        self.assertTrue(result['stop_allowed'])
+        result = check.evaluate(DeliveryAcceptanceChecks().completed())
+        self.assertTrue(result['stop_allowed'])
+
+    def test_managed_entry_unknown_existing_provider_and_exact_refusal_remain_distinct(self):
+        for variant in ('unknown_entry', 'existing_provider', 'exact_refusal', 'external_business'):
+            request = fixtures.AccessRoutingChecks().access_case()
+            action = copy.deepcopy(request['action'])
+            action.pop('capabilities', None)
+            if variant == 'unknown_entry': action['access']['authentication_path'] = 'unknown'
+            elif variant == 'exact_refusal':
+                request['context']['tool_failures'] = [{'kind': 'platform_denied', 'resource': copy.deepcopy(action['resource']),
+                    'action_kind': 'read', 'side_effect': 'read', 'destination_node': 'mac-mini'}]
+            elif variant == 'external_business':
+                action['access'].update(resource_owner='external_business', identity_role='business')
+            request.update(phase='progress', progress={'checkpoint': 'after_failure', 'claim': 'working',
+                'steps': [{'id': 'metadata', 'action': action}]})
+            result = check.evaluate(request)
+            with self.subTest(variant=variant):
+                self.assertIn('access_route', result['steps'][0])
+                self.assertFalse(result['stop_allowed'])
+                if variant == 'unknown_entry':
+                    self.assertEqual(result['steps'][0]['access_route'], 'discover_existing_authentication')
+                    self.assertEqual(result['steps'][0]['state'], 'needs_evidence')
+                elif variant == 'exact_refusal':
+                    self.assertEqual(result['steps'][0]['state'], 'direct_refusal')
+                else:
+                    self.assertEqual(result['steps'][0]['state'], 'ready')
+
+    def test_new_reference_shapes_fail_structurally_without_traceback(self):
+        import contextlib, io, json
+        import codex_framework as framework
+        for key in ('event_ref', 'execution_ref', 'review_ref'):
+            for value in (None, [], {}, 1, False, ''):
+                request = ContinuationChecks().selected()
+                request['progress']['continuation'][key] = value
+                output, error = io.StringIO(), io.StringIO()
+                with self.subTest(key=key, value=value), contextlib.redirect_stdout(output), contextlib.redirect_stderr(error), unittest.mock.patch('sys.stdin', io.StringIO(json.dumps(request))):
+                    self.assertEqual(framework.main(['check']), 1)
+                    self.assertEqual(json.loads(output.getvalue())['status'], 'invalid')
+                    self.assertEqual(error.getvalue(), '')
+
+    def test_review_cannot_precede_the_selected_user_goal(self):
+        request = ContinuationChecks().selected()
+        self.execution(request)
+        source = request['context']['native_sources'][0]['turns'][0]['items']
+        goal = next(i for i in source if i['id'] == request['progress']['goal_ref'])
+        source.remove(goal); source.append(goal)
+        self.assertIn('goal_review_order_unverified', check.evaluate(request)['missing'])
+
+    def test_pause_outside_current_project_does_not_stop_this_goal(self):
+        request = self.paused()
+        request['progress']['steps'] = []
+        request['progress']['resource'] = {'kind': 'repo', 'id': 'other-project'}
+        pause = next(r for r in request['context']['evidence'] if r['kind'] == 'pause')
+        pause['resource'] = copy.deepcopy(request['progress']['resource'])
+        self.assertFalse(check.evaluate(request)['stop_allowed'])
+        self.assertIn('progress_outside_scope', check.evaluate(request)['blocked'])
+
+    def test_handoff_reference_shapes_are_structured_input_errors(self):
+        import contextlib, io, json
+        import codex_framework as framework
+        for key in ('authorization_ref', 'sent_ref', 'received_ref', 'execution_ref', 'result_ref'):
+            for value in ([], {}, 1, False):
+                request = ContinuationChecks().handoff('received')
+                request['progress']['continuation']['handoff'][key] = value
+                output, error = io.StringIO(), io.StringIO()
+                with self.subTest(key=key, value=value), contextlib.redirect_stdout(output), contextlib.redirect_stderr(error), unittest.mock.patch('sys.stdin', io.StringIO(json.dumps(request))):
+                    self.assertEqual(framework.main(['check']), 1)
+                    self.assertEqual(json.loads(output.getvalue())['status'], 'invalid')
+                    self.assertEqual(error.getvalue(), '')
+
+    def test_pause_rejects_text_and_structured_delegation_with_valid_source_digest(self):
+        for variant in ('wrapper', 'structured', 'empty_marker', 'null_marker', 'false_marker'):
+            request = self.paused()
+            record = next(r for r in request['context']['evidence'] if r['kind'] == 'pause')
+            item = check.native_item(request['context'], record)
+            text = item['text']
+            if variant == 'wrapper':
+                self.rewrite(request, record, '<codex_delegation><input>'+text+'</input></codex_delegation>')
+            else:
+                marker = {'sourceThreadId': 'another-task'} if variant == 'structured' else {} if variant == 'empty_marker' else None if variant == 'null_marker' else False
+                item['content'] = [{'type': 'text', 'text': text, 'codexDelegation': marker}]
+            with self.subTest(variant=variant):
+                result = check.evaluate(request)
+                self.assertEqual(result['status'], 'needs_evidence')
+                self.assertFalse(result['stop_allowed'])
+                self.assertIn('current_user_pause_unverified', result['missing'])
+
+    def test_pause_and_message_authorization_share_direct_source_filter(self):
+        for mode in ('pause', 'message'):
+            for marker in ({}, None, False, {'sourceThreadId': 'other'}):
+                request = self.paused() if mode == 'pause' else ContinuationChecks().handoff('received')
+                kind = 'pause' if mode == 'pause' else 'authorization'
+                record = next(r for r in request['context']['evidence'] if r['kind'] == kind and r['ref'] in ('codex:user:pause', 'codex:user:message'))
+                item = check.native_item(request['context'], record)
+                item['content'] = [{'type': 'text', 'text': item['text'], 'codexDelegation': marker}]
+                with self.subTest(mode=mode, marker=marker):
+                    result = check.evaluate(request)
+                    self.assertNotEqual(result['status'], 'ready')
+                    self.assertFalse(result['stop_allowed'])
+
+    def test_malformed_pause_content_is_structured_input_error(self):
+        import contextlib, io, json
+        import codex_framework as framework
+        request = self.paused()
+        record = next(r for r in request['context']['evidence'] if r['kind'] == 'pause')
+        item = check.native_item(request['context'], record)
+        item['content'] = {}
+        output, error = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(output), contextlib.redirect_stderr(error), unittest.mock.patch('sys.stdin', io.StringIO(json.dumps(request))):
+            self.assertEqual(framework.main(['check']), 1)
+        self.assertEqual(json.loads(output.getvalue())['status'], 'invalid')
+        self.assertEqual(error.getvalue(), '')
 
 
 if __name__ == "__main__":
