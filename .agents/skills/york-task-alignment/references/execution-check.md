@@ -1,5 +1,17 @@
 # 执行与修复的即时检查
 
+## 可选项目业务工件适配
+
+正常 `check` 输入可附 `business_verification: {expected_ref, observed_ref}`，旧输入与退出语义不变，不要求所有任务填写。它复用 `context.evidence/native_sources`；预期为 `business_expectation`，关联当前用户 `goal`，实际为 `business_run`，关联该预期，二者资源精确匹配本次 envelope.resource、task/project 与固定测试版本。实际记录须是完整成功原生命令的观察原件及 SHA-256；预期先于本次观察。调用者仍核实原件真实性、原生产过程先保存观察再断言，后读历史文件的时间不冒充原动作时间。
+
+当前适配项目 `BusinessEvidence` 工件，预期正文只选 `level: engineering|business_e2e`、`run` 的 runId/caseId/sourceVersion/testVersion/environment/evidenceKind，以及所需 `operations`（每项 method/path/contract、独立 postconditions 和需要时的 binding_equalities）。实际正文由受支持只读命令汇集同一次运行的 `run.json` 为 run、所有 operation 文件为 operations；文件名去掉 .json，值保留实际对象，不合并覆盖 failed/interrupted/recovery-*。必需操作缺键保持缺口，键存在但为 null、数组或其他非对象则输入无效，不能跳过检查。可选 http-observed 只是先保存的补充 HTTP 观察，须与同操作完整 observed 的身份、method/path/status/request/response/before 一致；不能代替完整 observed、after、bindings 或 verdict。所有恢复 attempt 的 started、失败与未结束状态继续保留，旧操作 PASS 或另一 attempt 的 PASS 不清除它们。这是项目适配器的选定输入，不是通用采集格式或新增台账。文件只读及该检查均不执行或重放动作。
+
+检查精确运行/版本、操作集合、同操作请求与准备状态、契约投影及绑定来源、完整前后状态和 PASS 原件；失败、缺失、未知或恢复痕迹保留待审，不能用后来状态查询补造遗失 Exchange。绑定检查核对“来源值”，postconditions 给本次项目契约的固定 status 或 request/response/before/after 标量投影子集；binding_equalities 选定需要相等的两个绑定名称。未提供领域预期不通过，违反预期或动态关系即拒绝；预期依据与其他领域关系仍由项目独立 Oracle 验证。已知敏感指针被拒，普通字段值是否允许仍须采集端和模型按业务语义核对，检查不回显原正文。
+
+该适配器的 ready 仅代表提供的工程工件关系一致；synthetic-controller 不是 HTTP 或真实 test2。请求 business_e2e 一律保留 business_end_to_end_not_proven_by_adapter，由实际浏览器、网络、存储与独立领域验收继续完成，不能升级标签绕过。progress/close_issue 等入口提供此适配时也消费它，不能在完成判定忽略已提供的业务失败；未提供时不声称自动识别自然语言中的业务要求。真实流程、能力与后续工作仍按 [业务复测](../../york-engineering/references/business-workflow.md) 和原协调判断。
+
+## 现有执行与接续检查
+
 当任务涉及跨端接续、重复副作用、共享资源冲突、预算、故障恢复或缺陷关闭，而现有事实不能一眼判断时，可运行框架仓库的 `scripts/codex_framework.py check`。先由当前任务读取项目契约、原目标与原生/节点记录，检查器消费本次临时输入，不创建任务、持久日志、权限或业务数据，也不替代 Codex 原生审批。普通明确且低风险的动作不必为此建立记录。
 
 工具失败后重排、进入等待、阶段收尾和交接均沿用该 `check` 命令，以 `phase: progress` 检查本轮剩余步骤。输入的 `progress.checkpoint` 为 `after_failure|wait|stage_end|handoff`，`claim` 为 `working|waiting|completed|continuous_tracking`；`steps` 最多 32 项，每项有唯一 `id`、现有 `action` 结构及引用前面步骤 ID 的 `depends_on`。输出逐项为 `direct_refusal`、`dependency_blocked`、`ready`、`needs_evidence` 或 `blocked`。输出 `work_partition` 同时列出逐项条件满足的 `ready_step_ids`、有直接或依赖阻断的 `blocked_step_ids`、仍缺证据的 `unresolved_step_ids`；三组按输入顺序覆盖已提供步骤。聚合 `needs_evidence` 或 `blocked` 不能被解释为所有分支暂停，仍须核对具体步骤；`ready_step_ids` 也只表示该步骤输入关系满足，不覆盖全局目标、消息权限或省略的停止要求。这是当前剩余工作的有界投影，模型仍需从原任务核对是否遗漏步骤，不能把 `status: ready` 误读为全部步骤均可执行。

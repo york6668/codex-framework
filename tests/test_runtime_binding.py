@@ -348,8 +348,11 @@ class RuntimeBindingTests(FixtureCase):
         manifest, snapshot = runtime.validate(directory)
         self.assertEqual(set(manifest["files"]), {"scripts/" + n for n in runtime.MODULES} | {"snapshot.json"})
         self.assertNotIn("scripts/acceptance_capture.py", manifest["files"])
-        self.assertEqual(len(snapshot["files"]), 52)
-        self.assertEqual(self.cli("status").stdout.strip(), "same=52 update=0 keep-local=0 conflict=0")
+        expected_documents = {name for name in run_git(self.repo, "ls-tree", "-r", "--name-only", self.p).splitlines()
+                              if cf.allowed(name)}
+        self.assertEqual(set(snapshot["files"]), expected_documents)
+        self.assertEqual(self.cli("status").stdout.strip(),
+                         "same=" + str(len(expected_documents)) + " update=0 keep-local=0 conflict=0")
         result = self.cli("check", payload={})
         self.assertEqual(result.returncode, 1)
         self.assertNotIn("Traceback", result.stderr)

@@ -148,6 +148,154 @@ def overlaps(left, right):
              or right[2].startswith(left[2] + "/")))
 
 
+def business_observation(expected, observed):
+    """Inspect the project's bounded BusinessEvidence format, never execute it.
+
+    This checks selected observations, not arbitrary secrets, producer provenance,
+    domain oracles, browser execution or real end-to-end acceptance.
+    """
+    expected = obj(expected, "business expectation")
+    observed = obj(observed, "business observation")
+    wanted = obj(expected.get("run"), "business expectation.run")
+    run = obj(observed.get("run"), "business observation.run")
+    operations = obj(expected.get("operations"), "business expectation.operations")
+    actual = obj(observed.get("operations"), "business observation.operations")
+    if expected.get("level") not in ("engineering", "business_e2e"):
+        raise CheckError("business expectation.level must be engineering or business_e2e")
+    missing, blocked = [], []
+    if items(observed.get("read_errors", []), "business observation.read_errors"):
+        missing.append("business_capture_read_incomplete")
+    if expected["level"] == "business_e2e":
+        missing.append("business_end_to_end_not_proven_by_adapter")
+    fields = ("runId", "caseId", "sourceVersion", "testVersion", "environment", "evidenceKind")
+    for key in fields:
+        value = wanted.get(key)
+        if (not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", value)
+                or value in ("unversioned", "unknown")):
+            raise CheckError("business expectation requires bounded run identity and versions")
+    if wanted["evidenceKind"] not in ("synthetic-controller", "live-project-runner"):
+        raise CheckError("unsupported business evidence kind")
+    if any(run.get(key) != wanted[key] for key in fields) or type(run.get("schema")) is not int or run["schema"] != 1:
+        blocked.append("business_run_identity_or_version_mismatch")
+    if not operations or len(operations) > 32:
+        raise CheckError("business expectation requires 1 to 32 operations")
+    if set(actual) != set(operations):
+        missing.append("business_operation_set_mismatch")
+
+    def equal(left, right):
+        # JSON booleans and numbers have distinct meanings.
+        return json.dumps(left, sort_keys=True) == json.dumps(right, sort_keys=True)
+
+    for operation_id, required in operations.items():
+        identifier(operation_id, "business operation ID")
+        required = obj(required, "business expected operation")
+        contract = obj(required.get("contract"), "business operation.contract")
+        for section in ("request", "response", "state"):
+            pointers = items(contract.get(section), "business contract." + section)
+            if (len(pointers) != len(set(pointers)) if all(isinstance(p, str) for p in pointers) else True):
+                raise CheckError("business projection pointers must be unique strings")
+            for pointer in pointers:
+                if not re.fullmatch(r"(/[A-Za-z0-9_-]+)+", pointer):
+                    raise CheckError("business projection pointer is invalid")
+                if re.search(r"auth|cookie|token|secret|password|credential|session|email|phone|account", pointer, re.I):
+                    blocked.append("business_sensitive_projection")
+        bindings = obj(contract.get("bindings"), "business contract.bindings")
+        for name, value in bindings.items():
+            identifier(name, "business binding name")
+            if not isinstance(value, str) or ":" not in value:
+                raise CheckError("business binding must name a selected source and pointer")
+            section, pointer = value.split(":", 1)
+            projection = "state" if section in ("before", "after") else section
+            if section not in ("request", "response", "before", "after") or pointer not in contract[projection]:
+                raise CheckError("business binding source is not selected")
+        if operation_id not in actual:
+            continue  # The operation-set mismatch above retains this gap.
+        captured = obj(actual[operation_id], "business captured operation")
+        if set(captured) - {"prepared", "http-observed", "observed", "bindings", "verdict"}:
+            # Failed/interrupted and recovery records remain useful evidence,
+            # but a later state lookup cannot replace a lost exchange.
+            missing.append("business_operation_failure_or_recovery_requires_review")
+        http = None
+        if "http-observed" in captured:
+            http = obj(captured["http-observed"], "business HTTP observation")
+            if (not equal(http.get("run"), run) or http.get("operationId") != operation_id
+                    or http.get("phase") != "HTTP_OBSERVED"):
+                blocked.append("business_http_observation_mismatch")
+        events = {}
+        for name, phase in (("prepared", "PREPARED"), ("observed", "OBSERVED"), ("verdict", "PASS")):
+            value = captured.get(name)
+            if value is None:
+                missing.append("business_operation_" + name + "_missing")
+                continue
+            value = obj(value, "business event")
+            events[name] = value
+            if not equal(value.get("run"), run) or value.get("operationId") != operation_id:
+                blocked.append("business_event_identity_mismatch")
+            if value.get("phase") != phase:
+                missing.append("business_operation_not_passed")
+        if not all(key in events for key in ("prepared", "observed", "verdict")):
+            continue
+        prepared, observation = events["prepared"], events["observed"]
+        if http is not None and any(
+                key not in http or key not in observation or not equal(http[key], observation[key])
+                for key in ("method", "path", "status", "request", "response", "before")):
+            blocked.append("business_http_observation_mismatch")
+        for key in ("method", "path"):
+            if not isinstance(required.get(key), str) or not required[key]:
+                raise CheckError("business expected operation requires method and path")
+            if prepared.get(key) != required[key] or observation.get(key) != required[key]:
+                blocked.append("business_exchange_action_mismatch")
+        if not equal(prepared.get("contract"), contract):
+            blocked.append("business_contract_mismatch")
+        postconditions = required.get("postconditions")
+        if (not isinstance(postconditions, dict) or not postconditions
+                or not any(key in ("response", "after") and isinstance(value, dict) and value
+                           for key, value in postconditions.items())):
+            missing.append("business_domain_expectation_missing")
+        else:
+            for section, value in postconditions.items():
+                if section == "status":
+                    matches = equal(observation.get(section), value)
+                elif section in ("request", "response", "before", "after"):
+                    value = obj(value, "business postcondition projection")
+                    captured_values = observation.get(section)
+                    matches = (isinstance(captured_values, dict) and all(
+                        key in captured_values and equal(captured_values[key], wanted_value)
+                        for key, wanted_value in value.items()))
+                else:
+                    raise CheckError("unsupported business postcondition source")
+                if not matches:
+                    blocked.append("business_domain_postcondition_mismatch")
+        if not equal(prepared.get("request"), observation.get("request")) or not equal(prepared.get("before"), observation.get("before")):
+            blocked.append("business_exchange_preparation_mismatch")
+        for section, projection in (("request", "request"), ("response", "response"), ("before", "state"), ("after", "state")):
+            values = observation.get(section)
+            if not isinstance(values, dict) or set(values) != set(contract[projection]):
+                missing.append("business_selected_observation_missing")
+                continue
+            if any(isinstance(v, (dict, list)) or (isinstance(v, str) and len(v) > 512) for v in values.values()):
+                missing.append("business_selected_observation_invalid")
+        captured_bindings = captured.get("bindings")
+        if not isinstance(captured_bindings, dict) or set(captured_bindings) != set(bindings):
+            missing.append("business_binding_missing")
+            continue
+        for name, source in bindings.items():
+            section, pointer = source.split(":", 1)
+            values = observation.get(section)
+            if (not isinstance(values, dict) or pointer not in values
+                    or not equal(captured_bindings[name], {"source": source, "value": values[pointer]})):
+                blocked.append("business_binding_source_mismatch")
+        for pair in items(required.get("binding_equalities", []), "business binding_equalities"):
+            if (not isinstance(pair, list) or len(pair) != 2
+                    or not all(isinstance(name, str) and name in bindings for name in pair)):
+                raise CheckError("business binding equality requires two selected binding names")
+            left, right = (captured_bindings.get(name) for name in pair)
+            if (not isinstance(left, dict) or not isinstance(right, dict)
+                    or not equal(left.get("value"), right.get("value"))):
+                blocked.append("business_dynamic_relationship_mismatch")
+    return list(dict.fromkeys(blocked)), list(dict.fromkeys(missing))
+
+
 def tool_failures(context):
     """Read all supplied failures; a later failure never replaces an earlier denial."""
     failures = items(context.get("tool_failures", []), "context.tool_failures")
@@ -374,7 +522,7 @@ def evaluate(payload):
         evidence[ref] = record
 
     action_input = payload.get("action")
-    strict_sources = (phase in ("resume", "feedback", "verify_local", "close_issue", "progress")
+    strict_sources = ("business_verification" in payload or phase in ("resume", "feedback", "verify_local", "close_issue", "progress")
                       or (phase == "action" and isinstance(action_input, dict)
                           and (action_input.get("kind") in ("repair", "publish")
                                or "recovery" in action_input or "workspace" in action_input
@@ -640,6 +788,50 @@ def evaluate(payload):
         elif previous["outcome"] == "not_run":
             need("independent_verification_not_run")
 
+    # Optional project adapter: two source references, no new global gate.
+    business = payload.get("business_verification")
+    if business is not None:
+        business = obj(business, "business_verification")
+        if set(business) != {"expected_ref", "observed_ref"}:
+            raise CheckError("business_verification requires only expected_ref and observed_ref")
+        expected_record = linked(business["expected_ref"], "business_expectation")
+        observed_record = linked(business["observed_ref"], "business_run")
+        envelope_name = {"verify_local": "local_verification", "close_issue": "issue",
+                         "action": "action", "resume": "resume", "progress": "progress",
+                         "feedback": "feedback"}[phase]
+        envelope = obj(payload.get(envelope_name), envelope_name)
+        target = resource(envelope.get("resource"))
+        if (not any(covers(s, target, False) for s in project_scopes)
+                or not any(covers(s, target, False) for s in task_scopes)):
+            block("business_verification_outside_scope")
+        for record, label in ((expected_record, "business_expectation"), (observed_record, "business_run")):
+            check_outcome_scope(record, target, label)
+        if expected_record and observed_record:
+            check_current_goal(expected_record.get("related_ref"), required=True)
+            if observed_record.get("related_ref") != expected_record["ref"]:
+                block("business_observation_expectation_mismatch")
+            observed_item = native_item(context, observed_record)
+            if (observed_item is None or observed_item.get("type") != "commandExecution"
+                    or observed_item.get("status") != "completed" or observed_item.get("exitCode") != 0
+                    or observed_record.get("result") != "observed"
+                    or not observed_record.get("digest")):
+                need("business_actual_observation_source")
+            if not native_precedes(context, expected_record, observed_record):
+                need("business_expectation_not_before_observation")
+            try:
+                expected_body = json.loads(source_body(context, expected_record) or "null")
+                observed_body = json.loads(source_body(context, observed_record) or "null")
+            except ValueError:
+                raise CheckError("business source must contain complete JSON")
+            failures, gaps = business_observation(expected_body, observed_body)
+            if (expected_record.get("version") != expected_body["run"]["testVersion"]
+                    or observed_record.get("version") != expected_body["run"]["testVersion"]):
+                block("business_evidence_version_mismatch")
+            for failure in failures:
+                block(failure)
+            for gap in gaps:
+                need(gap)
+
     if phase == "progress":
         progress = obj(payload.get("progress"), "progress")
         checkpoint = progress.get("checkpoint")
@@ -669,7 +861,11 @@ def evaluate(payload):
             if len(set(dependencies)) != len(dependencies) or any(d not in by_id for d in dependencies):
                 raise CheckError("progress dependencies must name earlier steps once")
             action = obj(entry.get("action"), "progress step.action")
-            single = evaluate({**payload, "phase": "action", "action": action})
+            single_payload = {**payload, "phase": "action", "action": action}
+            # Review evidence belongs to the aggregate goal, not every
+            # independent next action. Keep its gap without blocking reads.
+            single_payload.pop("business_verification", None)
+            single = evaluate(single_payload)
             if "platform_denied_action" in single["blocked"]:
                 state = "direct_refusal"
             elif any(by_id[d]["state"] != "ready" for d in dependencies):
