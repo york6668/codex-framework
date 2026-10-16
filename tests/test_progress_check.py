@@ -1403,5 +1403,305 @@ class ActiveOpportunityChecks(unittest.TestCase):
         self.assertEqual(error.getvalue(), '')
 
 
+class CurrentRequestChecks(unittest.TestCase):
+    """Optional supplied request/report relations, never real host interception."""
+    def add_request(self, request, ref='request:current', version=None, target=None, *, after_review=False, structured=False, related=None):
+        helper = ContinuationChecks()
+        version = version or request['progress']['version']
+        target = copy.deepcopy(target or request['progress']['resource'])
+        record, item = helper.add(request, ref, 'task_request',
+            '<codex_delegation><source_thread_id>coordinator</source_thread_id><input>Review '+version+'</input></codex_delegation>',
+            item_type='functionCallOutput', version=version, resource=target,
+            related_ref=related or request['progress']['goal_ref'])
+        item.update(name='send_message', namespace='cloud_threads')
+        if structured:
+            item['type'] = 'userMessage'
+            item['content'] = [{'type':'text','text':item.pop('output')['text'],
+                                'codexDelegation':{'sourceThreadId':'coordinator'}}]
+        if not after_review:
+            source = request['context']['native_sources'][0]['turns'][0]['items']
+            source.remove(item)
+            source.insert(next(n for n,x in enumerate(source) if x['id']==request['progress']['continuation']['review_ref']), item)
+        return record, item
+
+    def add_report(self, request, selected='request:current', ref='report:current', *, body=None, version=None, target=None):
+        import json
+        original = next(r for r in request['context']['evidence'] if r['ref']==selected)
+        version = version or original['version'];target=copy.deepcopy(target or original['resource'])
+        body = body or {'version':version,'outcome':'passed'}
+        record,item=ContinuationChecks().add(request,ref,'task_report',json.dumps(body),item_type='commandExecution',
+            version=version,resource=target,related_ref=selected,result='observed')
+        item.update(command='read frozen report '+version,status='completed',exitCode=0)
+        return record,item
+
+    def bound(self, **kwargs):
+        request=DeliveryAcceptanceChecks().completed()
+        self.add_request(request, **kwargs);self.add_report(request)
+        request['progress']['current_request']={'input_ref':'request:current','report_ref':'report:current'}
+        return request
+
+    def test_matching_current_input_report_and_old_acceptance_stay_valid_for_that_scope(self):
+        for structured in (False,True):
+            request=self.bound(structured=structured);result=check.evaluate(request)
+            self.assertEqual(result['status'],'ready');self.assertTrue(result['stop_allowed'])
+            self.assertEqual(result['current_request']['state'],'report_matched')
+            self.assertEqual(result['current_request']['outcome'],'passed')
+
+    def test_different_current_object_and_version_cannot_close_stale_consistent_pack(self):
+        request=DeliveryAcceptanceChecks().completed()
+        target={'kind':'repo','id':'framework','path':'scripts/current-object'}
+        self.add_request(request,version='manifest:new',target=target)
+        self.add_report(request)
+        request['progress']['current_request']={'input_ref':'request:current','report_ref':'report:current'}
+        result=check.evaluate(request)
+        self.assertIn('current_request_resource_mismatch',result['blocked'])
+        self.assertIn('current_request_version_mismatch',result['blocked'])
+        self.assertIn('current_request_acceptance_mismatch',result['blocked'])
+        self.assertFalse(result['stop_allowed'])
+
+    def test_same_object_new_frozen_version_rejects_old_result_and_lock(self):
+        request=self.bound();selected=next(r for r in request['context']['evidence'] if r['ref']=='request:current')
+        old=selected['version'];selected['version']='manifest:revision2'
+        ActiveOpportunityChecks().rewrite(request,selected,'<codex_delegation><source_thread_id>coordinator</source_thread_id><input>Review manifest:revision2</input></codex_delegation>')
+        result=check.evaluate(request)
+        self.assertIn('current_request_version_mismatch',result['blocked'])
+        self.assertIn('current_request_report_unverified',result['missing'])
+        self.assertFalse(result['stop_allowed'])
+
+    def test_hash_mention_or_conflicting_top_level_identity_is_not_binding(self):
+        for body in ({'manifest_sha256':'old','verdict':'PASS_SCOPED','mentions':'commit:abc'},
+                     {'manifest_sha256':'old','version':'commit:abc','verdict':'PASS_SCOPED'},
+                     {'notes':'commit:abc PASS'}, {'version':'commit:abc','outcome':'passed','verdict':'FAIL_SCOPED'}):
+            request=self.bound();record=next(r for r in request['context']['evidence'] if r['ref']=='report:current')
+            import json
+            ActiveOpportunityChecks().rewrite(request,record,json.dumps(body))
+            with self.subTest(body=body):
+                result=check.evaluate(request);self.assertIn('current_request_report_unverified',result['missing']);self.assertFalse(result['stop_allowed'])
+
+    def test_failed_current_report_is_bound_but_not_candidate_success(self):
+        request=self.bound();record=next(r for r in request['context']['evidence'] if r['ref']=='report:current')
+        import json
+        ActiveOpportunityChecks().rewrite(request,record,json.dumps({'manifest_sha256':'commit:abc','verdict':'FAIL_TWO_ADOPTION_BLOCKERS'}))
+        result=check.evaluate(request)
+        self.assertEqual(result['current_request']['state'],'report_matched')
+        self.assertEqual(result['current_request']['outcome'],'failed')
+        self.assertIn('current_request_report_failed',result['deviations']);self.assertFalse(result['stop_allowed'])
+
+    def test_not_run_and_unrecognized_outcome_never_become_pass(self):
+        import json
+        for verdict in ('NOT_RUN_ENVIRONMENT','PASS in prose',None,[],True):
+            request=self.bound();record=next(r for r in request['context']['evidence'] if r['ref']=='report:current')
+            ActiveOpportunityChecks().rewrite(request,record,json.dumps({'version':'commit:abc','verdict':verdict}))
+            with self.subTest(verdict=verdict):
+                result=check.evaluate(request);self.assertFalse(result['stop_allowed'])
+                self.assertNotEqual(result['current_request']['outcome'],'passed')
+
+    def test_report_source_relationship_resource_and_order_are_required(self):
+        for variant in ('assistant','other_request','other_resource','missing','truncated','before_request'):
+            request=self.bound();record=next(r for r in request['context']['evidence'] if r['ref']=='report:current')
+            item=check.native_item(request['context'],record)
+            if variant=='assistant':item['type']='agentMessage';item['text']=item['output']['text'];item.pop('output')
+            elif variant=='other_request':record['related_ref']='request:other'
+            elif variant=='other_resource':record['resource']['path']='scripts/other'
+            elif variant=='missing':record['native_item_id']='missing'
+            elif variant=='truncated':item['output']['truncated']=True
+            else:
+                source=request['context']['native_sources'][0]['turns'][0]['items'];source.remove(item);source.insert(0,item)
+            with self.subTest(variant=variant):
+                result=check.evaluate(request);self.assertIn('current_request_report_unverified',result['missing']);self.assertFalse(result['stop_allowed'])
+
+    def test_review_must_follow_selected_request(self):
+        request=self.bound(after_review=True);result=check.evaluate(request)
+        self.assertIn('current_request_review_unverified',result['missing']);self.assertFalse(result['stop_allowed'])
+
+    def test_unverified_or_wrong_provider_input_cannot_bind(self):
+        for variant in ('promise','provider','missing','version_mention_missing'):
+            request=self.bound();record=next(r for r in request['context']['evidence'] if r['ref']=='request:current')
+            item=check.native_item(request['context'],record)
+            if variant=='promise':item['type']='agentMessage';item['text']=item['output']['text'];item.pop('output')
+            elif variant=='provider':item['namespace']='unrelated_provider'
+            elif variant=='missing':record['native_item_id']='missing'
+            else:ActiveOpportunityChecks().rewrite(request,record,'<codex_delegation><source_thread_id>coordinator</source_thread_id><input>Other work</input></codex_delegation>')
+            with self.subTest(variant=variant):
+                result=check.evaluate(request);self.assertIn('current_request_input_unverified',result['missing']);self.assertFalse(result['stop_allowed'])
+
+    def test_two_pending_requests_can_return_selected_one_without_latest_cancellation(self):
+        request=self.bound();self.add_request(request,ref='request:second',version='manifest:second',after_review=True)
+        request['progress']['claim']='working'
+        result=check.evaluate(request)
+        self.assertEqual(result['current_request']['state'],'report_matched')
+        self.assertEqual(result['current_request']['pending_request_refs'],['request:second'])
+        self.assertNotIn('current_request_superseded',result['missing']);self.assertFalse(result['stop_allowed'])
+        request['progress']['claim']='completed';result=check.evaluate(request)
+        self.assertIn('other_supplied_requests_unresolved',result['missing'])
+        self.add_report(request,selected='request:second',ref='report:second');self.assertTrue(check.evaluate(request)['stop_allowed'])
+
+    def test_explicit_newer_correction_requires_rebinding_not_silent_latest_selection(self):
+        request=self.bound();self.add_request(request,ref='request:correction',version='manifest:fixed',after_review=True,related='request:current')
+        result=check.evaluate(request)
+        self.assertIn('current_request_superseded',result['missing']);self.assertFalse(result['stop_allowed'])
+        self.assertEqual(result['current_request']['input_ref'],'request:current')
+
+    def test_unrelated_child_event_version_is_not_the_next_action_version(self):
+        request=self.bound();ContinuationChecks().add(request,'event:child','continuation_event','Child result manifest:other',
+            item_type='functionCallOutput',version='manifest:other',resource=copy.deepcopy(request['progress']['resource']))
+        self.assertEqual(check.evaluate(request)['status'],'ready')
+
+    def test_request_binding_does_not_grant_message_or_pause_authority(self):
+        request=ActiveOpportunityChecks().paused()
+        self.add_request(request,version='manifest:input',target=request['progress']['resource'])
+        request['progress']['current_request']={'input_ref':'request:current'}
+        pause=next(r for r in request['context']['evidence'] if r['kind']=='pause')
+        ActiveOpportunityChecks().rewrite(request,pause,'<codex_delegation><source_thread_id>coordinator</source_thread_id><input>Pause</input></codex_delegation>')
+        result=check.evaluate(request);self.assertIn('current_user_pause_unverified',result['missing']);self.assertFalse(result['stop_allowed'])
+
+    def test_optional_absence_preserves_the_entire_previous_progress_result(self):
+        request=DeliveryAcceptanceChecks().completed();result=check.evaluate(request)
+        self.assertNotIn('current_request',result);self.assertEqual(result['status'],'ready')
+
+    def test_new_relation_shapes_return_structured_invalid(self):
+        import io,contextlib,json
+        import codex_framework as framework
+        for value in (None,[],False,{}, {'input_ref':[]},{'input_ref':'request:current','report_ref':{}},{'input_ref':'x','unknown':1}):
+            request=self.bound();request['progress']['current_request']=value;output,error=io.StringIO(),io.StringIO()
+            with self.subTest(value=value),contextlib.redirect_stdout(output),contextlib.redirect_stderr(error),unittest.mock.patch('sys.stdin',io.StringIO(json.dumps(request))):
+                self.assertEqual(framework.main(['check']),1)
+            self.assertEqual(json.loads(output.getvalue())['status'],'invalid');self.assertEqual(error.getvalue(),'')
+
+    def test_report_root_resource_and_native_exit_type_are_not_overridden_by_labels(self):
+        import json
+        for variant in ('root_resource','false_exit','duplicate_json','non_json_constant'):
+            request=self.bound();record=next(r for r in request['context']['evidence'] if r['ref']=='report:current')
+            item=check.native_item(request['context'],record)
+            if variant=='root_resource':
+                ActiveOpportunityChecks().rewrite(request,record,json.dumps({'version':'commit:abc','outcome':'passed',
+                    'resource':{'kind':'repo','id':'framework','path':'scripts/wrong'}}))
+            elif variant=='false_exit':item['exitCode']=False
+            elif variant=='duplicate_json':ActiveOpportunityChecks().rewrite(request,record,'{"version":"old","version":"commit:abc","outcome":"passed"}')
+            else:ActiveOpportunityChecks().rewrite(request,record,'{"version":"commit:abc","outcome":"passed","other":NaN}')
+            with self.subTest(variant=variant):
+                result=check.evaluate(request);self.assertIn('current_request_report_unverified',result['missing']);self.assertFalse(result['stop_allowed'])
+
+    def test_supplied_failure_for_frozen_request_cannot_hide_behind_a_selected_pass(self):
+        request=self.bound();self.add_report(request,ref='report:failed',body={'version':'commit:abc','outcome':'failed'})
+        result=check.evaluate(request)
+        self.assertIn('current_request_failure_unresolved',result['deviations'])
+        self.assertFalse(result['stop_allowed'])
+
+    def test_missing_report_and_unknown_request_order_keep_specific_gaps(self):
+        request=self.bound();request['progress']['current_request'].pop('report_ref')
+        self.assertIn('current_request_report_unverified',check.evaluate(request)['missing'])
+        request=self.bound();source=request['context']['native_sources'][0];source['turns'].append({'items':[]})
+        item=next(x for x in source['turns'][0]['items'] if x['id']=='request:current');source['turns'][0]['items'].remove(item);source['turns'][-1]['items'].append(item)
+        self.assertIn('current_request_review_unverified',check.evaluate(request)['missing'])
+
+
+class RequestRevisionChecks(unittest.TestCase):
+    """Verified replacement chains and independent pending work, offline only."""
+    def revised(self, depth=1):
+        helper=CurrentRequestChecks();request=helper.bound()
+        child=next(r for r in request['context']['evidence'] if r['ref']=='request:current')
+        source=request['context']['native_sources'][0]['turns'][0]['items']
+        for n in range(depth):
+            parent,item=helper.add_request(request,ref='request:old-'+str(n),version='manifest:old-'+str(n))
+            child['related_ref']=parent['ref']
+            ActiveOpportunityChecks().rewrite(request,child,'<codex_delegation><source_thread_id>coordinator</source_thread_id><input>Replace '+parent['ref']+' with '+child['version']+'</input></codex_delegation>')
+            source.remove(item);source.insert(next(i for i,x in enumerate(source) if x['id']==child['native_item_id']),item)
+            child=parent
+        return request
+
+    def test_reselection_completes_without_unexecuted_obsolete_reports(self):
+        for depth in (1,3):
+            request=self.revised(depth);result=check.evaluate(request)
+            with self.subTest(depth=depth):
+                self.assertEqual(result['status'],'ready');self.assertTrue(result['stop_allowed'])
+                self.assertEqual(result['current_request']['pending_request_refs'],[])
+                self.assertEqual(result['current_request']['superseded_request_refs'],['request:old-'+str(n) for n in range(depth)])
+
+    def test_unrelated_newer_same_resource_and_version_stays_pending(self):
+        request=self.revised();CurrentRequestChecks().add_request(request,ref='request:parallel',version='commit:abc',after_review=True)
+        result=check.evaluate(request)
+        self.assertEqual(result['current_request']['pending_request_refs'],['request:parallel'])
+        self.assertIn('other_supplied_requests_unresolved',result['missing']);self.assertFalse(result['stop_allowed'])
+        self.assertNotIn('request:parallel',result['current_request']['superseded_request_refs'])
+
+    def test_missing_source_or_order_does_not_clear_a_replacement_chain(self):
+        for variant in ('missing_parent','digest','provider','new_before_old','unknown_page_order','cycle','wrong_owner','unknown_origin'):
+            request=self.revised(2);records={r['ref']:r for r in request['context']['evidence']};old=records['request:old-1'];current=records['request:current'];source=request['context']['native_sources'][0];items=source['turns'][0]['items'];item=next(x for x in items if x['id']==old['native_item_id'])
+            if variant=='missing_parent':request['context']['evidence'].remove(old)
+            elif variant=='digest':old['digest']='0'*64
+            elif variant=='provider':item['namespace']='other_provider'
+            elif variant=='new_before_old':items.remove(item);items.append(item)
+            elif variant=='unknown_page_order':items.remove(item);source['turns'].append({'items':[item]});source.pop('page',None)
+            elif variant=='cycle':old['related_ref']=current['ref']
+            elif variant=='wrong_owner':old['task_ref']='codex:thread:other'
+            else:old['related_ref']='request:missing-origin'
+            with self.subTest(variant=variant):
+                result=check.evaluate(request)
+                self.assertIn('current_request_revision_unverified',result['missing']);self.assertFalse(result['stop_allowed'])
+                self.assertNotIn('superseded_request_refs',result['current_request'])
+
+    def test_newer_input_without_explicit_relation_never_retires_old(self):
+        request=self.revised();current=next(r for r in request['context']['evidence'] if r['ref']=='request:current');current['related_ref']=request['progress']['goal_ref']
+        result=check.evaluate(request)
+        self.assertEqual(result['current_request']['pending_request_refs'],['request:old-0'])
+        self.assertFalse(result['stop_allowed']);self.assertNotIn('superseded_request_refs',result['current_request'])
+
+    def test_old_report_cannot_be_returned_as_the_new_request_report(self):
+        request=self.revised();CurrentRequestChecks().add_report(request,selected='request:old-0',ref='report:old')
+        request['progress']['current_request']['report_ref']='report:old'
+        result=check.evaluate(request)
+        self.assertIn('current_request_report_unverified',result['missing']);self.assertFalse(result['stop_allowed'])
+        self.assertEqual(result['current_request']['pending_request_refs'],[])
+
+    def test_superseded_failure_is_retained_with_new_version_success(self):
+        import json
+        request=self.revised();CurrentRequestChecks().add_report(request,selected='request:old-0',ref='report:old-failed',body={'version':'manifest:old-0','outcome':'failed'})
+        before=json.dumps(request,sort_keys=True);result=check.evaluate(request)
+        self.assertEqual(result['status'],'ready');self.assertTrue(result['stop_allowed'])
+        self.assertEqual(result['current_request']['superseded_failed_request_refs'],['request:old-0'])
+        self.assertEqual(json.dumps(request,sort_keys=True),before)
+
+    def test_same_frozen_version_failure_is_not_erased_by_new_input_ref(self):
+        request=self.revised();old=next(r for r in request['context']['evidence'] if r['ref']=='request:old-0');old['version']='commit:abc'
+        ActiveOpportunityChecks().rewrite(request,old,'<codex_delegation><source_thread_id>coordinator</source_thread_id><input>Review commit:abc</input></codex_delegation>')
+        CurrentRequestChecks().add_report(request,selected=old['ref'],ref='report:old-failed',body={'version':'commit:abc','outcome':'failed'})
+        result=check.evaluate(request)
+        self.assertIn('current_request_failure_unresolved',result['deviations']);self.assertFalse(result['stop_allowed'])
+        self.assertEqual(result['current_request']['superseded_failed_request_refs'],[old['ref']])
+
+    def test_completed_revised_parallel_branch_does_not_leave_its_old_input_pending(self):
+        request=self.revised();helper=CurrentRequestChecks()
+        helper.add_request(request,ref='request:parallel',version='manifest:parallel',after_review=True)
+        helper.add_report(request,selected='request:parallel',ref='report:parallel')
+        request['progress']['current_request']={'input_ref':'request:parallel','report_ref':'report:parallel'}
+        request['progress']['claim']='working'
+        result=check.evaluate(request)
+        self.assertEqual(result['current_request']['state'],'report_matched')
+        self.assertEqual(result['current_request']['pending_request_refs'],[])
+        self.assertEqual(result['current_request']['superseded_request_refs'],['request:old-0'])
+
+    def test_unreported_replacement_branch_itself_stays_pending(self):
+        request=self.revised();helper=CurrentRequestChecks();helper.add_request(request,ref='request:parallel',version='manifest:parallel',after_review=True);helper.add_report(request,selected='request:parallel',ref='report:parallel')
+        request['progress']['current_request']={'input_ref':'request:parallel','report_ref':'report:parallel'}
+        request['progress']['claim']='working'
+        request['context']['evidence']=[r for r in request['context']['evidence'] if r['ref']!='report:current']
+        result=check.evaluate(request)
+        self.assertEqual(result['current_request']['pending_request_refs'],['request:current'])
+        self.assertFalse(result['stop_allowed'])
+
+    def test_replacement_fork_is_not_resolved_by_latest_time(self):
+        request=self.revised();CurrentRequestChecks().add_request(request,ref='request:fork',version='manifest:fork',after_review=True,related='request:old-0')
+        result=check.evaluate(request)
+        self.assertEqual(result['current_request']['pending_request_refs'],['request:fork'])
+        self.assertFalse(result['stop_allowed'])
+
+    def test_selecting_superseded_middle_of_chain_remains_rejected(self):
+        request=self.revised(2);helper=CurrentRequestChecks();helper.add_report(request,selected='request:old-0',ref='report:middle')
+        request['progress']['current_request']={'input_ref':'request:old-0','report_ref':'report:middle'}
+        result=check.evaluate(request)
+        self.assertIn('current_request_superseded',result['missing']);self.assertFalse(result['stop_allowed'])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -47,6 +47,67 @@ def direct_user_message(item, body):
             and not any(isinstance(block, dict) and "codexDelegation" in block for block in blocks))
 
 
+def received_request(item, body):
+    """Recognize supplied task input, without granting message/pause authority."""
+    if item is None:
+        return False
+    if item.get("type") == "userMessage":
+        if direct_user_message(item, body):
+            return True
+        content = item.get("content", [])
+        if any(isinstance(b, dict) and isinstance(b.get("codexDelegation"), dict)
+               and isinstance(b["codexDelegation"].get("sourceThreadId"), str)
+               and b["codexDelegation"]["sourceThreadId"].strip() for b in content):
+            return True
+    elif not (item.get("type") == "functionCallOutput"
+              and item.get("namespace") == "cloud_threads" and item.get("name") == "send_message"):
+        return False
+    return bool(body and body.lstrip().startswith("<codex_delegation>")
+                and re.search(r"<source_thread_id>[^<\s]+</source_thread_id>", body)
+                and "<input>" in body and body.rstrip().endswith("</codex_delegation>"))
+
+
+def task_report_identity(body):
+    """Read explicit report identity/outcome fields, never a hash mention in prose."""
+    def unique(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate report field")
+            result[key] = value
+        return result
+    def reject_constant(value):
+        raise ValueError("non-JSON report constant")
+    try:
+        report = json.loads(body, object_pairs_hook=unique, parse_constant=reject_constant) if body else None
+    except (ValueError, RecursionError):
+        return None
+    if not isinstance(report, dict):
+        return None
+    versions = [report[k] for k in ("version", "manifest_sha256", "candidate_manifest_sha256") if k in report]
+    if not versions or any(not isinstance(v, str) or not v.strip() for v in versions) or len(set(versions)) != 1:
+        return None
+    outcomes = []
+    if "outcome" in report:
+        if report["outcome"] not in ("passed", "failed", "not_run"):
+            return None
+        outcomes.append(report["outcome"])
+    if "verdict" in report:
+        verdict = report["verdict"]
+        if not isinstance(verdict, str) or not re.fullmatch(r"(?:PASS|FAIL|NOT_RUN)(?:_[A-Z0-9]+)*", verdict):
+            return None
+        outcomes.append("passed" if verdict == "PASS" or verdict.startswith("PASS_") else
+                        "failed" if verdict == "FAIL" or verdict.startswith("FAIL_") else "not_run")
+    if not outcomes or len(set(outcomes)) != 1:
+        return None
+    if "resource" in report:
+        try:
+            resource(report["resource"])
+        except CheckError:
+            return None
+    return versions[0], outcomes[0], report.get("resource")
+
+
 def resource(value):
     value = obj(value, "resource")
     kind = identifier(value.get("kind"), "resource.kind")
@@ -1141,6 +1202,158 @@ def evaluate(payload):
                     continuation_state = "returned"
                 if stages.index(declared) > stages.index(continuation_state):
                     need("handoff_" + declared + "_unverified")
+        request_binding = None
+        if "current_request" in progress:
+            binding = obj(progress["current_request"], "progress.current_request")
+            if set(binding) - {"input_ref", "report_ref"}:
+                raise CheckError("current_request may contain only input and report references")
+            request_ref = identifier(binding.get("input_ref"), "current_request.input_ref")
+            if "report_ref" in binding:
+                identifier(binding["report_ref"], "current_request.report_ref")
+            request_binding = {"input_ref": request_ref, "state": "unverified", "outcome": None,
+                               "pending_request_refs": []}
+
+            def request_record(ref):
+                record = evidence.get(ref)
+                if (record is None or record.get("kind") not in ("task_request", "continuation_event")
+                        or record.get("source") != "codex" or record.get("project_id") != project_id
+                        or record.get("task_ref") != task_ref or not verify_source(context, project, record)):
+                    return None
+                version = record.get("version")
+                if (not isinstance(version, str) or not version.strip() or record.get("resource") is None
+                        or not received_request(native_item(context, record), source_body(context, record))
+                        or not contains_version(source_body(context, record), version)):
+                    return None
+                resource(record["resource"])
+                return record
+
+            def report_record(ref, request):
+                record = evidence.get(ref)
+                if (record is None or record.get("kind") != "task_report" or record.get("source") != "codex"
+                        or record.get("project_id") != project_id or record.get("task_ref") != task_ref
+                        or record.get("related_ref") != request["ref"] or record.get("result") != "observed"
+                        or record.get("version") != request["version"] or record.get("resource") is None
+                        or resource(record["resource"]) != resource(request["resource"])
+                        or not verify_source(context, project, record)
+                        or not native_precedes(context, request, record)):
+                    return None
+                report_item = native_item(context, record)
+                if (report_item is None or report_item.get("type") != "commandExecution"
+                        or type(report_item.get("exitCode")) is not int or report_item["exitCode"] != 0):
+                    return None
+                identity = task_report_identity(source_body(context, record))
+                return ((record, identity[1]) if identity and identity[0] == request["version"]
+                        and (identity[2] is None or resource(identity[2]) == resource(request["resource"])) else None)
+
+            reports_by_request = {}
+            for record in evidence.values():
+                if record.get("kind") == "task_report" and isinstance(record.get("related_ref"), str):
+                    reports_by_request.setdefault(record["related_ref"], []).append(record["ref"])
+
+            request = request_record(request_ref)
+            if request is None:
+                need("current_request_input_unverified")
+            else:
+                requested_target = resource(request["resource"])
+                if (not any(covers(s, requested_target, False) for s in project_scopes)
+                        or not any(covers(s, requested_target, False) for s in task_scopes)):
+                    block("current_request_outside_scope")
+                request_binding.update(state="selected", resource=request["resource"], version=request["version"])
+                if review is None or not native_precedes(context, request, review):
+                    need("current_request_review_unverified")
+                if claim == "completed":
+                    current_target = progress.get("resource")
+                    if current_target is None or resource(current_target) != requested_target:
+                        block("current_request_resource_mismatch")
+                    if progress.get("version") != request["version"]:
+                        block("current_request_version_mismatch")
+                    acceptance_record = evidence.get(progress.get("acceptance_ref"))
+                    if (acceptance_record is not None and (acceptance_record.get("version") != request["version"]
+                            or acceptance_record.get("resource") != request["resource"])):
+                        block("current_request_acceptance_mismatch")
+                    validation = progress.get("independent_verification")
+                    if validation is None and isinstance(payload.get("issue"), dict):
+                        validation = payload["issue"].get("independent_verification")
+                    if validation is not None or project.get("independent_verification_required") is True:
+                        check_independent_verification(validation, request["resource"], request["version"])
+                observed_report = report_record(binding.get("report_ref"), request)
+                if observed_report is None:
+                    if claim == "completed" or "report_ref" in binding:
+                        need("current_request_report_unverified")
+                else:
+                    request_binding.update(state="report_matched", report_ref=binding["report_ref"], outcome=observed_report[1])
+                    if observed_report[1] == "failed":
+                        deviate("current_request_report_failed")
+                    elif observed_report[1] == "not_run":
+                        need("current_request_report_not_run")
+                if any((prior := report_record(ref, request)) is not None and prior[1] == "failed"
+                       for ref in reports_by_request.get(request_ref, [])):
+                    deviate("current_request_failure_unresolved")
+                # Follow only verified explicit revision links; timestamps or
+                # matching names never cancel an independent request.
+                def ancestors_of(selected):
+                    ancestors, visited, current = [], {selected["ref"]}, selected
+                    while current.get("related_ref") is not None:
+                        parent_ref = current["related_ref"]
+                        if not isinstance(parent_ref, str) or not parent_ref.strip() or parent_ref in visited:
+                            return None
+                        parent_record = evidence.get(parent_ref)
+                        if parent_record is not None and parent_record.get("kind") == "goal":
+                            break
+                        parent = request_record(parent_ref)
+                        if parent is None or not native_precedes(context, parent, current):
+                            return None
+                        ancestors.append(parent)
+                        visited.add(parent_ref)
+                        current = parent
+                    return ancestors
+
+                selected_ancestors = ancestors_of(request)
+                if selected_ancestors is None:
+                    need("current_request_revision_unverified")
+                supplied_requests = [request] + [record for record in evidence.values()
+                    if record.get("kind") == "task_request" and record.get("ref") != request_ref
+                    and record.get("project_id") == project_id and record.get("task_ref") == task_ref]
+                superseded_records = {}
+                for supplied in supplied_requests:
+                    verified = request_record(supplied["ref"])
+                    lineage = ancestors_of(verified) if verified is not None else None
+                    for ancestor in lineage or []:
+                        superseded_records.setdefault(ancestor["ref"], ancestor)
+                superseded = set(superseded_records)
+                if request_ref in superseded:
+                    need("current_request_superseded")
+                if superseded:
+                    request_binding["superseded_request_refs"] = list(superseded_records)
+                    prior_failures = [record for record in superseded_records.values()
+                        if any((prior := report_record(ref, record)) is not None and prior[1] == "failed"
+                               for ref in reports_by_request.get(record["ref"], []))]
+                    if prior_failures:
+                        request_binding["superseded_failed_request_refs"] = [record["ref"] for record in prior_failures]
+                        selected_history = {record["ref"] for record in selected_ancestors or []}
+                        if any(record["ref"] in selected_history and record["version"] == request["version"]
+                               and resource(record["resource"]) == requested_target for record in prior_failures):
+                            deviate("current_request_failure_unresolved")
+                # Only explicitly supplied request records form this bounded
+                # view. Ordinary child-result events never become new goals.
+                for candidate in evidence.values():
+                    if (candidate.get("kind") != "task_request" or candidate.get("ref") == request_ref
+                            or candidate.get("project_id") != project_id or candidate.get("task_ref") != task_ref):
+                        continue
+                    if candidate["ref"] in superseded:
+                        continue
+                    other = request_record(candidate["ref"])
+                    if candidate.get("related_ref") == request_ref:
+                        if other is None or not native_precedes(context, request, other):
+                            need("current_request_correction_unverified")
+                        else:
+                            need("current_request_superseded")
+                    resolved = other is not None and any(report_record(ref, other) is not None
+                        for ref in reports_by_request.get(candidate["ref"], []))
+                    if not resolved:
+                        request_binding["pending_request_refs"].append(candidate["ref"])
+                if claim == "completed" and request_binding["pending_request_refs"]:
+                    need("other_supplied_requests_unresolved")
         if claim == "paused":
             pause_ref = progress.get("pause_ref")
             if pause_ref is not None:
@@ -1187,7 +1400,7 @@ def evaluate(payload):
             next_operation = "execute_selected_step_or_authorized_handoff"
         else:
             next_operation = "review_goal_and_select_allowed_step"
-        return {"status": status, "blocked": blocked, "missing": missing,
+        result = {"status": status, "blocked": blocked, "missing": missing,
                 "deviations": deviations, "steps": decisions,
                 # Per-step conditions are separate from the aggregate review.
                 # These lists neither grant permission nor discover omitted work.
@@ -1205,6 +1418,9 @@ def evaluate(payload):
                 "wait_allowed": claim == "waiting" and status == "ready",
                 "continuous_eligible": False,
                 "meaning": "advisory_progress_from_supplied_native_sources; no runtime interception"}
+        if request_binding is not None:
+            result["current_request"] = request_binding
+        return result
 
     if phase == "resume":
         resume = obj(payload.get("resume"), "resume")

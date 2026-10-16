@@ -103,3 +103,13 @@ python3 scripts/codex_framework.py check < /tmp/current-action.json
 在 `stage_end/handoff` 声明 working 时，仅 selected/sent 不足，返回 `continuation_action_unverified`；已核接收或本任务实际动作才支持本步已推进。handoff returned 返回 `returned_result_requires_next_action`，须把结果作为新事件回看当前完整目标并实施下一步，不能复用旧交接当作返回后的动作。可选 `event_ref` 为当前线程 `continuation_event`，`related_ref` 关联本轮目标，来源须为原生用户输入/工具输出/命令；其后才有本轮 review。可选 `execution_ref` 为当前线程 `continuation_execution`，`result: observed`、`related_ref` 指向本轮 review、`resource` 精确匹配所选动作，来源为 review 后实际成功结束的原生命令；失败、未知、旧命令或助手承诺不算动作。输出 `local_action_observed` 仅核对这些已给关系，不验证调用方原件真实性或命令业务效果，也不把一次动作写成全部目标完成。无需为使用这些建议新建记录表或固定调用。
 
 `claim: paused` 使用 `pause_ref` 指向当前线程直接用户 `pause` 输入，`related_ref` 关联当前目标、`resource` 与 progress.resource 相同；文本 `<codex_delegation>` 包装、结构化 `codexDelegation` 标记及助手消息均不是直接用户暂停或消息授权；两者共用来源判定。暂停须在目标后且在回看前，覆盖所有已列剩余资源，不得同时选择、执行或交接暂停工作。局部暂停外仍有独立资源时不能据此停止整体。用户意思与遗漏目标仍由模型核对，字段标签本身不证明暂停。平台拒绝、取消、在途效果去重、最新目标及原有授权检查不被上述建议豁免。实际采用验收另取真实返回→下一动作→接收/执行证据，至少覆盖再次返回后的下一条边；模拟输入、发布安装和单次交接均不能替代。
+
+## 当前委托与返回对象
+
+现有目标、回看、验收与独验互相一致，仍不能证明调用者选中了当前委托。需要核对该关系时，可选 `progress.current_request: {input_ref, report_ref?}`；沿用原 `context.evidence/native_sources`，不建立新表单、队列或必填门禁。`input_ref` 显式选择当前线程 `task_request` 或原 `continuation_event`，关联已核 `resource/version`；原件为直接用户输入、原生 `cloud_threads.send_message` 接收输出或带 `codexDelegation` 的用户输入。冻结版本须作为完整标识出现在该原件中，来源、作用域及顺序仍需核验；委托只定义本次工作，不产生消息、暂停或资源操作授权。
+
+`report_ref` 指向本线程 `task_report`，`related_ref` 精确关联选定输入、`resource/version` 相同、`result: observed`；原件须是输入后成功完成的报告读取命令。JSON 报告顶层 `version`、`manifest_sha256`、`candidate_manifest_sha256` 至少一项且所有已给项完整相等；提及新 SHA、旧报告追加新字段或同系列旧版本均不能替代。结果使用精确 `outcome: passed|failed|not_run`，或明确的顶层 `verdict: PASS/FAIL/NOT_RUN`（可接大写字母数字下划线限定项）；同时出现时须一致，未知或冲突保留缺口。这是支持的结构化报告标记，不能从任意正文判断结果。项目报告不符合该合同的，保留缺口并由项目方法提供适用原件，不自动改写旧报告或真实结果。
+
+输出仅在提供该关系时增加 `current_request`：`state: unverified|selected|report_matched`、原输入/资源/版本、报告及 `outcome`，并列出本次已提供 `task_request` 中尚无匹配报告的 `pending_request_refs`。已提供同一冻结委托的有效失败报告不能被另一 PASS 隐去，保留 `current_request_failure_unresolved`。FAIL 返回 `current_request_report_failed`，未运行返回 `current_request_report_not_run`，均不能作候选通过；报告匹配也不代替原目标验收和独立 lock/verdict。声明 completed 时，回看必须在当前输入后，完成资源/版本及验收、独验均与选定对象比较，缺报告或其他已提供待回收对象不允许停止。普通事件的版本可以与下一全局动作不同，不全转成新目标；多个独立委托可显式返回其中一个，其他对象继续待处理。明确 `task_request.related_ref` 指向所选旧输入的修订须核顺序并重选，不能静默替换。 重选后，仅沿本次已提供、同任务项目且来源/版本/旧先新后顺序均可核的显式替代链剔除过时输入；目标原件不是可替代委托，独立待办不因较新时间或相同名称消失。缺失原件、断链、未知顺序或环保持具体缺口，不要求已替代且未执行旧版本另交报告。`superseded_request_refs` 保留已核过时输入，`superseded_failed_request_refs` 保留其已核失败；同资源同冻结版本的失败仍不能以换委托引用清除。
+
+未提供该关系的旧输入及完整输出继续保留原意义，不声称自动识别遗漏的委托、拦截最终回复或验证宿主实际采用。回归原错配时保留原输入输出，以逐字原生输入/报告配上显式选定关系分别检查；旧无关系投影的历史盲点不能冒称已经自动消失。实际同线程接续仍沿正常委托与返回取证，不重放模型或伪造事件。
