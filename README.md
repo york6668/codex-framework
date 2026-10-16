@@ -148,3 +148,17 @@ python3 -m unittest discover -s tests -v
 `python3 scripts/codex_framework.py workstation-check < /tmp/workstation-check.json` 对当前任务选定的节点状态做有界只读核对。它将已知故障、来源过期/缺失、身份或版本不符、资源清理后置条件不符分别呈现为异常或未知；仅 `normal` 退出 0。来源契约与限制见[工作站异常与可溯源性](.agents/skills/york-workstation/references/observability.md)。该入口不创建采集或调度，也不代替原生任务记录和模型对实际原件的核实。
 
 已安装的 `SessionStart` Hook 还可在本地任务启动或恢复时读取节点来源清单，注入简短异常或未知摘要；摘要缺席时只读运行 `codex-framework workstation-entry` 直读固定清单，不递归扫描工作站。该入口限制来源目录、文件数量和合计字节，旧记录可报告故障却不能证明健康。它不会在任务空闲时唤醒模型；正常启动的自动注入须单独验收。
+
+## 有限结果的实际返回核对
+
+对于已经发生返回对象错配的原合并/收件路径，`scripts/return_receipt.py` 的 `produce(expected, committed_readback, bindings, payload=payload)` 可在原成功合并后的同一次读回操作中生成完整有限回执；它不修改总表或发送消息。`expected` 固定当前原生委托与逐对象报告、结论、限制和下一步，`bindings` 核对原有总表中的确切回执与下一步投影及报告指纹。原报告各自的身份保持分开。
+
+主协调在读取候选返回前固定同一完整 `expected`，把 `scripts/return_receipt_receiver.js` 的纯函数 `receiveFinal(contracts, observed)` 放入原收件执行单元：受支持的原生读取取得实际 final 后直接比较全文，再记录接受或拒收。该函数无需访问 Mac 文件、模块或网络；`observed` 由当前原生读取提供 thread_id/final_ref/completed/truncated/text，不能用子任务自述替代。合同须随原委托或可核验返回携带完整内容，路径和摘要不能代替原文；不要执行子任务返回的任意代码。固定审核的接收器源码可直接内联使用。
+
+回执格式是 `finite-return-v2` 的完整规范 JSON，禁止额外正文；报告、限制和下一步均与预期完整相等才接受。多发送方独立请求逐项保留在 `pending_request_refs`，不默认取最新消息；缺失、截断或不明的原生返回保留具体未知。拒收只针对该返回，保护已成功合并成果并继续独立获准工作。全局总表 hash 仅作读回审计，不证明返回主题，也不因无关字段变化拒收同一有效投影。
+
+这是原调用路径被实际采用后的一次事后检出/纠正能力，不是平台自动订阅、发送前拦截、自由文本语义判定或零偏差保证。两个工具不进入安装运行闭包；实际调用证据、独立复核和真实采用分别验收。
+
+发送前由父端在原执行单元调用同一纯 JS 文件的 makeDispatch(senderThread, targetThread, requestId, payload, results)。requestId 是父端本次新建且不复用的请求标识；payload 是父端保存的精确逻辑指令字符串，不裁剪、规范化 Unicode 或转换换行。摘要为该字符串 UTF-8 字节的 SHA-256，排除合同字段、平台包装、子端 FCO 和发送后生成的标识。纯 JS SHA-256 已可在无 Node/crypto/TextEncoder 的 functions.exec 中运行。父端先保存返回的 expected/prompt，再将同一个 prompt 字符串传入原生发送调用；不从子 final 反推 expected。该 packet 是 canonical finite-dispatch-v1 JSON，包含 payload 与 expected；整个 prompt 的另一个摘要只作发送审计，不能与 payload 摘要混用。
+
+子端在原收到委托的操作中对同一逻辑 packet 调用 parse_dispatch(prompt)，再把 packet 的 payload/expected 送入原成功合并读回的 produce。解析器核对完整逻辑 packet、SHA 与原格式，不假定 provider 包装规则，也不以父端标识认证子 FCO 原件或授予权限。父端原生读取实际 final 后仍用发送前保留的 expected 进行全文比较；缺失的原生完成/正文/身份仍为 unknown。多个独立父端请求各自保存，不按最新覆盖。
