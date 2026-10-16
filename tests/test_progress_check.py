@@ -530,5 +530,237 @@ class ContinuationChecks(unittest.TestCase):
         self.assertIn("selected_step_not_executable",result["blocked"])
 
 
+
+class TaskBoundaryChecks(unittest.TestCase):
+    """Supplied relationship contracts; no real diagnosis, dispatch or resource work."""
+
+    def mixed(self):
+        request = fixtures.action_case()
+        request['project']['scopes'].append({'kind': 'service', 'id': 'docker', 'access': 'write'})
+        request['task']['scopes'] = copy.deepcopy(request['project']['scopes'])
+        request['context']['node_snapshot_observed_at'] = datetime.now(timezone.utc).isoformat()
+        request['context']['node_snapshot_max_age_seconds'] = 900
+
+        def action(kind, resource, effect, capabilities):
+            result = {'kind': kind, 'resource': resource, 'capabilities': capabilities}
+            if kind != 'read':
+                result['effect_key'] = effect
+            return result
+
+        code = action('write', {'kind': 'repo', 'id': 'framework', 'path': 'scripts/core.py'}, 'code', ['python'])
+        offline = action('invoke', {'kind': 'repo', 'id': 'framework', 'path': 'tests/offline.py'}, 'offline', ['python'])
+        live = action('invoke', {'kind': 'service', 'id': 'docker', 'path': 'mysql'}, 'live', ['docker'])
+        adoption = action('read', live['resource'], None, [])
+        request.update(phase='progress', progress={'checkpoint': 'after_failure', 'claim': 'working', 'steps': [
+            {'id': 'code', 'action': code}, {'id': 'offline', 'action': offline},
+            {'id': 'live', 'action': live}, {'id': 'adoption', 'action': adoption, 'depends_on': ['live']}]})
+        ContinuationChecks().review(request)
+        request['progress']['continuation']['selected_step_id'] = 'code'
+        return request
+
+    def assert_partition(self, result, ready, blocked, unresolved):
+        self.assertEqual(result['work_partition'], {'ready_step_ids': ready,
+            'blocked_step_ids': blocked, 'unresolved_step_ids': unresolved})
+        self.assertEqual(set(ready + blocked + unresolved), {s['id'] for s in result['steps']})
+        self.assertEqual(len(ready + blocked + unresolved), len(result['steps']))
+
+    def test_docker_offline_and_oom_only_hold_dependent_field_work(self):
+        for exhausted in (False, True):
+            with self.subTest(exhausted=exhausted):
+                request = self.mixed()
+                if exhausted:
+                    request['context']['tool_failures'] = [{'kind': 'resource_exhausted',
+                        'ref': 'codex:tool:oom', 'resource': request['progress']['steps'][2]['action']['resource'],
+                        'action_kind': 'invoke'}]
+                result = check.evaluate(request)
+                self.assertEqual(result['status'], 'needs_evidence')
+                self.assert_partition(result, ['code', 'offline'], ['adoption'], ['live'])
+                self.assertNotIn('selected_step_not_executable', result['blocked'])
+                request['progress']['claim'] = 'waiting'
+                result = check.evaluate(request)
+                self.assertIn('independent_work_remaining', result['blocked'])
+                self.assertFalse(result['wait_allowed'])
+
+    def test_readonly_diagnosis_cannot_write_invoke_or_touch_other_task_scope(self):
+        request = fixtures.action_case()
+        request['task']['scopes'][0]['access'] = 'read'
+        request['action']['kind'] = 'read'
+        self.assertEqual(check.evaluate(request)['status'], 'ready')
+        for kind in ('write', 'invoke', 'repair', 'publish'):
+            with self.subTest(kind=kind):
+                request['action']['kind'] = kind
+                self.assertIn('outside_task_scope', check.evaluate(request)['blocked'])
+        request['action']['kind'] = 'read'
+        request['action']['resource']['path'] = 'other-task/config.py'
+        self.assertIn('outside_task_scope', check.evaluate(request)['blocked'])
+
+    def test_unrelated_new_issue_does_not_interrupt_original_work(self):
+        request = self.mixed()
+        request['context']['tool_failures'] = [{'kind': 'platform_denied', 'ref': 'codex:other:denied',
+            'resource': {'kind': 'repo', 'id': 'other-project'}, 'action_kind': 'write'}]
+        result = check.evaluate(request)
+        self.assert_partition(result, ['code', 'offline'], ['adoption'], ['live'])
+        request['progress']['steps'][0]['action']['resource']['id'] = 'other-project'
+        self.assertIn('outside_project_scope', check.evaluate(request)['steps'][0]['blocked'])
+
+    def test_scoped_pause_and_explicit_project_stop_have_different_coverage(self):
+        request = self.mixed()
+        request['context']['tool_failures'] = [{'kind': 'user_cancelled', 'ref': 'codex:user:stop',
+            'resource': copy.deepcopy(request['progress']['steps'][0]['action']['resource'])}]
+        ContinuationChecks().add(request, 'codex:user:stop', 'goal', 'Pause only the code action', item_type='userMessage')
+        result = check.evaluate(request)
+        self.assert_partition(result, ['offline'], ['code', 'adoption'], ['live'])
+        request['context']['tool_failures'][0]['resource'] = {'kind': 'repo', 'id': 'framework'}
+        request['context']['tool_failures'].append({'kind': 'user_cancelled', 'ref': 'codex:user:stop',
+            'resource': {'kind': 'service', 'id': 'docker'}})
+        import hashlib
+        record = next(r for r in request['context']['evidence'] if r['ref'] == 'codex:user:stop')
+        item = next(i for i in request['context']['native_sources'][0]['turns'][0]['items'] if i['id'] == 'codex:user:stop')
+        item['text'] = 'Stop the entire project, including its repository and service actions'
+        record['digest'] = hashlib.sha256(item['text'].encode()).hexdigest()
+        result = check.evaluate(request)
+        self.assert_partition(result, [], ['code', 'offline', 'live', 'adoption'], [])
+        self.assertIn('user_cancelled_action', result['steps'][1]['blocked'])
+        self.assertNotEqual(result['status'], 'ready')
+        self.assertFalse(result['continuous_eligible'])
+
+    def test_shared_conflict_isolates_actual_file_and_its_dependents(self):
+        request = self.mixed()
+        action = request['progress']['steps'][0]['action']
+        request['context']['native_operations'] = [{'ref': 'codex:other:inflight', 'project_id': 'other',
+            'task_ref': 'codex:thread:other', 'resource': copy.deepcopy(action['resource']),
+            'effect_key': 'other-change', 'state': 'running'}]
+        result = check.evaluate(request)
+        self.assert_partition(result, ['offline'], ['code', 'adoption'], ['live'])
+        request['context']['native_operations'][0]['resource']['path'] = 'scripts/other.py'
+        self.assert_partition(check.evaluate(request), ['code', 'offline'], ['adoption'], ['live'])
+
+    def test_new_user_correction_restores_legal_branches_without_clearing_denial(self):
+        import hashlib
+        import json
+        request = self.mixed()
+        request['context']['tool_failures'] = [
+            {'kind': 'user_cancelled', 'ref': 'codex:user:old-stop', 'resource': {'kind': 'repo', 'id': 'framework'}},
+            {'kind': 'platform_denied', 'ref': 'codex:tool:live-denied',
+             'resource': {'kind': 'service', 'id': 'docker'}, 'action_kind': 'invoke'}]
+        ContinuationChecks().add(request, 'codex:user:resume', 'goal',
+            'Resume framework code and offline validation; the service refusal remains', item_type='userMessage')
+        self.assertIn('newer_goal_requires_scope_review', check.evaluate(request)['missing'])
+        request['progress']['goal_ref'] = 'codex:user:resume'
+        record = next(r for r in request['context']['evidence'] if r['kind'] == 'goal_review')
+        text = json.dumps({'goal_ref': request['progress']['goal_ref'],
+                           'step_ids': [s['id'] for s in request['progress']['steps']]})
+        record['digest'] = hashlib.sha256(text.encode()).hexdigest()
+        source = request['context']['native_sources'][0]['turns'][0]['items']
+        next(i for i in source if i['id'] == record['native_item_id'])['text'] = text
+        request['context']['tool_failures'] = request['context']['tool_failures'][1:]
+        result = check.evaluate(request)
+        self.assert_partition(result, ['code', 'offline'], ['live', 'adoption'], [])
+        self.assertIn('platform_denied_action', result['steps'][2]['blocked'])
+
+    def test_late_diagnosis_returns_to_original_owner_and_does_not_complete_goal(self):
+        request = ContinuationChecks().handoff('returned')
+        h = request['progress']['continuation']['handoff']
+        h['result_ref'] = 'codex:result:diagnosis'
+        record, item = ContinuationChecks().add(request, h['result_ref'], 'handoff_result',
+            'bounded diagnosis ' + h['version'], thread=h['target_task_ref'], version=h['version'])
+        item['phase'] = 'final_answer'
+        result = check.evaluate(request)
+        self.assertEqual(result['continuation_state'], 'returned')
+        self.assertEqual(result['coordination_owner'], request['task']['native_ref'])
+        self.assert_partition(result, ['diagnose'], [], [])
+        request['progress']['claim'] = 'completed'
+        self.assertIn('remaining_steps_not_complete', check.evaluate(request)['blocked'])
+        record['version'] = 'commit:old'
+        self.assertIn('handoff_returned_unverified', check.evaluate(request)['missing'])
+
+    def test_unavailable_channel_and_missing_send_authority_preserve_independent_work(self):
+        request = ContinuationChecks().handoff('received')
+        h = request['progress']['continuation']['handoff']
+        request['context']['evidence'] = [r for r in request['context']['evidence'] if r['ref'] != h['authorization_ref']]
+        sent = next(i for i in request['context']['native_sources'][0]['turns'][0]['items'] if i['id'] == h['sent_ref'])
+        sent['output']['text'] = '{"threadId":"review-task","status":"unknown"}'
+        record = next(r for r in request['context']['evidence'] if r['ref'] == h['sent_ref'])
+        import hashlib
+        record['digest'] = hashlib.sha256(sent['output']['text'].encode()).hexdigest()
+        result = check.evaluate(request)
+        self.assertFalse(result['handoff_received'])
+        self.assertEqual(result['coordination_owner'], request['task']['native_ref'])
+        self.assertIn('handoff_received_unverified', result['missing'])
+        self.assert_partition(result, ['diagnose'], [], [])
+
+    def test_inventory_delivery_does_not_close_candidates_or_unknown_ownership(self):
+        request = self.mixed()
+        request['progress']['steps'].extend([
+            {'id': 'candidate_review', 'action': {'kind': 'read', 'resource': {'kind': 'service', 'id': 'docker',
+                'path': 'candidate-review'}, 'capabilities': ['candidate-evidence']}},
+            {'id': 'unknown_owner', 'action': {'kind': 'read', 'resource': {'kind': 'service', 'id': 'docker',
+                'path': 'anonymous-owner'}, 'capabilities': ['owner-evidence']}}])
+        # Refresh the provided goal-review set, rather than pretending a completed
+        # inventory can prove those derived questions absent.
+        import hashlib
+        import json
+        record = next(r for r in request['context']['evidence'] if r['kind'] == 'goal_review')
+        text = json.dumps({'goal_ref': request['progress']['goal_ref'],
+                           'step_ids': [s['id'] for s in request['progress']['steps']]})
+        record['digest'] = hashlib.sha256(text.encode()).hexdigest()
+        items = request['context']['native_sources'][0]['turns'][0]['items']
+        next(i for i in items if i['id'] == record['native_item_id'])['text'] = text
+        result = check.evaluate(request)
+        self.assert_partition(result, ['code', 'offline'], ['adoption'], ['live', 'candidate_review', 'unknown_owner'])
+        request['progress']['steps'] = request['progress']['steps'][:4]
+        self.assertIn('remaining_goals_omitted_or_unreviewed', check.evaluate(request)['blocked'])
+
+    def test_feedback_correction_must_replace_old_plan_version(self):
+        request = fixtures.action_case()
+        target = copy.deepcopy(request['action']['resource'])
+        request['project']['accepted_corrections'] = [{'ref': 'codex:fix:threshold',
+            'resource': target, 'version': 'commit:corrected'}]
+        request['project']['corrections_source_ref'] = 'codex:user:feedback'
+        record, item = ContinuationChecks().add(request, 'codex:fix:threshold', 'fix',
+            'verified criterion commit:corrected', item_type='commandExecution', version='commit:corrected')
+        item.update(status='completed', exitCode=0, command='verify criterion commit:corrected')
+        self.assertIn('accepted_correction_not_used', check.evaluate(request)['missing'])
+        request['action']['accepted_corrections'] = [{'ref': record['ref'], 'version': 'commit:old'}]
+        self.assertIn('stale_correction_version', check.evaluate(request)['blocked'])
+        request['action']['accepted_corrections'][0]['version'] = 'commit:corrected'
+        self.assertEqual(check.evaluate(request)['status'], 'ready')
+
+    def test_feedback_acknowledgment_is_not_actual_followup_or_cancel_release(self):
+        request = fixtures.ClosureChecks().close_case()
+        request['context']['evidence'] = [r for r in request['context']['evidence'] if r['kind'] != 'followup']
+        self.assertIn('followup_used_correction', check.evaluate(request)['missing'])
+        request = self.mixed()
+        request['context']['tool_failures'] = [{'kind': 'user_cancelled', 'ref': 'codex:user:cancelled',
+            'resource': request['progress']['steps'][0]['action']['resource']}]
+        ContinuationChecks().add(request, 'codex:feedback:grouped', 'observation', 'feedback grouped; no cancellation release')
+        result = check.evaluate(request)
+        self.assertIn('user_cancelled_action', result['steps'][0]['blocked'])
+        self.assert_partition(result, ['offline'], ['code', 'adoption'], ['live'])
+
+    def test_merged_candidate_requires_combination_test_and_exact_independent_version(self):
+        request = fixtures.ClosureChecks().close_case()
+        target = request['issue']['resource']
+        review = request['issue']['independent_verification']
+        request['phase'] = 'action'
+        request['action'] = {'kind': 'publish', 'resource': target, 'effect_key': 'release',
+            'depends_on': ['codex:merge:combined'], 'release': {'goal_ref': request['issue']['goal_ref'],
+                'version': 'commit:merged', 'test_ref': 'codex:test:combined', 'independent_verification': review}}
+        request['context']['native_operations'] = [{'ref': 'codex:merge:combined', 'project_id': 'framework',
+            'task_ref': request['task']['native_ref'], 'effect_key': 'merge', 'state': 'unknown'}]
+        result = check.evaluate(request)
+        self.assertIn('dependency_unverified', result['missing'])
+        self.assertIn('tested_release_version', result['missing'])
+        request['context']['native_operations'][0]['state'] = 'succeeded'
+        record, item = ContinuationChecks().add(request, 'codex:test:combined', 'release_test',
+            'combination regression commit:merged', item_type='commandExecution', version='commit:merged', result='passed')
+        item.update(status='completed', exitCode=0, command='combination regression commit:merged')
+        self.assertIn('independent_verification_version_mismatch', check.evaluate(request)['missing'])
+        fixtures.attach_independent_verification(request, 'commit:merged', suffix='combined')
+        self.assertEqual(check.evaluate(request)['status'], 'ready')
+        item['exitCode'] = 1
+        self.assertIn('tested_release_version', check.evaluate(request)['missing'])
+
+
 if __name__ == "__main__":
     unittest.main()

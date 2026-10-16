@@ -713,6 +713,13 @@ def evaluate(payload):
                   "deviation" if deviations else "ready")
         return {"status": status, "blocked": blocked, "missing": missing,
                 "deviations": deviations, "steps": decisions,
+                # Per-step conditions are separate from the aggregate review.
+                # These lists neither grant permission nor discover omitted work.
+                "work_partition": {
+                    "ready_step_ids": [s["id"] for s in decisions if s["state"] == "ready"],
+                    "blocked_step_ids": [s["id"] for s in decisions
+                                         if s["state"] in ("direct_refusal", "dependency_blocked", "blocked")],
+                    "unresolved_step_ids": [s["id"] for s in decisions if s["state"] == "needs_evidence"]},
                 "continuation_state": continuation_state, "selected_step_id": selected_step,
                 "handoff_received": received,
                 "coordination_owner": task_ref,

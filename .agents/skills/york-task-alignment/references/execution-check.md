@@ -2,7 +2,9 @@
 
 当任务涉及跨端接续、重复副作用、共享资源冲突、预算、故障恢复或缺陷关闭，而现有事实不能一眼判断时，可运行框架仓库的 `scripts/codex_framework.py check`。先由当前任务读取项目契约、原目标与原生/节点记录，检查器消费本次临时输入，不创建任务、持久日志、权限或业务数据，也不替代 Codex 原生审批。普通明确且低风险的动作不必为此建立记录。
 
-工具失败后重排、进入等待、阶段收尾和交接均沿用该 `check` 命令，以 `phase: progress` 检查本轮剩余步骤。输入的 `progress.checkpoint` 为 `after_failure|wait|stage_end|handoff`，`claim` 为 `working|waiting|completed|continuous_tracking`；`steps` 最多 32 项，每项有唯一 `id`、现有 `action` 结构及引用前面步骤 ID 的 `depends_on`。输出逐项为 `direct_refusal`、`dependency_blocked`、`ready`、`needs_evidence` 或 `blocked`。这是当前剩余工作的有界投影，模型仍需从原任务核对是否遗漏步骤，不能把 `status: ready` 误读为全部步骤均可执行。
+工具失败后重排、进入等待、阶段收尾和交接均沿用该 `check` 命令，以 `phase: progress` 检查本轮剩余步骤。输入的 `progress.checkpoint` 为 `after_failure|wait|stage_end|handoff`，`claim` 为 `working|waiting|completed|continuous_tracking`；`steps` 最多 32 项，每项有唯一 `id`、现有 `action` 结构及引用前面步骤 ID 的 `depends_on`。输出逐项为 `direct_refusal`、`dependency_blocked`、`ready`、`needs_evidence` 或 `blocked`。输出 `work_partition` 同时列出逐项条件满足的 `ready_step_ids`、有直接或依赖阻断的 `blocked_step_ids`、仍缺证据的 `unresolved_step_ids`；三组按输入顺序覆盖已提供步骤。聚合 `needs_evidence` 或 `blocked` 不能被解释为所有分支暂停，仍须核对具体步骤；`ready_step_ids` 也只表示该步骤输入关系满足，不覆盖全局目标、消息权限或省略的停止要求。这是当前剩余工作的有界投影，模型仍需从原任务核对是否遗漏步骤，不能把 `status: ready` 误读为全部步骤均可执行。
+
+处理、排查、独立验证和集成的职责及真实依赖由[工作生命周期](../SKILL.md#职责与新问题)承担，检查器不从任务称谓推导权限，也不决定自然语言是否要求全项目停止。只读排查用真实 `task.scopes.access: read`；写入、invoke、修改旁任务仍按实际范围检查。用户停止或纠正先由执行者根据原件更新当前有效范围，不能凭可并行标签忽略整项目停止，也不能删掉仍有效的取消或拒绝。
 
 `context.tool_failures` 可列出多条仍有效的失败；原有单条 `tool_failure` 输入继续兼容，若两者同时存在会合并检查。每条平台拒绝按实际资源、原件提供的 effect_key、目的地与副作用匹配；write 改称 invoke 或更换通道、线程不会消除同一拒绝；资源路径的父子范围也会匹配。只把直接拒绝及其已证依赖标为暂停，其他获准动作单独检查。调用者须从原生记录保留所有仍有效的失败，检查器不能从省略的输入恢复历史；权限或事实确实改变时依原目标和平台规则复核，不能借输入删去拒绝来重试。
 
