@@ -564,6 +564,8 @@ def evaluate(payload):
         raise CheckError("phase must be resume, action, feedback, verify_local, close_issue or progress")
     blocked, missing, deviations = [], [], []
     access_route = None
+    resource_route = None
+    basis_review = None
 
     def block(code):
         if code not in blocked:
@@ -589,7 +591,8 @@ def evaluate(payload):
             raise CheckError("evidence references must be unique and name a native or node source")
         if set(record) - {"ref", "source", "kind", "project_id", "task_ref", "version",
                            "result", "related_ref", "digest", "resource", "native_item_id",
-                           "node_path", "node_id", "workspace"}:
+                           "node_path", "node_id", "workspace", "epistemic_status",
+                           "origin_refs", "supersedes_ref"}:
             raise CheckError("evidence may contain only references and outcome metadata")
         evidence[ref] = record
 
@@ -598,7 +601,8 @@ def evaluate(payload):
                       or (phase == "action" and isinstance(action_input, dict)
                           and (action_input.get("kind") in ("repair", "publish")
                                or "recovery" in action_input or "workspace" in action_input
-                               or "incident" in context or "access" in action_input)))
+                               or "incident" in context or "access" in action_input
+                               or "maintenance" in action_input)))
 
     def linked(ref, kind):
         record = evidence.get(ref)
@@ -707,6 +711,95 @@ def evaluate(payload):
                         or source_record.get("version") != version
                         or not verify_source(context, project, source_record)):
                     need("accepted_correction_unverified")
+
+    def check_decision_basis(action, target):
+        """Compare explicit premise lineage, never infer facts from source prose.
+
+        This optional projection is not an authority registry or a runtime gate.
+        Callers still establish semantic entailment and complete provenance.
+        """
+        if "basis_refs" not in action:
+            return None
+        selected = items(action["basis_refs"], "action.basis_refs")
+        for ref in selected:
+            identifier(ref, "basis reference")
+        if len(set(selected)) != len(selected):
+            raise CheckError("basis references must be unique")
+        if action.get("kind") == "read":
+            return {"selected_refs": selected, "purpose": "inquiry_only"}
+        seen, active, superseding = set(), set(), set()
+
+        def source(ref):
+            record = evidence.get(ref)
+            if (record is None or record.get("kind") != "premise"
+                    or record.get("project_id") != project_id):
+                need("decision_basis_source_unverified")
+                return None
+            digest = record.get("digest")
+            if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+                need("decision_basis_digest")
+                return None
+            if not verify_source(context, project, record):
+                need("decision_basis_source_unverified")
+                return None
+            if record.get("resource") is None or not overlaps(resource(record["resource"]), target):
+                block("decision_basis_scope_mismatch")
+                return None
+            return record
+
+        def visit(ref):
+            if ref in active:
+                need("decision_basis_cycle")
+                return
+            if ref in seen:
+                return
+            active.add(ref)
+            record = source(ref)
+            if record is not None:
+                state = record.get("epistemic_status")
+                if state not in ("confirmed", "assumption", "unknown"):
+                    need("decision_basis_status_unverified")
+                elif state != "confirmed":
+                    need("decision_basis_unconfirmed")
+                origins = items(record.get("origin_refs", []), "premise.origin_refs")
+                for origin in origins:
+                    identifier(origin, "premise origin reference")
+                if len(set(origins)) != len(origins):
+                    raise CheckError("premise origins must be unique")
+                for origin in origins:
+                    visit(origin)
+                item = native_item(context, record)
+                body = source_body(context, record)
+                # Assistant/other-task summaries may carry an established source;
+                # neither their wording nor a confirmed label creates a root fact.
+                if not origins and not (direct_user_message(item, body) or
+                        (item is not None and item.get("type") == "commandExecution"
+                         and item.get("status") == "completed" and item.get("exitCode") == 0
+                         and record.get("result") == "observed")):
+                    need("decision_basis_origin_unverified")
+                for correction in evidence.values():
+                    if correction.get("supersedes_ref") != ref:
+                        continue
+                    replacement = source(correction["ref"])
+                    replacement_item = native_item(context, replacement) if replacement else None
+                    replacement_body = source_body(context, replacement) if replacement else None
+                    if (replacement is None or replacement.get("epistemic_status") != "confirmed"
+                            or replacement.get("resource") != record.get("resource")
+                            or not direct_user_message(replacement_item, replacement_body)):
+                        need("decision_correction_source_unverified")
+                    elif not native_precedes(context, record, replacement):
+                        need("decision_correction_order_unverified")
+                    else:
+                        block("decision_basis_superseded")
+                        superseding.add(replacement["ref"])
+            active.remove(ref)
+            seen.add(ref)
+
+        for ref in selected:
+            visit(ref)
+        return {"selected_refs": selected, "lineage_refs": sorted(seen),
+                "superseding_refs": sorted(superseding),
+                "meaning": "supplied_source_relations_only; semantic_entailment_not_verified"}
 
     def check_outcome_scope(record, target, label):
         """A successful result for another resource cannot accept this target."""
@@ -955,6 +1048,10 @@ def evaluate(payload):
                         "blocked": single["blocked"], "missing": single["missing"]}
             if "access_route" in single:
                 decision["access_route"] = single["access_route"]
+            if "resource_route" in single:
+                decision["resource_route"] = single["resource_route"]
+            if "decision_basis" in single:
+                decision["decision_basis"] = single["decision_basis"]
             decisions.append(decision)
             by_id[step_id] = decision
         if claim == "working" and any(s["state"] == "needs_evidence" for s in decisions):
@@ -1481,6 +1578,7 @@ def evaluate(payload):
         if not any(covers(scope, target, write) for scope in task_scopes):
             block("outside_task_scope")
         check_corrections(target, action.get("accepted_corrections", []))
+        basis_review = check_decision_basis(action, target)
         required = items(action.get("capabilities", []), "action.capabilities")
         available = items(context.get("capabilities", []), "context.capabilities")
         if any(capability not in available for capability in required):
@@ -1716,6 +1814,113 @@ def evaluate(payload):
                 block("platform_denied_action" if requirement == "denied" else "direct_trust_edit_forbidden")
             if blocked:
                 access_route = "stop_affected_action"
+        maintenance = action.get("maintenance")
+        if maintenance is not None:
+            maintenance = obj(maintenance, "action.maintenance")
+            if set(maintenance) - {"contract_ref", "observation_ref", "strategy", "claim",
+                                   "max_age_seconds", "goal_ref"}:
+                raise CheckError("action.maintenance contains unsupported fields")
+            strategy = maintenance.get("strategy")
+            if strategy not in ("rebuild", "preserve", "hot_takeover", "discover", "temporary_relief"):
+                raise CheckError("action.maintenance.strategy is invalid")
+            claim = maintenance.get("claim", "plan")
+            if claim not in ("plan", "complete"):
+                raise CheckError("action.maintenance.claim is invalid")
+            age = maintenance.get("max_age_seconds")
+            if isinstance(age, bool) or not isinstance(age, int) or not 1 <= age <= 86400:
+                raise CheckError("action.maintenance.max_age_seconds must be an integer from 1 to 86400")
+
+            def resource_fact(ref, fact_kind, fields, command_only=False):
+                record = linked(ref, fact_kind)
+                if record is None:
+                    return None
+                digest = record.get("digest")
+                if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+                    need(fact_kind + "_digest")
+                    return None
+                check_outcome_scope(record, target, fact_kind)
+                item = native_item(context, record)
+                body = source_body(context, record)
+                command = (item is not None and item.get("type") == "commandExecution"
+                           and item.get("status") == "completed" and item.get("exitCode") == 0)
+                if not command and (command_only or not direct_user_message(item, body)):
+                    need("native_" + fact_kind + "_source")
+                    return None
+                def unique(pairs):
+                    result = {}
+                    for key, value in pairs:
+                        if key in result:
+                            raise CheckError("duplicate resource fact field")
+                        result[key] = value
+                    return result
+                try:
+                    value = json.loads(body, object_pairs_hook=unique) if body else None
+                except (ValueError, RecursionError):
+                    need("structured_" + fact_kind)
+                    return None
+                value = obj(value, fact_kind + " body")
+                if set(value) != set(fields) | {"resource"}:
+                    raise CheckError(fact_kind + " body fields are invalid")
+                if resource(value["resource"]) != target:
+                    block(fact_kind + "_resource_mismatch")
+                return value
+
+            contract = resource_fact(maintenance.get("contract_ref"), "resource_contract",
+                                     ("role", "retention", "rebuild_ref", "availability"))
+            observation = resource_fact(maintenance.get("observation_ref"), "resource_observation",
+                                        ("observed_at", "target_verified", "dependencies",
+                                         "retention_conflict", "normal_baseline", "goal_result"), True)
+            resource_route = {"rebuild": "stop_rebuild_and_verify", "preserve": "preserve_and_verify",
+                              "hot_takeover": "preserve_with_continuity", "discover": "discover_resource_role",
+                              "temporary_relief": "temporary_relief_only"}[strategy]
+            if strategy != "discover" and (kind == "read" or not isinstance(workspace, dict)):
+                block("resource_strategy_requires_actual_effect")
+            if contract is not None:
+                for field, allowed in {
+                        "role": ("rebuildable_model", "retained_state", "external_business", "personal", "unknown"),
+                        "retention": ("none", "required", "unknown"),
+                        "availability": ("restart_allowed", "continuous_required", "unknown")}.items():
+                    if contract[field] not in allowed:
+                        raise CheckError("resource_contract." + field + " is invalid")
+                if contract["rebuild_ref"] is not None:
+                    identifier(contract["rebuild_ref"], "resource_contract.rebuild_ref")
+                if contract["role"] == "unknown":
+                    need("resource_role_unverified")
+                if strategy == "rebuild":
+                    if contract["role"] != "rebuildable_model" or contract["retention"] != "none":
+                        block("rebuild_requires_discardable_managed_scope")
+                    if not contract["rebuild_ref"]:
+                        need("reconstruction_source")
+                    if contract["availability"] != "restart_allowed":
+                        need("rebuild_interruption_contract")
+                if strategy == "hot_takeover" and contract["availability"] != "continuous_required":
+                    block("unsupported_continuity_requirement")
+            if observation is not None:
+                for field in ("target_verified", "retention_conflict", "normal_baseline"):
+                    if not isinstance(observation[field], bool):
+                        raise CheckError("resource_observation." + field + " must be boolean")
+                if observation["dependencies"] not in ("clear", "quiesced", "busy", "unknown"):
+                    raise CheckError("resource_observation.dependencies is invalid")
+                if observation["goal_result"] not in ("passed", "failed", "not_run"):
+                    raise CheckError("resource_observation.goal_result is invalid")
+                if not node_snapshot_fresh({"node_snapshot_observed_at": observation["observed_at"],
+                                            "node_snapshot_max_age_seconds": age}):
+                    need("resource_observation_stale_or_unverified")
+                if not observation["target_verified"]:
+                    need("exact_resource_identity")
+                if strategy != "discover" and observation["dependencies"] not in ("clear", "quiesced"):
+                    need("affected_dependency_safe_point")
+                if strategy == "rebuild" and observation["retention_conflict"]:
+                    block("rebuild_conflicts_with_observed_retention")
+                if claim == "complete":
+                    goal = check_current_goal(maintenance.get("goal_ref"), required=True)
+                    observed = evidence.get(maintenance.get("observation_ref"))
+                    if goal is not None and observed.get("related_ref") != goal["ref"]:
+                        block("resource_result_goal_mismatch")
+                    if observation["goal_result"] != "passed" or not observation["normal_baseline"]:
+                        need("resource_goal_under_normal_baseline")
+            if strategy == "temporary_relief" and claim == "complete":
+                block("temporary_relief_not_capacity_solution")
         if kind == "repair":
             defect = obj(action.get("defect", {}), "action.defect")
             if not defect.get("failure_ref") or not defect.get("cause_ref"):
@@ -1858,8 +2063,13 @@ def evaluate(payload):
     result = {"status": status, "blocked": blocked, "missing": missing, "deviations": deviations,
               "continuous_eligible": continuous_eligible,
               "meaning": "source_excerpt_and_input_consistency_only; provenance, authorization and goal semantics remain external"}
+    if basis_review is not None:
+        result["decision_basis"] = basis_review
     if access_route is not None:
         result["access_route"] = access_route
+    if resource_route is not None:
+        result["resource_route"] = ("stop_affected_action" if blocked else
+                                    "resolve_resource_facts" if missing else resource_route)
     if phase == "close_issue":
         validation = payload["issue"].get("independent_verification")
         attempts = validation.get("attempts", []) if isinstance(validation, dict) else []

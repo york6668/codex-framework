@@ -129,3 +129,23 @@ python3 scripts/codex_framework.py check < /tmp/current-action.json
 输出仅在提供该关系时增加 `current_request`：`state: unverified|selected|report_matched`、原输入/资源/版本、报告及 `outcome`，并列出本次已提供 `task_request` 中尚无匹配报告的 `pending_request_refs`。已提供同一冻结委托的有效失败报告不能被另一 PASS 隐去，保留 `current_request_failure_unresolved`。FAIL 返回 `current_request_report_failed`，未运行返回 `current_request_report_not_run`，均不能作候选通过；报告匹配也不代替原目标验收和独立 lock/verdict。声明 completed 时，回看必须在当前输入后，完成资源/版本及验收、独验均与选定对象比较，缺报告或其他已提供待回收对象不允许停止。普通事件的版本可以与下一全局动作不同，不全转成新目标；多个独立委托可显式返回其中一个，其他对象继续待处理。明确 `task_request.related_ref` 指向所选旧输入的修订须核顺序并重选，不能静默替换。 重选后，仅沿本次已提供、同任务项目且来源/版本/旧先新后顺序均可核的显式替代链剔除过时输入；目标原件不是可替代委托，独立待办不因较新时间或相同名称消失。缺失原件、断链、未知顺序或环保持具体缺口，不要求已替代且未执行旧版本另交报告。`superseded_request_refs` 保留已核过时输入，`superseded_failed_request_refs` 保留其已核失败；同资源同冻结版本的失败仍不能以换委托引用清除。
 
 未提供该关系的旧输入及完整输出继续保留原意义，不声称自动识别遗漏的委托、拦截最终回复或验证宿主实际采用。回归原错配时保留原输入输出，以逐字原生输入/报告配上显式选定关系分别检查；旧无关系投影的历史盲点不能冒称已经自动消失。实际同线程接续仍沿正常委托与返回取证，不重放模型或伪造事件。
+
+## 可选资源角色与方案核对
+
+资源方案先由模型按[资源角色与处置](../../york-workstation/references/resource-lifecycle.md#资源角色与处置)理解实际用途、用户重建契约、准确对象及依赖。复杂或反复偏移时，正常 `phase: action` 可附 `action.maintenance`，不提供时旧输入、输出和退出语义不变，不增加每次维护必填表、台账或审批。检查只校验提供的有界事实关系，不解释自然语言、发现遗漏消费者或授权停删；模型仍须理解原件、用户日常基线及实际目标。
+
+该可选输入含 `contract_ref`、`observation_ref`、`strategy: rebuild|preserve|hot_takeover|discover|temporary_relief`、`max_age_seconds`（按本动作选1–86400秒的整数）和可选 `claim: plan|complete`、`goal_ref`。引用沿用 `context.evidence/native_sources`，同 project/task 且 resource 精确匹配；不是另建资源管理程序。`resource_contract` 是有摘要的原生直接用户声明或成功命令取得的有结构契约，正文选定 `resource`、`role: rebuildable_model|retained_state|external_business|personal|unknown`、`retention: none|required|unknown`、非敏感 `rebuild_ref`（无来源为 null）、`availability: restart_allowed|continuous_required|unknown`。普通对话无需为检查器重写为JSON；只有已有此类结构原件、且本次检查确有帮助时才用，未结构化事实由模型按同一方法直接判断。
+
+`resource_observation` 须为成功、完整原生命令及摘要，正文为 `resource`、原观察时刻 `observed_at`、布尔 `target_verified/retention_conflict/normal_baseline`、`dependencies: clear|quiesced|busy|unknown`、`goal_result: passed|failed|not_run`。仅用于本轮判断，真实原件和字段语义仍须核实；某一瞬间无连接不能推出无间歇消费者，重读不刷新时刻。complete 还需选择当前原生用户 `goal_ref`，观察证据的 `related_ref` 关联该目标；通过标记不代替实际客户端/容量预期及原 owner 验收。
+
+rebuild 需要当前契约可重建、当前数据无需保留、重建来源、允许中断，及准确对象和已处理依赖；冲突、陈旧或未知均不直接停删。hot_takeover 必须有实际连续性要求，不能从数据库名称推定；temporary_relief 不能签 complete，关闭 Chrome/IDE 不能作为正常基线容量方案。新字段不清除旧的范围、在途冲突、平台拒绝、跨环境授权或删除确认；只读标签也不能包装重建副作用。输出 `resource_route` 仅建议下一步，ready 不证明事实真实或原资源已经恢复。正式验收仍分开核对固定源码、实际安装、模型采用及资源 owner 的真实结果。
+
+## 实施依据的可选关系核对
+
+有争议的前提可在原有临时 `context.evidence` 中以 `kind: premise` 引用原件，附 `epistemic_status: confirmed|assumption|unknown`、适用 `resource`，转述附 `origin_refs`。`action.basis_refs` 仅列本动作实际依赖的事实；未提供时旧输入输出语义不变，不要求每动作填表或运行检查。来源仍使用原生 `task_ref/native_item_id/digest`；跨任务转述可引用同项目的原始来源，不改写它的来源线程。
+
+非只读决定逐层核对所给原件和来源链；assumption/unknown、不明来源、断链、环、缺失摘要或不支持的来源形状返回具体缺证据。助手的 confirmed 标签不能自证根事实；没有原出处的其他任务摘要也不能洗白假设。可核的直接用户事实陈述或成功观察命令只提供根来源资格，原文是否蕴含该事实、是否仅是未来要求、来源是否完整真实及对象是否匹配仍由执行者判断；程序不会读懂任意正文。确认状态不赋予操作权限，原作用域、拒绝、独立验收和平台确认继续核验。
+
+明确纠正可用同一原件引用 `supersedes_ref` 指向被纠正前提。检查器要求已给同对象直接用户原件与可核旧先新后顺序，旧前提及其派生转述不能继续作为依据；输出保留 `lineage_refs/superseding_refs`。跨来源顺序无法核实则保留具体缺口，不能自行拼造时间或用户原话。模型仍负责撤销错误依赖和向活跃任务传播、核实采用；检查器不发消息、不自动改计划，也不能发现未提供的纠正或省略的祖先。
+
+`read` 中的前提仅表示查证方向，返回 `inquiry_only`，不要求先证明问题才可在原权限内取证；资源范围和真实拒绝仍适用。`progress` 沿原有每步 `work_partition` 输出：需要该事实的步骤缺证，独立步骤仍可做。检查器不判断任意 `depends_on` 的业务必要性，执行者须先按来源与消费者撤掉错误边，再核所给关系。测试 `tests/test_orchestration_basis.py` 验证有限程序边界；还需用原失败委托、纠正接收/采用和集成后实际任务动作独立验收，不能把该测试或 `ready` 说成真实编排保障。
