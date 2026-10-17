@@ -6,7 +6,7 @@
 
 设计从当前官方产品合同及宿主实际入口开始，并贯穿任务拆分、执行、接续、恢复和验收。已有适用且刚核对的资料可以复用；已知能力、接口或生命周期发生相关变化时重查受影响设计，不设置统一文档 TTL，也不每次动作重查全部资料。业务含义和预期来自用户与项目契约，不能因 OpenAI 没有描述某个业务规则就认定其违规。
 
-[OpenAI 编排](https://developers.openai.com/api/docs/guides/agents/orchestration)区分管理者调用有界专业能力与移交对话；原协调回收并判断完整目标。[Agents API](https://developers.openai.com/api/docs/guides/agents-api/overview)及其[环境生命周期](https://developers.openai.com/api/docs/guides/agents-api/environments/lifecycle)有具体的应用工具、执行环境与连接条件。当前任务的模型、CLI、SDK 和托管 API 不能互相代签；文件或会话保存不证明空闲后有触发器、接收者或自动执行机会。不为采用这些说明擅自部署 API 应用、购买能力或新增调度。
+涉及 OpenAI 的流程与环境，先按 [官方依据与能力核验](openai-capability-basis.md) 从完整官方文档体系定位适用能力，优先核对现成入口及其当前宿主、版本与授权。Agent 编排和 Agents API 是可选参考，不是流程设计的唯一模型或候选清单；SDK、app-server、exec/resume、ChatGPT 原生任务及其他相关产品按需要进入比较。原协调仍回收完整目标；文件或会话保存不证明空闲后有触发器、接收者或自动执行机会。官方存在、当前宿主支持和本次实际可用分别验证，不为采用说明擅自部署 API 应用、购买能力或新增调度。
 
 沿用已经选择的测试环境与资源归属；配置缓存过期时自动刷新本次涉及的实际事实，不重新询问已有归属或管理授权。配置存在、profile 名称和摘要刷新不能证明最终租户数据源、服务、浏览器站点或测试身份可用。已有认证沿允许的不透明入口消费；缺入口负责有界发现，实际缺口只限制依赖它的动作，不能扩大成整个资源系统故障。
 

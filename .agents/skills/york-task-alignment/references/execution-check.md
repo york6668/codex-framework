@@ -1,5 +1,7 @@
 # 执行与修复的即时检查
 
+OpenAI 设计与能力依据按 [官方依据与能力核验](../../york-engineering/references/openai-capability-basis.md) 从完整官方体系导航。`action.capabilities/context.capabilities` 是本次提供的能力标签关系，不是官方产品目录或本机可用证明；新产品不因未列示例而排除，别产品/宿主能力也不能用同名标签代签。模型先核适用正文、当前原生入口/安装版本、来源和时效，再构造临时投影；缺失或已失效证据不签可用。检查器不查询或授权新产品，不解析 Markdown 方法为运行配置，不因 `ready` 证明实际能力、连续执行或完整研究已完成。
+
 ## 可选项目业务工件适配
 
 正常 `check` 输入可附 `business_verification: {expected_ref, observed_ref}`，旧输入与退出语义不变，不要求所有任务填写。它复用 `context.evidence/native_sources`；预期为 `business_expectation`，关联当前用户 `goal`，实际为 `business_run`，关联该预期，二者资源精确匹配本次 envelope.resource、task/project 与固定测试版本。实际记录须是完整成功原生命令的观察原件及 SHA-256；预期先于本次观察。调用者仍核实原件真实性、原生产过程先保存观察再断言，后读历史文件的时间不冒充原动作时间。
