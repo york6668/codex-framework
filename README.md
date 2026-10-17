@@ -58,7 +58,7 @@ python3 "$HOME/work/codex-framework/scripts/codex_framework.py" install
 
 ## 固定版本运行与恢复
 
-`install` 部署六个原有 CLI 模块及新增的 `framework_runtime` 管理模块；`acceptance_capture` 是独立工具，不在运行闭包。每个完整提交在 Codex home 的 `framework-sync/runtime/versions/<commit>/` 保存模块、正文快照和 hash/模式/输入契约 manifest。`active.json` 指向一个已校验版本，`approved.json` 保存已校验版本的 manifest hash。正常 `$HOME/.local/bin/codex-framework` 是无仓库导入的稳定 loader，每次先固定物理目录、核对整个包，再导入；旧进程继续使用原目录。
+`install` 部署六个原有 CLI 模块及 `framework_runtime`、`task_runtime`、`task_worker`，共九个模块；从旧受管入口升级时，先按原活动指针、已批准包指纹及完整包校验，静态还原原入口模板并逐字匹配，随后由标准安装事务更新；未知或已改入口保持阻塞；`acceptance_capture` 是独立工具，不在运行闭包。每个完整提交在 Codex home 的 `framework-sync/runtime/versions/<commit>/` 保存模块、正文快照和 hash/模式/输入契约 manifest。`active.json` 指向一个已校验版本，`approved.json` 保存已校验版本的 manifest hash。正常 `$HOME/.local/bin/codex-framework` 是无仓库导入的稳定 loader，每次先固定物理目录、核对整个包，再导入；旧进程继续使用原目录。
 
 ```sh
 # 已核对且存在于本地 Git 的发布分支头；首次 expected-runtime 使用 none。
@@ -105,6 +105,28 @@ python3 /path/to/codex-framework/scripts/codex_framework.py install \
 `export` 不包含设备的 `config.toml`、历史记忆或新建的无关 Skill，也不会将未发布修改当成已发布的共同基线。本框架仓库已获用户授权，由 Codex 核对修改、完成必要验证后自主提交与推送，无需逐次交用户审核；其他设备再主动同步。同步命令没有后台任务或自动推送行为。
 
 记忆配置片段仅供参考，安装不改写 `config.toml`、不自动开启原生记忆；见 [.codex/memory-framework.md](.codex/memory-framework.md)。设备可选资源说明放在 Codex home 的 `workstation/local.md`，不随本仓分发。
+
+## 持久任务执行入口
+
+`codex-framework task` 读取 JSON 请求，在节点 Codex home 的 `task-runtime/` 保存已登记任务的需求、验收、当前执行、结果和下一动作。记录不进 Git，也不替代业务总表；模型负责从已授权原输入准备登记和修订。安装不自动接入现有桌面或云端任务；Goal、Hook、消息回收和实际采用分别验证。
+
+`register` 接收 `task_id` 和 `spec`。spec 包含原 `request_id`、需求正文、`acceptance_version`、准确 `workspace` 和 `steps`；每步声明 `id`、当前指令、`depends_on`、可证伪的 `checks`。检查支持精确文件 SHA256、精确结果文本、已获准且可重复的验证命令。验证先执行命令，再只读核文件；不能把真实变更、不可恢复动作或秘密处理藏在验证命令里。每步 `max_runs` 上限1–8；`review_required`、`load_required` 按实际验收使用。已有授权覆盖的步骤不另加审批条件。
+
+调用方以原入口输入字节、修订和作用域负责登记，控制器不从另一会话的最新消息猜需求。`amend` 带当前 `expected_revision` 显式替换需求及验收，保护原失败、独立请求和未决生产者。文案、版本、步骤改名或临时移除不能清除已知同对象限制。workspace 只是相对路径锚点；文件按规范绝对目标和限制形成时记录的既有 device/inode 比较，覆盖硬链接、改名及文件系统实际认定的大小写/Unicode 别名。原路径被替换也不撤销其路径限制；相同内容或通用指令文案不证明不同对象/分支相同。符号链接和越界相对路径继续拒绝。任意工具业务语义仍由准确原输入与登记方负责。
+
+限制在状态投影、预约派发、发送提示前、原生会话开始、结果回收、验证和验收重新核对。旧 `ready` 不是下次执行许可；调用间已完成的对象变化必须进入当前判断。提示前发现变化则停止发送任务提示；提示后才发现则停止该步骤并保留可能已发生的效果，不重发原动作、不假装撤销。当前限制、执行回执和未知效果分别保留，后续复核不覆盖先前未决事实。只有实际依赖受影响；其余获准步骤在剩余预算内继续。
+
+这是协调器约束，不是 OS 文件隔离。任务锁只保护状态 CAS，不能阻止外部进程在核对后修改文件，也不能拦截工作方的所有嵌套工具、终端或直发。默认路径适用于原权限足够、由执行方配合遵守约束的任务；不能因几次 `stat` 一致就声称对象不可变。对确需保证对象在任意并发写入下稳定、原子快照或受保护写入的步骤，模型应保留该要求，可登记 `stable_objects_required: true`。当前原生 CLI 适配没有已核实的此类 OS 隔离能力，这一步返回具体能力缺口，不启动工作方或验证命令；不接受 `isolated` 自报放行，独立步骤继续。原平台权限、逐次审批和明确拒绝始终有效。
+
+`run` 带当前版本，每次最多1–4个原生回合，默认3个。先持久化执行意图与对象观察，再沿现有账户/配置运行 `codex exec/resume --json`；进程和原生会话身份在原入口登记。每个自然返回后必经当前验收，模型 final、exit0、`turn.completed` 不能直接完成需求。验证器缺失、读取失败、超时、无进展及原生失败各留准确分支诊断，不自动重放结果不明的命令。文件核验在实际打开的 FD 上先 `fstat` 判对象，再流式读取，并复核该对象和目标路径；这只绑定控制器的读取，不隔离原生工作方的写入或其他进程。验收记录是有界观察，不是原子多文件快照或持续不变承诺；观察后外部对象变化须重新查证，不能盲目恢复旧文件。
+
+验证 I/O 在专用、短命的 POSIX 子作业中执行，父进程有独立期限；子作业关闭继承的任务锁和原生管道，避免一个挂起的读操作继续占住协调状态。元数据探测默认2秒；文件检查默认5秒、256 MiB，可在该 file check 显式给 `timeout`（1–60秒）和 `max_bytes`（最多1 TiB）。命令沿原 `timeout`，输出流式哈希，默认总输出8 MiB，可给 `max_output_bytes`（最多1 GiB）；不收集完整输出到内存。目标以非阻塞、no-follow 方式取得实际FD，再核普通文件类型与身份，FIFO不等待写端。父进程的期限覆盖打开、类型核实和读取，不依赖子作业先返回；一次错误停止本步后续验证并继续独立步骤。同次调用不反复探测已经超时的同一元数据目标，但成功快照不跨决策缓存。超时、超量或子管道未关闭记录局部失败和可能副作用，不自动重放命令。正常结束先自然回收；必要清理仅针对本作业登记的进程组，清理被拒不换信号入口，未回收或内核不响应保留未知。此处不保证终止任意内核状态，也不支持验证命令脱离作业组、提权或留下后台服务。
+
+`resume` 只需原 `task_id`，从持久事实恢复。记录中的控制或工作 PID 仍存在时不抢先验收；代际不能确认保留核对缺口。结果不明先读原生原会话/回合，或在无未确认原生生产者时只读核准确文件效果，不重复模型动作。验证命令开始而回执丢失仍不可重放。原生结果跨修订尚未确认时保持该原执行未决，不能用 `source_ref` 标签或文件已出现代替原生结果。只支持当前入口的进程恢复，不宣称 OS/桌面重启或空闲自动唤醒。
+
+`block`、`approval`、`delivery` 保存原渠道观察；发送 accepted 仅属传输，助手 ACK、委托包装或技术 user-shaped 续办消息不能成为人类决定。当前 CLI 没有可认证新的人类批准入口，`approved` 字段不能扩权。`review` 核原报告字节、当前 `task_input_sha256`、`candidate_tree`、`reviewer_thread` 和 `verdict`；原协调仍核真实独立来源，报告标签不认证身份。`loaded` 核实际 active、完整包 manifest 与 Git tree；`accept` 再核当前证据、原报告、加载身份及对象约束。只发送成功或相近版本不足。
+
+工作方默认沿用现有配置和账户，不新建 API、凭据、付费方式，不代工具批准。只有本任务据实际官方能力选定时才显式登记 `native_model`、`native_reasoning_effort`；不静默换模型或重试不支持名称。成功退出0；`run/resume` 未验收退出2并返回下一动作或具体等待；输入、冲突或必需验证失败退出1。`status` 返回当前约束投影及验收观察，不能把源码、安装或一次回合结束当作整体实际闭环。
 
 ## Codex 云端执行环境
 

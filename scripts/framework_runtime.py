@@ -22,8 +22,27 @@ FORMAT = 1
 INPUT_CONTRACT = 1
 MODULES = ("codex_framework.py", "execution_check.py", "framework_refresh.py",
            "source_evidence.py", "workstation_check.py", "workstation_entry.py",
-           "framework_runtime.py")
+           "framework_runtime.py", "task_runtime.py", "task_worker.py")
+LEGACY_MODULES = MODULES[:-2]
 SHA = re.compile(r"[0-9a-f]{40}\Z")
+
+
+def declared_modules(raw):
+    """Parse the approved source's closure without executing candidate code."""
+    try:
+        tree = ast.parse(raw)
+    except (SyntaxError, TypeError, ValueError) as exc:
+        raise cf.SyncError("候选模块声明无法解析") from exc
+    declarations = [node for node in tree.body if isinstance(node, ast.Assign)
+                    and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name)
+                    and node.targets[0].id == "MODULES"]
+    try:
+        value = ast.literal_eval(declarations[0].value) if len(declarations) == 1 else None
+    except (ValueError, TypeError):
+        value = None
+    if value not in (MODULES, LEGACY_MODULES):
+        raise cf.SyncError("候选模块闭包不兼容")
+    return value
 
 
 def encoded(value):
@@ -108,12 +127,13 @@ def validate(directory, expected_hash=None):
         raise cf.SyncError("运行包 manifest JSON 无效") from exc
     if not isinstance(m, dict):
         raise cf.SyncError("运行包 manifest 必须是对象")
-    required = {"scripts/" + n for n in MODULES} | {"snapshot.json"}
+    required = set(m.get("files", {})) if isinstance(m.get("files"), dict) else set()
+    closures = [{"scripts/" + n for n in names} | {"snapshot.json"} for names in (MODULES, LEGACY_MODULES)]
     if (type(m.get("version")) is not int or type(m.get("input_contract")) is not int
             or m.get("version") != FORMAT or m.get("input_contract") != INPUT_CONTRACT
             or m.get("source") != cf.REMOTE or m.get("branch") != cf.BRANCH
             or not matches_sha(m.get("revision")) or not isinstance(m.get("files"), dict)
-            or set(m["files"]) != required):
+            or required not in closures):
         raise cf.SyncError("运行包来源、完整模块闭包或输入契约不兼容")
     actual = set()
     for path in directory.rglob("*"):
@@ -133,6 +153,9 @@ def validate(directory, expected_hash=None):
         mode = "100755" if path.stat().st_mode & 0o111 else "100644"
         if value is None or digest(value) != item["sha256"] or mode != item["mode"]:
             raise cf.SyncError("运行包文件 hash/模式不符: " + name)
+    declaration = declared_modules(cf.read_file(cf.safe_path(directory, "scripts/framework_runtime.py")))
+    if required != {"scripts/" + n for n in declaration} | {"snapshot.json"}:
+        raise cf.SyncError("运行包模块与源码声明不符")
     import framework_refresh as refresh
     snapshot = load(cf.safe_path(directory, "snapshot.json"))
     refresh.validate_snapshot(snapshot)
@@ -206,7 +229,7 @@ def describe(f, state=None):
 # never removed by an update, so an already running P can finish after Q switches.
 LOADER = '''#!/usr/bin/env python3
 # codex-framework managed loader v1
-import base64, fcntl, hashlib, json, os, re, runpy, sys
+import ast, base64, fcntl, hashlib, json, os, re, runpy, sys
 from pathlib import Path
 ROOT = Path(%r)
 MODULES = %r
@@ -236,11 +259,12 @@ def pointer_value(value):
 
 def manifest_value(value, revision):
     m = object_value(value, "runtime manifest")
-    names = {"scripts/" + name for name in MODULES} | {"snapshot.json"}
+    names = set(m.get("files", {})) if isinstance(m.get("files"), dict) else set()
+    closures = [{"scripts/" + name for name in group} | {"snapshot.json"} for group in (MODULES, MODULES[:-2])]
     if (type(m.get("version")) is not int or m["version"] != 1
             or type(m.get("input_contract")) is not int or m["input_contract"] != 1
             or m.get("revision") != revision or not isinstance(m.get("files"), dict)
-            or set(m["files"]) != names):
+            or names not in closures):
         raise ValueError("runtime modules/contract mismatch")
     for name, entry in m["files"].items():
         expected_mode = "100755" if name == "scripts/codex_framework.py" else "100644"
@@ -304,6 +328,14 @@ def main():
             mode = "100755" if path.stat().st_mode & 0o111 else "100644"
             if hashlib.sha256(data).hexdigest() != entry["sha256"] or mode != entry["mode"]:
                 raise ValueError("runtime hash/mode mismatch: " + name)
+        try:
+            tree = ast.parse(read(directory / "scripts/framework_runtime.py"))
+            declarations = [n for n in tree.body if isinstance(n, ast.Assign) and len(n.targets)==1 and isinstance(n.targets[0], ast.Name) and n.targets[0].id=="MODULES"]
+            modules = ast.literal_eval(declarations[0].value) if len(declarations)==1 else None
+        except (SyntaxError, ValueError, TypeError) as exc:
+            raise ValueError("invalid runtime module declaration") from exc
+        if modules not in (MODULES, MODULES[:-2]) or {"scripts/" + n for n in modules} | {"snapshot.json"} != names:
+            raise ValueError("runtime manifest/source closure mismatch")
         sys.path.insert(0, str(directory / "scripts"))
         sys.dont_write_bytecode = True
         sys._codex_framework_runtime = {"directory": str(directory), "revision": revision, "source_repo": a["source_repo"]}
@@ -349,6 +381,33 @@ except (OSError, ValueError, KeyError) as exc:
 
 def loader_bytes(f):
     return (LOADER % (str(f.codex_home), MODULES)).encode()
+
+
+
+def prior_loader_bytes(f, prior):
+    """Recognize the exact prior managed template without executing old source."""
+    if prior is None:
+        return None
+    fingerprint = approved_packages(f).get(prior["revision"])
+    if fingerprint != prior["manifest_sha256"]:
+        raise cf.SyncError("旧运行入口没有匹配的已批准运行包")
+    directory = version_path(f, prior["revision"])
+    manifest, _ = validate(directory, fingerprint)
+    if manifest["revision"] != prior["revision"]:
+        raise cf.SyncError("旧运行入口的包与活动版本不符")
+    raw = cf.read_file(cf.safe_path(directory, "scripts/framework_runtime.py"))
+    modules = declared_modules(raw)
+    tree = ast.parse(raw)
+    declarations = [node for node in tree.body if isinstance(node, ast.Assign)
+                    and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name)
+                    and node.targets[0].id == "LOADER"]
+    try:
+        template = ast.literal_eval(declarations[0].value) if len(declarations) == 1 else None
+        if not isinstance(template, str):
+            raise ValueError("missing literal loader")
+        return (template % (str(f.codex_home), modules)).encode()
+    except (TypeError, ValueError, UnicodeError) as exc:
+        raise cf.SyncError("旧运行入口模板无法静态核对") from exc
 
 
 def launcher_path(f):
@@ -447,7 +506,8 @@ def register(f, revision, manifest):
 def prepare(f, revision):
     snapshot = approved_snapshot(f, revision)
     values = {"snapshot.json": (encoded(snapshot), "100644")}
-    for name in MODULES:
+    modules = declared_modules(cf.git(f.repo, "show", revision + ":scripts/framework_runtime.py"))
+    for name in modules:
         path = "scripts/" + name
         entry = cf.git(f.repo, "ls-tree", revision, "--", path)
         expected_mode = "100755" if name == "codex_framework.py" else "100644"
@@ -679,13 +739,16 @@ def install(f, revision=None, expected_runtime=None, rollback=False):
         if "link" in existing and Path(existing["link"]).absolute() != f.repo / "scripts/codex_framework.py":
             raise cf.SyncError("launcher 指向未知位置；保留原入口")
         if "data" in existing and existing["data"] is not None and existing != file_value(loader_bytes(f)):
-            raise cf.SyncError("launcher 为未知内容；未覆盖")
+            if existing != file_value(prior_loader_bytes(f, old)):
+                raise cf.SyncError("launcher 为未知内容；未覆盖")
         new_active = {"version": FORMAT, "revision": revision, "manifest_sha256": digest(encoded(manifest)),
                       "source_repo": str(f.repo), "previous_revision": (old or {}).get("revision")}
         changes = {}
         def change(key, value):
             path = target(f, key)
             before, after = capture(path), file_value(value)
+            if key == "launcher" and before != existing:
+                raise cf.SyncError("launcher 在入口核对后改变；未覆盖")
             if before != after:
                 changes[key] = {"before": before, "after": after}
         base = f.load_state()
