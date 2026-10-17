@@ -162,3 +162,54 @@ python3 -m unittest discover -s tests -v
 发送前由父端在原执行单元调用同一纯 JS 文件的 makeDispatch(senderThread, targetThread, requestId, payload, results)。requestId 是父端本次新建且不复用的请求标识；payload 是父端保存的精确逻辑指令字符串，不裁剪、规范化 Unicode 或转换换行。摘要为该字符串 UTF-8 字节的 SHA-256，排除合同字段、平台包装、子端 FCO 和发送后生成的标识。纯 JS SHA-256 已可在无 Node/crypto/TextEncoder 的 functions.exec 中运行。父端先保存返回的 expected/prompt，再将同一个 prompt 字符串传入原生发送调用；不从子 final 反推 expected。该 packet 是 canonical finite-dispatch-v1 JSON，包含 payload 与 expected；整个 prompt 的另一个摘要只作发送审计，不能与 payload 摘要混用。
 
 子端在原收到委托的操作中对同一逻辑 packet 调用 parse_dispatch(prompt)，再把 packet 的 payload/expected 送入原成功合并读回的 produce。解析器核对完整逻辑 packet、SHA 与原格式，不假定 provider 包装规则，也不以父端标识认证子 FCO 原件或授予权限。父端原生读取实际 final 后仍用发送前保留的 expected 进行全文比较；缺失的原生完成/正文/身份仍为 unknown。多个独立父端请求各自保存，不按最新覆盖。
+
+### 结果尚未知的普通交接
+
+普通独立审查在发送时只知道输入对象和待答问题，不应猜测未来结论、报告 hash 或 PASS 来套用已知结果模式。`scripts/review_handoff.js` 的 `createReviewHandoff(sha256Utf8, receiveFinal)` 复用上述固定接收器，增加 `makeReviewDispatch(sender, target, requestId, payload, subjects, questions, supersedes=null)`。每个输入对象为 `{object_key, ref, sha256}`；问题为 `{question_key, text, object_keys}`。`supersedes` 仅显式引用同一发送者、目标的另一个完整 request；多发送方及同发送方的独立请求各自保留，不依赖单个 active key 或最新消息。
+
+原发送调用直接通过 `sendReview(record, io)` 执行，其中 `record={dispatch, attempt:"prepared", native_receipt:null}`；`io.retain` 在原有交接证据中保存同一 record 并确认读回成功，`io.send(target,prompt)` 调用这次原生消息工具一次。未保留记录不会发送；原调用开始后抛错、无确认或记录再次出现均不自动重发，先回查原任务。此方法只记录所传请求，不创建全局待办、队列或调度，也不能证明未提供的历史请求不存在。调用示例：
+
+```js
+const api = createReviewHandoff(sha256Utf8, receiveFinal);
+const dispatch = api.makeReviewDispatch(sender, reviewer, newRequestId,
+  exactPayload, knownInputSubjects, questions); // 此处没有结果或未来报告
+const record = {dispatch, attempt:"prepared", native_receipt:null};
+const sent = await api.sendReview(record, {
+  retain: retainInOriginalHandoffEvidence, // 原证据持久化并读回，返回 true
+  send: (target, prompt) => tools.mcp__codex_app__send_message_to_thread({
+    threadId: target, prompt // 沿用该动作既有消息授权
+  })
+});
+```
+
+工作方在自己的原报告生成/读回处调用 `scripts/review_handoff.py` 的 `produce_review(prompt, report_ref, report_readback, request_pointer=..., result_pointer=..., evidence_readbacks=...)`。两个 JSON pointer 指向原报告中实际保存的 request 与 result，适配原报告字段；不写总表。result 保存原输入 subjects、逐对象/问题的 answers、limitations 和 next_scope；answer 为 `{object_key,question_key,status,answer,evidence:[{ref,sha256}]}`。status 可为 completed、failed、limited、blocked、not_run、unknown，不能用已完成的旧主题填缺项。实际答案和证据在工作后产生。证据读回是显式传入的 UTF-8 字节，不沿报告里的任意路径自动取文件；已完成/失败答案必须有证据。原报告可保留其领域 schema，纯文本/大文件/二进制的实质审阅仍由原工作方完成，结构化伴随报告引用其实际字节，不宣称本适配器理解任意文本含义。
+
+完整 final 是 canonical `review-return-v1`，含原 request、实际 report 引用/hash/pointers，以及完整 result；不得加额外正文。原收件动作调用 `readReview(dispatches, selectedRequest, {readNative,readReport})`，把原生 read_thread 回执和原报告/证据读回直接交给它；readReport 由原调用者按获准对象有界读取，适配器不授权任意子端路径。回执支持当前 codex_app schemaVersion1 的 thread/turn/items 外层及其两种已见输入：原生 userMessage 的 codexDelegation，或 cloud_threads.send_message 的 functionCallOutput 委托。按精确发送 prompt、发送者、目标和唯一原 turn 选择真实 final；可见压缩标记不能改变请求，额外 prose 不裁剪，缺失、截断及歧义不通过。
+
+```js
+const got = await api.readReview(retainedDispatches, dispatch.contract.request, {
+  readNative: target => tools.mcp__codex_app__read_thread({
+    threadId: target, turnLimit: 2, includeOutputs: true, maxOutputCharsPerItem: 20000
+  }),
+  readReport: readOriginalReportAndEvidence // {ref,text,truncated:false,evidence:[{ref,text,truncated:false}]}
+});
+// binding=bound 只证明当前输入、报告投影、证据字节和实际 final 对应；
+// coverage=complete 只证明所有问题有已执行的答案，包括真实失败答案。
+// 原协调方实质审查后，才用 decideReview 绑定本次 final/hash/report hash 的决定。
+```
+
+`receiveReview` 永不自动给实质 accepted。缺问题或 limited/blocked/not_run/unknown 保留 partial；`decideReview` 不能将 partial 标为完成。即使新头和报告内部一致，旧内容或虚假自报仍须原协调方实质拒收；关系检查不是自由文本语义判定、原件真实性或权限证明。拒收不回滚已成功工作，也不暂停独立获准步骤。
+
+### 执行单元重置和报告预检
+
+每个新 V8 执行单元重新绑定已审核源码中的函数；代码缓存与历史合同分别恢复。先用固定审核的 `sha256Utf8` 检查扩展源码的已知 hash，再求值固定源码；不能执行子端返回的代码。`functions.store` 只作缓存，不能作为派发或验收的唯一原件。没有发生发送的重置只为下一个真正新请求恢复代码；已发送后丢失合同则用 `recoverNativeDispatch(nativeRead, {sender_thread,target_thread,turn_id,prompt_utf8_sha256})`。四个 pin 来自原发送记录：它只从原目标的原 turn 中读取父来源的完整已发送 prompt，核对 SHA 后恢复原 review 或 finite 合同，不从子 final 推造；旧 finite 恢复还调用原 `receiveFinal` 校验合同。只有这一原请求被找回，不能据此宣称全部待办已恢复。需 `includeOutputs:true` 才能读到 cloud_threads 输入正文；原件缺失、超长截断、提供方不支持或 pin 缺失均保留 unknown，禁止重发已可能合并的操作。恢复代码或原合同不等于接受实际返回。`recoverDispatch` 也可从原发送者保存的完整 record 及独立已知 SHA 恢复，仍要求查原任务状态，绝不自动重发。
+
+已知结果合并在原写表前调用 `return_receipt.preflight(expected,payload=payload)`，核对所有报告当时可读、UTF-8 字节和 hash；原报告可以是 JSON 或纯文本。合并后 `produce` 仍核对原投影及最新报告字节。报告变化或返回失败只拒收该次返回，不重做已成功合并；旧失败记录不被新模式追认，补回执需新的明确请求。
+
+这些方法接入调用者实际执行的原 send/read/report 操作，不能全局注册原生回调或拦截模型 final。代表性调用链须逐条记录实际发送、报告读回、真实 final、绑定检查和父方实质决定；单测及一条调用通过不能签所有发送方、所有宿主、自然压缩恢复或后续模型采用。当前 Hook 的注册范围与执行状态另验，不因有工具源码就声明平台级覆盖。
+
+交接库不在当前标准 CLI 的七模块闭包中。标准 `install` 分发运行包与共享正文；原调用者从已核发布提交取得上述 Python/JS 库的确切字节，核对已验指纹后加载到原执行单元。验收分别报告 CLI/正文安装、发布库的实际加载和原生 IO 调用，不把版本指针切换写成库已全局注册。原生补证、人工收讫及受控 pending 的处置按 `york-task-alignment` 的原生补证与结果收讫方法；校验库本身不提供空闲唤醒、持久调度或自动回收。
+
+实际 `cloud_threads.read` 的 `content` 可仅含 `Action completed.`，正文位于 `structuredContent={threadId,latestTurn,items,nextCursor,...}`。适配器直接识别并保留此原结构，不改造成 `schemaVersion:1`。当前已见助手投影没有原始委托或原生 final 身份，因此识别后仍为 `unknown`，返回原游标供原调用者有界核对；不会自动翻页、读取报告或重发。`latestTurn` 的完成状态不能签历史请求 turn。尚缺的输入、分页/排序和 final 身份合同须从原提供方核实，不能由报告自报 request、助手 role 或人为包装补足。
+
+纯函数的64 KiB上限也不扩大宿主原生读回能力：当前 codex_app read_thread 的单项读取配置最多20000字符。完整 final、原输入或证据不可取得时保留 unknown 或格式未匹配，不截取可用片段来通过；支持其他提供方须沿其实际原件另验。

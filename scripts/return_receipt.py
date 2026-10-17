@@ -169,14 +169,40 @@ def produce(expected, committed_readback, bindings, *, payload):
         if _pointer(ledger, report_pointer) != {"path": row["report_ref"],
                                               "sha256": row["report_sha256"]}:
             raise ReceiptError("report: committed identity mismatch")
-        try:
-            raw = Path(row["report_ref"]).read_bytes()
-        except OSError as exc:
-            raise ReceiptError("report: unavailable") from exc
-        if hashlib.sha256(raw).hexdigest() != row["report_sha256"]:
-            raise ReceiptError("report: fingerprint mismatch")
-        _load(raw)  # Original report is JSON; do not alter its domain schema.
+        _report_bytes(row)
     return render(expected, hashlib.sha256(committed_readback).hexdigest())
+
+
+def _report_bytes(row):
+    try:
+        raw = Path(row["report_ref"]).read_bytes()
+    except OSError as exc:
+        raise ReceiptError("report: unavailable") from exc
+    if hashlib.sha256(raw).hexdigest() != row["report_sha256"]:
+        raise ReceiptError("report: fingerprint mismatch")
+    # Known-result mode pins the complete meaning separately. Original reports
+    # may be UTF-8 prose, not only JSON; their bytes/hash are not semantic proof.
+    try:
+        raw.decode("utf-8", errors="strict")
+    except UnicodeError as exc:
+        raise ReceiptError("report: UTF-8 text required") from exc
+    return raw
+
+
+def preflight(expected, *, payload):
+    """Use BEFORE the original caller commits its merge; no writes or sends.
+
+    This checks report availability/bytes/type now. produce() checks them again
+    against the actual committed projection, so a later change still fails. An
+    existing successful merge is never undone/repeated because its return failed.
+    """
+    validate_expected(expected)
+    _text(payload, "logical payload")
+    if hashlib.sha256(payload.encode()).hexdigest() != expected["request"]["payload_utf8_sha256"]:
+        raise ReceiptError("logical payload fingerprint mismatch")
+    for row in expected["results"]:
+        _report_bytes(row)
+    return {"state": "ready", "request": expected["request"], "reports_checked": len(expected["results"])}
 
 
 def parse_dispatch(prompt):
