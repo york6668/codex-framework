@@ -18,6 +18,10 @@ OpenAI 设计与能力依据按 [官方依据与能力核验](../../york-enginee
 
 工具失败后重排、进入等待、阶段收尾和交接均沿用该 `check` 命令，以 `phase: progress` 检查本轮剩余步骤。输入的 `progress.checkpoint` 为 `after_failure|wait|stage_end|handoff`，`claim` 为 `working|waiting|paused|completed|continuous_tracking`；`steps` 最多 32 项，每项有唯一 `id`、现有 `action` 结构及引用前面步骤 ID 的 `depends_on`。输出逐项为 `direct_refusal`、`dependency_blocked`、`ready`、`needs_evidence` 或 `blocked`。输出 `work_partition` 同时列出逐项条件满足的 `ready_step_ids`、有直接或依赖阻断的 `blocked_step_ids`、仍缺证据的 `unresolved_step_ids`；三组按输入顺序覆盖已提供步骤。逐项保留已有 `access_route` 建议；管理入口未知先按原归属有界发现，不从 GUI 缺席推导凭据不存在。聚合 `needs_evidence` 或 `blocked` 不能被解释为所有分支暂停，仍须核对具体步骤；`ready_step_ids` 也只表示该步骤输入关系满足，不覆盖全局目标、消息权限或省略的停止要求。这是当前剩余工作的有界投影，模型仍需从原任务核对是否遗漏步骤，不能把 `status: ready` 误读为全部步骤均可执行。
 
+`progress.steps[].depends_on` 仅在对应边有可核的必要关系时传播阻塞。`depends_on_basis` 可为单边 `{status, source_ref, reason}` 或按前序步骤 ID 索引的同形对象；每条边都须覆盖。省略依据、hypothesis/unknown、缺失/伪造原件均将该消费者放入 `needs_evidence`，不授予整体等待，也不放行该消费者的写入。其他无依赖步骤仍从原 `work_partition` 继续；核实错误依赖后撤掉该边，再检查实际动作，不凭缺证强行执行。
+
+`proven` 引用沿原 `context.evidence/native_sources`，证据 `kind: dependency`、同 project/task、`resource` 精确对应消费者，带原正文 SHA256。原件须为成功命令取得的契约/观察（`result: observed`），或直接用户给定的必要关系；助手标签和委托转述不能自证。结构正文为 `{producer:{step_id,action}, consumer:{step_id,action}, requires:{kind,resource,reason}}`，两端的完整 action 与本次输入一致，reason 与该边依据一致。`required_input` 的 resource 是生产者实际对象，原件说明消费者为何必须取得该输入；`shared_effect` 的 resource 是两端实际重叠的对象，不能仅用共同项目/目录把不同文件连成共享写入。真实原子事务、同对象在途或实际不兼容仍依据其必要输入/共享效果局部处理；原 action 的作用域、准确拒绝、UNKNOWN 及预算检查不被依赖关系清除。程序只绑定已给原件与关系，不能认证调用者快照或理解任意业务正文；原件是否真实且确为必要输入/效果仍由模型判断。已有普通对话不必为此重写成表单，只有选择该可选检查器时使用其有界合同。
+
 处理、排查、独立验证和集成的职责及真实依赖由[工作生命周期](../SKILL.md#职责与新问题)承担，检查器不从任务称谓推导权限，也不决定自然语言是否要求全项目停止。只读排查用真实 `task.scopes.access: read`；写入、invoke、修改旁任务仍按实际范围检查。用户停止或纠正先由执行者根据原件更新当前有效范围，不能凭可并行标签忽略整项目停止，也不能删掉仍有效的取消或拒绝。
 
 `context.tool_failures` 可列出多条仍有效的失败；原有单条 `tool_failure` 输入继续兼容，若两者同时存在会合并检查。每条平台拒绝按实际资源、原件提供的 effect_key、目的地与副作用匹配；write 改称 invoke 或更换通道、线程不会消除同一拒绝；资源路径的父子范围也会匹配。只把直接拒绝及其已证依赖标为暂停，其他获准动作单独检查。调用者须从原生记录保留所有仍有效的失败，检查器不能从省略的输入恢复历史；权限或事实确实改变时依原目标和平台规则复核，不能借输入删去拒绝来重试。
@@ -148,7 +152,7 @@ rebuild 需要当前契约可重建、当前数据无需保留、重建来源、
 
 明确纠正可用同一原件引用 `supersedes_ref` 指向被纠正前提。检查器要求已给同对象直接用户原件与可核旧先新后顺序，旧前提及其派生转述不能继续作为依据；输出保留 `lineage_refs/superseding_refs`。跨来源顺序无法核实则保留具体缺口，不能自行拼造时间或用户原话。模型仍负责撤销错误依赖和向活跃任务传播、核实采用；检查器不发消息、不自动改计划，也不能发现未提供的纠正或省略的祖先。
 
-`read` 中的前提仅表示查证方向，返回 `inquiry_only`，不要求先证明问题才可在原权限内取证；资源范围和真实拒绝仍适用。`progress` 沿原有每步 `work_partition` 输出：需要该事实的步骤缺证，独立步骤仍可做。检查器不判断任意 `depends_on` 的业务必要性，执行者须先按来源与消费者撤掉错误边，再核所给关系。测试 `tests/test_orchestration_basis.py` 验证有限程序边界；还需用原失败委托、纠正接收/采用和集成后实际任务动作独立验收，不能把该测试或 `ready` 说成真实编排保障。
+`read` 中的前提仅表示查证方向，返回 `inquiry_only`，不要求先证明问题才可在原权限内取证；资源范围和真实拒绝仍适用。`progress` 沿原有每步 `work_partition` 输出：需要该事实的步骤缺证，独立步骤仍可做。`progress` 的依赖沿上面的原件与消费者合同核对；执行者仍须解释原文的实际必要性、撤掉错误边，不能将程序关系检查当成业务判断。测试 `tests/test_orchestration_basis.py` 验证有限程序边界；还需用原失败委托、纠正接收/采用和集成后实际任务动作独立验收，不能把该测试或 `ready` 说成真实编排保障。
 
 
 ## 持久执行与即时检查的边界
@@ -158,11 +162,11 @@ rebuild 需要当前契约可重建、当前数据无需保留、重建来源、
 
 ## 项目关系与最终收口
 
-持久 `task` 可保留项目 goal/responsibility/obligations、assignment owner/role/delivery_owner/covers 和原生 request_identity。模型从项目与当前请求原件维护，不以自报身份扩大授权。原任务状态和 `accepted` 只覆盖该任务；`coordinate`/`work` 按明确 task_ids 查看义务遗漏、真实依赖及当前可做项。命令 `depends_on` 旧输入保持原控制顺序；显式 depends_on_basis 的 hypothesis/unknown 只作为查证线索，不成为硬依赖。跨任务 requires 的 proven 关系必须有准确任务、输入版本、来源与消费者原因；源码关系不能认证来源正文或授权本身。
+持久 `task` 可保留项目 goal/responsibility/obligations、assignment owner/role/delivery_owner/covers 和原生 request_identity。模型从项目与当前请求原件维护，不以自报身份扩大授权。原任务状态和 `accepted` 只覆盖该任务；`coordinate`/`work` 按明确 task_ids 查看义务遗漏、真实依赖及当前可做项。持久 `task` 的本地 `depends_on` 也逐边核已取得的消费者契约原件；`depends_on_basis` 的 source_ref/source_sha256 锁定 workspace 内原 JSON，准确对应两端当前工作与所需结果/共享效果，合同见核心 README。缺失、hypothesis/unknown、部分边缺证或假引用放入原 work_partition 的 unresolved，不自动硬等待或派发消费者；上游失效沿已证必要关系逐级传播，未证依据的后继仍保留缺证；external 被动文件核验不能从默认输出 write 标签推导 shared_effect。无依赖步骤继续，原准确拒绝/在途 UNKNOWN 保留。跨任务 requires 的 proven 关系必须有准确任务、输入版本、来源与消费者原因；源码关系不能认证来源正文或授权本身。
 
 已登记文件输出及显式逻辑资源使用有界占用元数据协调；索引不持有项目待办，不能按项目/数据库标签制造全局停工。历史拒绝沿原对象效果保存；普通资源共享、兼容读和离线工作分别判断。无原生真实调用的确定性回归只证明程序分流。
 
-finalization 关联当前 components→integration→实际合并/加载 artifact→独立 final_regression→coordination 原清单更新。统一 artifact 逐项绑定项目 Git ref/commit/tree 与实际加载文件；最终报告必须对应本轮 task/request/input、同一 artifact 和当前分项输入。缺合并、实际加载、总回归或原清单文件效果时，三个局部 PASS 不能令 overall_complete 为真。当前请求报告可用 verify-return 核对，旧报告不能仅换任务标题后回收。
+finalization 关联当前 components→integration→实际合并/加载 artifact→独立 final_regression→coordination 原清单更新。统一 artifact 逐项绑定项目 Git ref/commit/tree 与实际加载文件；最终报告必须对应本轮 task/request/input、同一 artifact、当前分项结果及原独验内容。汇总读回原组件独验与实际 Git blob/加载映射；受检树不同于合并树时，只能沿原独验明确的受检文件范围复用相同字节和 Git mode，不由集成者自行缩小范围。最终 `component_results` 还绑定结果、review 原件哈希和准确采用对象，不能用输入字段相同代替内容一致。缺合并、实际加载、总回归或原清单文件效果时，三个局部 PASS 不能令 overall_complete 为真。当前请求报告可用 verify-return 核对，旧报告不能仅换任务标题后回收。
 
 
 可选持久原目标接续使用核心 README 的“原目标结果与当前执行机会的接续”：

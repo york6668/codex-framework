@@ -484,13 +484,18 @@ class Store:
 
 
 def partition(value, observations=None):
-    ready, waiting, done = [], [], []
+    ready, waiting, done, unresolved = [], [], [], []
     observations = observations or {s["id"]: assessment(value, s["id"]) for s in value["spec"]["steps"]}
     for spec in value["spec"]["steps"]:
         key = spec["id"]
         step = value["steps"][key]
         if observations[key]["blocked"]:
-            waiting.append({"step": key, "condition": observations[key]["reason"], "restriction_refs": observations[key]["restriction_refs"]})
+            row={"step": key, "condition": observations[key]["reason"], "restriction_refs": observations[key]["restriction_refs"]}
+            conditions=observations[key]['related_conditions']
+            if (any(c['kind']=='local_dependency_evidence_required' for c in conditions)
+                    and not any(c['kind'] in ('retained_refusal','occupied_effect') for c in conditions)):
+                row['evidence_gaps']=observations[key]['related_conditions'];unresolved.append(row)
+            else:waiting.append(row)
         elif step.get("continuation") and not step["continuation"]["resolved"]:
             waiting.append({"step": key, "condition": "original_continuation_requires_readback", "origin": step["continuation"]["origin"]})
         elif step["state"] == "verified":
@@ -504,7 +509,7 @@ def partition(value, observations=None):
             waiting.append({"step": key, "condition": "explicit_approval_decision_required"})
         else:
             ready.append(key)
-    return {"ready": ready, "waiting": waiting, "verified": done}
+    return {"ready": ready, "waiting": waiting, "verified": done, "unresolved": unresolved}
 
 
 @io_call

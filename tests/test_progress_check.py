@@ -1,6 +1,8 @@
 """Scenario checks for scoped failures and task progress decisions."""
 
 import copy
+import hashlib
+import json
 import sys
 import unittest
 from datetime import datetime, timezone
@@ -10,6 +12,28 @@ sys.path[:0] = [str(Path(__file__).resolve().parents[1] / "scripts"),
                 str(Path(__file__).resolve().parents[1] / "tests")]
 import execution_check as check
 import test_execution_check as fixtures
+
+
+def bind_dependency(request, producer_id, consumer_id, relation="required_input"):
+    """An acquired, native-shaped synthetic consumer contract, not real proof."""
+    steps = {s["id"]: s for s in request["progress"]["steps"]}
+    producer, consumer = steps[producer_id], steps[consumer_id]
+    ref = "codex:dependency:" + producer_id + ":" + consumer_id
+    reason = "This consumer requires the producer's exact input or shared effect"
+    body = json.dumps({"producer": {"step_id": producer_id, "action": producer["action"]},
+        "consumer": {"step_id": consumer_id, "action": consumer["action"]},
+        "requires": {"kind": relation, "resource": producer["action"]["resource"], "reason": reason}})
+    record = {"ref": ref, "kind": "dependency", "source": "codex", "project_id": request["project"]["id"],
+        "task_ref": request["task"]["native_ref"], "native_item_id": ref,
+        "resource": copy.deepcopy(consumer["action"]["resource"]), "result": "observed",
+        "digest": hashlib.sha256(body.encode()).hexdigest()}
+    request["context"]["evidence"].append(record)
+    request["context"]["native_sources"][0]["turns"][0]["items"].append({
+        "id": ref, "type": "commandExecution", "status": "completed", "exitCode": 0,
+        "command": "read consumer contract", "output": {"text": body, "truncated": False}})
+    basis = {"status": "proven", "source_ref": ref, "reason": reason}
+    consumer["depends_on_basis"] = {**consumer.get("depends_on_basis", {}), producer_id: basis}
+    return record
 
 
 class ProgressChecks(unittest.TestCase):
@@ -117,12 +141,14 @@ class ProgressChecks(unittest.TestCase):
         restore = copy.deepcopy(request["action"])
         diagnose = self.read_step(request)
         verify = self.read_step(request)
-        return {**request, "phase": "progress", "progress": {
+        result = {**request, "phase": "progress", "progress": {
             "checkpoint": "after_failure", "claim": claim,
             "steps": [
                 {"id": "restore", "action": restore, "depends_on": []},
                 {"id": "verify", "action": verify, "depends_on": ["restore"]},
                 {"id": "diagnose", "action": diagnose, "depends_on": []}]}}
+        bind_dependency(result, "restore", "verify")
+        return result
 
     def test_multiple_failures_preserve_refusal_and_allow_independent_read(self):
         request = self.base()

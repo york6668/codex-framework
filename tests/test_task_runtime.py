@@ -333,7 +333,10 @@ class TaskRuntimeTests(fixtures.FixtureCase):
         steps = [{"id": name, "instruction": "Return " + name,
                   "depends_on": [] if index == 0 else ["abc"[index-1]],
                   "checks": [{"kind": "message", "equals": name}]} for index, name in enumerate("abc")]
-        store, value = self.create(self.spec(steps))
+        spec=self.spec(steps)
+        from test_persistent_dependencies import bind_local_contract
+        for producer,consumer in [('a','b'),('b','c')]:bind_local_contract(spec,'fixture',producer,consumer)
+        store, value = self.create(spec)
         with mock.patch("task_worker.execute", side_effect=[self.worker(n) for n in "abc"]) as worker:
             value = task.run(store, value["revision"])
         self.assertTrue(value["accepted"])

@@ -77,8 +77,10 @@ class TaskProcessTests(fixtures.FixtureCase):
         for index,name in enumerate('abc'):
             steps.append({'id':name,'instruction':'Create '+name+'.txt','depends_on':[] if not index else ['abc'[index-1]],
                           'checks':[{'kind':'file','path':name+'.txt','sha256':hashlib.sha256((name.upper()+'\n').encode()).hexdigest()}]})
-        result=self.call({'operation':'register','task_id':'process-fixture','spec':{'request_id':'fixture-request',
-            'requirement':'Create three requested phase files','acceptance_version':'v1','workspace':str(self.work),'steps':steps}})
+        spec={'request_id':'fixture-request','requirement':'Create three requested phase files','acceptance_version':'v1','workspace':str(self.work),'steps':steps}
+        from test_persistent_dependencies import bind_local_contract
+        for producer,consumer in [('a','b'),('b','c')]:bind_local_contract(spec,'process-fixture',producer,consumer)
+        result=self.call({'operation':'register','task_id':'process-fixture','spec':spec})
         self.assertEqual(result.returncode,0,result.stderr)
         return json.loads(result.stdout)
 

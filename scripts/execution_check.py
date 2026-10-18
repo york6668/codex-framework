@@ -119,6 +119,52 @@ def resource(value):
     return kind, name, path.rstrip("/")
 
 
+def dependency_statement(body, producer, consumer, reason):
+    """Bind a necessary input/shared effect to the actual supplied consumer.
+
+    This is a relation check over an acquired contract/observation, not an
+    oracle for its truth or a permission to execute either action.
+    """
+    def unique(pairs):
+        value = {}
+        for key, child in pairs:
+            if key in value:
+                raise ValueError("duplicate dependency field")
+            value[key] = child
+        return value
+
+    def reject_constant(value):
+        raise ValueError("non-JSON dependency constant")
+
+    def same(left, right):
+        return json.dumps(left, sort_keys=True) == json.dumps(right, sort_keys=True)
+
+    if not isinstance(body, str) or len(body) > 65536:
+        return False
+    try:
+        statement = json.loads(body, object_pairs_hook=unique, parse_constant=reject_constant)
+        if not isinstance(statement, dict) or set(statement) != {"producer", "consumer", "requires"}:
+            return False
+        for key, entry in (("producer", producer), ("consumer", consumer)):
+            if not same(statement[key], {"step_id": entry["id"], "action": entry["action"]}):
+                return False
+        requirement = statement["requires"]
+        if (not isinstance(requirement, dict) or set(requirement) != {"kind", "resource", "reason"}
+                or requirement.get("reason") != reason):
+            return False
+        needed = resource(requirement["resource"])
+        produced = resource(producer["action"]["resource"])
+        consumed = resource(consumer["action"]["resource"])
+        if requirement["kind"] == "required_input":
+            return needed == produced
+        if requirement["kind"] == "shared_effect":
+            return (needed in (produced, consumed) and overlaps(produced, consumed)
+                    and any(e["action"].get("kind") != "read" for e in (producer, consumer)))
+        return False
+    except (ValueError, RecursionError):
+        return False
+
+
 def covers(scope, target, write):
     scope = obj(scope, "scope")
     base = resource(scope)
@@ -1017,17 +1063,23 @@ def evaluate(payload):
             required=claim == "completed")
         decisions = []
         by_id = {}
+        entries_by_id = {}
         for entry in steps:
             entry = obj(entry, "progress step")
             step_id = identifier(entry.get("id"), "progress step.id")
             if step_id in by_id:
                 raise CheckError("progress step IDs must be unique")
             dependencies = items(entry.get("depends_on", []), "progress step.depends_on")
+            for dependency in dependencies:
+                identifier(dependency, "progress dependency")
             if len(set(dependencies)) != len(dependencies) or any(d not in by_id for d in dependencies):
                 raise CheckError("progress dependencies must name earlier steps once")
+            action = obj(entry.get("action"), "progress step.action")
             basis = entry.get("depends_on_basis")
-            effective_dependencies = dependencies
+            mappings = {}
+            effective_dependencies = []
             unproven_dependencies = []
+            dependency_gaps = []
             if basis is not None:
                 basis = obj(basis, "progress step.depends_on_basis")
                 if "status" in basis:
@@ -1048,10 +1100,38 @@ def evaluate(payload):
                         identifier(fact.get("source_ref"), "dependency source_ref")
                         if not isinstance(fact.get("reason"), str) or not fact["reason"].strip():
                             raise CheckError("proven dependency needs its consumer reason")
-                    else:
-                        unproven_dependencies.append(dependency)
-                effective_dependencies = [d for d in dependencies if d not in unproven_dependencies]
-            action = obj(entry.get("action"), "progress step.action")
+            for dependency in dependencies:
+                fact = mappings.get(dependency)
+                gap = None
+                if fact is None:
+                    gap = "dependency_basis_missing"
+                elif fact["status"] != "proven":
+                    gap = "dependency_basis_unproven"
+                else:
+                    record = evidence.get(fact["source_ref"])
+                    digest = record.get("digest") if record else None
+                    original = (isinstance(digest, str) and re.fullmatch(r"[0-9a-f]{64}", digest)
+                                and record.get("kind") == "dependency"
+                                and record.get("project_id") == project_id
+                                and record.get("task_ref") == task_ref
+                                and record.get("resource") is not None
+                                and resource(record["resource"]) == resource(entry["action"]["resource"])
+                                and verify_source(context, project, record))
+                    item = native_item(context, record) if original else None
+                    body = source_body(context, record) if item else None
+                    if not (item and (direct_user_message(item, body) or
+                            (item.get("type") == "commandExecution"
+                             and item.get("status") == "completed" and item.get("exitCode") == 0
+                             and record.get("result") == "observed"))):
+                        gap = "dependency_basis_source_unverified"
+                    elif not dependency_statement(body, entries_by_id[dependency], entry, fact["reason"]):
+                        gap = "dependency_basis_consumer_unverified"
+                if gap:
+                    unproven_dependencies.append(dependency)
+                    if gap not in dependency_gaps:
+                        dependency_gaps.append(gap)
+                else:
+                    effective_dependencies.append(dependency)
             single_payload = {**payload, "phase": "action", "action": action}
             # Review evidence belongs to the aggregate goal, not every
             # independent next action. Keep its gap without blocking reads.
@@ -1059,6 +1139,11 @@ def evaluate(payload):
             single = evaluate(single_payload)
             if "platform_denied_action" in single["blocked"]:
                 state = "direct_refusal"
+            elif dependency_gaps:
+                # Missing proof cannot justify either global waiting or a
+                # speculative write. Other independent steps keep their route.
+                state = "needs_evidence"
+                single["missing"] = [*single["missing"], *dependency_gaps]
             elif any(by_id[d]["state"] != "ready" for d in effective_dependencies):
                 state = "dependency_blocked"
             elif (action.get("capabilities") or action.get("cost", 0)) and not node_snapshot_fresh(context):
@@ -1072,7 +1157,7 @@ def evaluate(payload):
                 state = "blocked"
             decision = {"id": step_id, "state": state,
                         "blocked": single["blocked"], "missing": single["missing"]}
-            if basis is not None:
+            if dependencies or basis is not None:
                 decision["unproven_dependencies"] = unproven_dependencies
             if "access_route" in single:
                 decision["access_route"] = single["access_route"]
@@ -1082,6 +1167,7 @@ def evaluate(payload):
                 decision["decision_basis"] = single["decision_basis"]
             decisions.append(decision)
             by_id[step_id] = decision
+            entries_by_id[step_id] = entry
         if claim == "working" and any(s["state"] == "needs_evidence" for s in decisions):
             need("remaining_step_status_unresolved")
         if claim == "waiting":

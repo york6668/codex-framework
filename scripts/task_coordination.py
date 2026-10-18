@@ -53,20 +53,79 @@ def relative(value,label):
     need(isinstance(value,str) and value and not Path(value).is_absolute() and '..' not in Path(value).parts,'invalid '+label)
 
 def basis(value):
-    need(isinstance(value,dict) and set(value)<={'status','source_ref','reason'},'invalid dependency basis')
+    need(isinstance(value,dict) and set(value)<={'status','source_ref','reason','source_sha256'},'invalid dependency basis')
     need(value.get('status') in ('proven','hypothesis','unknown'),'invalid dependency basis status')
     if value['status']=='proven':need(text(value.get('source_ref')) and text(value.get('reason')),'proven dependency needs its source and consumer reason')
+    if 'source_sha256' in value:need(hashes(value['source_sha256']),'invalid dependency source fingerprint')
 
 def local_dependencies(step):
     edges=step.get('depends_on',[]);declared=step.get('depends_on_basis')
-    if declared is None:return edges
+    if declared is None:return []
     need(isinstance(declared,dict),'invalid depends_on_basis')
     if 'status' in declared:
         need(len(edges)<=1,'single dependency basis requires at most one edge');basis(declared)
         return edges if declared['status']=='proven' else []
     need(set(declared)<=set(edges),'dependency basis names unknown edge')
     for value in declared.values():basis(value)
-    return [edge for edge in edges if edge not in declared or declared[edge]['status']=='proven']
+    return [edge for edge in edges if edge in declared and declared[edge]['status']=='proven']
+
+def local_endpoint(value,step):
+    spec=value['spec']
+    return {'task_id':value['task_id'],'request_id':spec['request_id'],'acceptance_version':spec['acceptance_version'],
+            'workspace':spec['workspace'],'step':{k:step.get(k,[]) if k=='resources' else step[k]
+                for k in ('id','instruction','checks','resources')}}
+
+def local_dependency_gaps(value,step,trail=(),memo=None):
+    """Unproved edges require inquiry, never implicit waiting or dispatch."""
+    memo={} if memo is None else memo
+    key=step['id']
+    need(key not in trail and len(trail)<32,'invalid local dependency graph/depth')
+    if key in memo:return memo[key]
+    declared=step.get('depends_on_basis') or {};steps={s['id']:s for s in value['spec']['steps']};gaps=[]
+    for edge in step.get('depends_on',[]):
+        fact=declared if 'status' in declared else declared.get(edge)
+        base={'step_id':step['id'],'depends_on':edge,'source_ref':fact.get('source_ref') if fact else None}
+        if not fact or fact['status']!='proven' or not hashes(fact.get('source_sha256')):
+            gaps.append(dict(base,kind='local_dependency_evidence_required'));continue
+        try:
+            source=read_json(value['spec']['workspace'],fact['source_ref'],fact['source_sha256'],value=value,unique=True)
+            producer=steps[edge]
+            need(task().encoded(source.get('producer'))==task().encoded(local_endpoint(value,producer)) and task().encoded(source.get('consumer'))==task().encoded(local_endpoint(value,step)),
+                 'dependency source does not bind actual producer/consumer work')
+            requirement=source.get('requires')
+            need(isinstance(requirement,dict) and set(source)=={'producer','consumer','requires'}
+                 and set(requirement)=={'kind','reason'} and requirement.get('reason')==fact['reason'],
+                 'dependency source has no bound necessary result/effect')
+            if requirement.get('kind')=='shared_effect':
+                conflict=task().isolated_io('local_dependency_effect',lambda:any(
+                    incompatible(a,b,False) for a in effect_projection(value,resources(value,producer))
+                    for b in effect_projection(value,resources(value,step))),2)[0]
+                need(conflict,
+                     'compatible or different actual resources are not a shared effect')
+            else:need(requirement.get('kind')=='required_result','unsupported necessary dependency relation')
+        except (task().TaskError,OSError,ValueError) as exc:
+            gaps.append(dict(base,kind='local_dependency_evidence_required',detail=str(exc)));continue
+        upstream=local_dependency_gaps(value,producer,trail+(key,),memo)
+        if upstream:
+            # Keep a bounded pointer to the original producer conditions. Do
+            # not recursively duplicate a shared DAG in every output record.
+            unresolved=any(g['kind']=='local_dependency_evidence_required' for g in upstream)
+            gaps.append(dict(base,kind='local_dependency_evidence_required' if unresolved else 'upstream_local_result_unresolved',
+                             upstream_step_id=edge,upstream_kinds=sorted({g['kind'] for g in upstream})))
+            continue
+        parent=value['steps'][edge];execution=value.get('execution')
+        uncertain=(parent.get('unresolved_execution') or
+                   (parent.get('continuation') and not parent['continuation']['resolved']) or
+                   (execution and execution['step']==edge))
+        if parent['state']!='verified' or uncertain:
+            gaps.append(dict(base,kind='required_local_result_not_verified'))
+        else:
+            checked=parent.get('validation') or {}
+            if (not checked.get('passed') or checked.get('acceptance_sha256')!=value['acceptance_sha256']
+                    or task().assessment(value,edge,checked.get('scope_after'),related=False)['blocked']):
+                gaps.append(dict(base,kind='required_local_result_stale'))
+    memo[key]=gaps
+    return gaps
 
 def validate(spec):
     if 'result_scope' in spec:validate_result_scope(spec['result_scope'])
@@ -258,11 +317,19 @@ def sync_index(store,value):
     else:
         with index_lock(store.root):write()
 
+def effect_projection(value,effects):
+    """Project the proposed controller entrance, not a hypothetical producer.
+
+    External collection only reads acquired files, including when its output
+    checks would conservatively reserve writes for a native producer.
+    """
+    return [dict(e,mode='read',operation='read') for e in effects] if value['spec'].get('execution_mode')=='external' else effects
+
 def effect_conflicts(value,step,wanted=None):
     root=ROOT.get()
     if root is None:return []
     wanted=resources(value,step) if wanted is None else wanted
-    if value['spec'].get('execution_mode')=='external':wanted=[dict(e,mode='read',operation='read') for e in wanted]
+    wanted=effect_projection(value,wanted)
     if not wanted:return []
     def inspect():
         matches=[]
@@ -309,7 +376,7 @@ def dependency_gaps(value,trail=()):
     return gaps
 
 def related(value,step,dependencies=True):
-    return (dependency_gaps(value) if dependencies else [])+effect_conflicts(value,step)
+    return (local_dependency_gaps(value,step)+dependency_gaps(value) if dependencies else [])+effect_conflicts(value,step)
 
 def prompt(value):
     spec=value['spec'];project=spec.get('project')
@@ -325,7 +392,7 @@ def bound_report(value,report):
     need(all(type(report.get(k)) is type(v) and report[k]==v for k,v in expected.items()),'report does not answer current project/task/native request/input')
     return expected
 
-def read_json(workspace,path,fingerprint,value=None):
+def read_json(workspace,path,fingerprint,value=None,unique=False):
     relative(path,'evidence path');need(hashes(fingerprint),'invalid evidence fingerprint')
     def read():
         target=task().cf.safe_path(workspace,path)
@@ -344,7 +411,13 @@ def read_json(workspace,path,fingerprint,value=None):
                 identity=lambda s:(s.st_dev,s.st_ino,s.st_size,s.st_mtime_ns,s.st_ctime_ns)
                 need(identity(info)==identity(end)==identity(current),'evidence changed during passive read')
                 check_passive_object(value,str(target),end.st_dev,end.st_ino)
-            parsed=json.loads(raw);need(isinstance(parsed,dict),'evidence must be an object');return parsed
+            def pairs(entries):
+                result={}
+                for key,child in entries:
+                    need(key not in result,'duplicate dependency source field');result[key]=child
+                return result
+            parsed=json.loads(raw,object_pairs_hook=pairs if unique else None)
+            need(isinstance(parsed,dict),'evidence must be an object');return parsed
         finally:os.close(fd)
     return task().isolated_io('project_evidence',read,3)[0]
 
@@ -397,6 +470,59 @@ def project_view(values,errors):
 def declared_link(value,identity,fingerprint):
     return any(e['task_id']==identity and e['step_id'] is None and e['input_sha256']==fingerprint and e['basis']['status']=='proven' for e in value['spec'].get('requires',[]))
 
+def component_result_digest(value):
+    """Identify acquired current results, separately from their input contract."""
+    for step in value['spec']['steps']:
+        for check in step['checks']:
+            if check['kind']=='file':
+                need(task().checked_file(value,None,check)['passed'],'component result file changed')
+    return task().digest(task().encoded({'steps':{name:state.get('validation') for name,state in value['steps'].items()},
+                                        'result_state':value.get('result_state')}))
+
+def component_bindings(values,ids,integration,loaded):
+    """Read original reviews and Git objects; labels alone cannot bind adoption.
+
+    Reviewer provenance and whether its scope answers the user's full goal
+    remain the original coordinator's responsibility. No source is executed.
+    """
+    workspace=integration['spec']['workspace'];declared=integration['spec']['artifact']
+    manifest=read_json(workspace,declared['manifest'],declared['sha256'],value=integration)
+    versions={v['project_id']:v for v in loaded['versions']};bindings={}
+    for identity in ids:
+        value=values[identity];review=value.get('review');need(isinstance(review,dict),'component has no independent content review')
+        path=Path(review['path']);report=read_json(path.parent,path.name,review['sha256'],value=value);bound_report(value,report)
+        need(report.get('verdict')=='PASS' and report.get('candidate_tree')==review['candidate_tree']
+             and report.get('reviewer_thread')==review['reviewer_thread'],'component original review identity changed')
+        project=value['spec'].get('project',{}).get('id');need(project in versions,'component has no adopted project version')
+        version=versions[project];repo=task().cf.safe_path(workspace,version['repo'])
+        mapped={f['source']:f for f in manifest['files'] if f['project_id']==project}
+        scope=report.get('reviewed_files')
+        if scope is None:
+            need(review['candidate_tree']==version['tree'],'component reviewed tree differs from adopted tree without reviewed-file scope')
+            scope=[{'path':name,'sha256':entry['sha256']} for name,entry in sorted(mapped.items())]
+        need(isinstance(scope,list) and 0<len(scope)<=64,'invalid component reviewed-file scope')
+        seen=set();files=[]
+        for item in scope:
+            need(isinstance(item,dict) and set(item) in ({'path','sha256'},{'path','sha256','mode'})
+                 and hashes(item.get('sha256')),'invalid reviewed-file identity')
+            name=item['path'];relative(name,'reviewed file path');need(name not in seen,'duplicate reviewed file');seen.add(name)
+            need(name in mapped and mapped[name]['sha256']==item['sha256'],'reviewed file missing or changed in actual loaded mapping')
+            modes=[]
+            for tree in (review['candidate_tree'],version['tree']):
+                blob=task().checked_command(workspace,{'kind':'command','argv':['git','-C',str(repo),'cat-file','blob',tree+':'+name],
+                    'timeout':3,'max_output_bytes':task().FILE_BYTES})
+                need(blob['passed'] and blob['stdout_sha256']==item['sha256'],'reviewed Git bytes differ from adopted content')
+                mode=task().checked_command(workspace,{'kind':'command','argv':['git','--literal-pathspecs','-C',str(repo),'ls-tree','--format=%(objectmode)',tree,'--',name],
+                    'timeout':3,'max_output_bytes':4096})
+                matches=[m for m in ('100644','100755') if mode['passed'] and mode['stdout_sha256']==task().digest((m+'\n').encode())]
+                need(len(matches)==1,'reviewed Git object is not an ordinary source file');modes.append(matches[0])
+            need(modes[0]==modes[1] and ('mode' not in item or item['mode']==modes[0]),'reviewed Git mode differs from adopted content')
+            files.append({'path':name,'sha256':item['sha256'],'mode':modes[0],'loaded':mapped[name]['loaded']})
+        bindings[identity]={'task_input_sha256':value['acceptance_sha256'],'result_sha256':component_result_digest(value),
+            'review_sha256':review['sha256'],'candidate_tree':review['candidate_tree'],'project_id':project,
+            'adopted_commit':version['commit'],'adopted_tree':version['tree'],'reviewed_files':sorted(files,key=lambda f:f['path'])}
+    return bindings
+
 def finalization(values,project_results,declared):
     result={'complete':False,'gaps':[]}
     if declared is None:result['gaps'].append({'kind':'cross_line_finalization_not_provided'});return result
@@ -428,9 +554,12 @@ def finalization(values,project_results,declared):
         need(loaded is not None and loaded==tested,'final regression did not use the same actual merged/loaded release')
         required_projects={values[i]['spec'].get('project',{}).get('id') for i in ids}
         need(required_projects<={v['project_id'] for v in loaded['versions']},'common loaded release omits a component project')
+        components=component_bindings(values,ids,integration,loaded)
+        result['component_results']=components
         reportref=declared['regression_report'];need(isinstance(reportref,dict) and set(reportref)=={'path','sha256'},'invalid final regression report reference')
         report=read_json(regression['spec']['workspace'],reportref['path'],reportref['sha256']);bound_report(regression,report)
         need(report.get('verdict')=='PASS' and report.get('artifact_sha256')==loaded['sha256'] and report.get('component_inputs')=={i:values[i]['acceptance_sha256'] for i in ids},'final regression result does not cover current common inputs')
+        need(report.get('component_results')==components,'final regression does not bind current component results/reviews/adopted content')
         implementers={values[i]['spec'].get('assignment',{}).get('owner') for i in ids}|{integration['spec'].get('assignment',{}).get('owner')}
         need(text(report.get('reviewer_thread')) and report['reviewer_thread'] not in implementers,'final regression is not independent of implementation/integration')
         for item in [values[i] for i in ids]+[integration]:need(report['reviewer_thread'] not in {s.get('session_id') for s in item['steps'].values()},'worker self-test cannot sign cross-line final regression')

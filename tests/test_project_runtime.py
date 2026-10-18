@@ -119,14 +119,15 @@ class ProjectRuntimeTests(fixtures.FixtureCase):
         for identity in ['hypothesis','independent']:self.assertEqual(out['tasks'][identity]['work_partition']['ready'],['a'])
         self.assertEqual(resource.read()['steps']['a']['wait']['kind'],'explicit_denial')
 
-    def test_explicit_local_hypothesis_preserves_legacy_order_without_promoting_it(self):
+    def test_unproved_local_edge_requires_inquiry_before_execution(self):
         steps=[{'id':'a','instruction':'Original denied step','checks':[{'kind':'message','equals':'42'}]},
                {'id':'b','instruction':'Independent verification','depends_on':['a'],'depends_on_basis':{'status':'hypothesis','source_ref':'synthetic:unverified'},'checks':[{'kind':'message','equals':'42'}]}]
         store,_=self.create('local',steps=steps);value=self.change(store,'approval',step='a',decision='denied',source_ref='synthetic:refusal')
-        self.assertEqual(task.partition(value)['ready'],['b'])
+        self.assertEqual(task.partition(value)['ready'],[])
+        self.assertEqual([r['step'] for r in task.partition(value)['unresolved']],['b'])
         legacy=copy.deepcopy(value);del legacy['spec']['steps'][1]['depends_on_basis']
         self.assertEqual(task.partition(legacy)['ready'],[])
-        self.assertEqual(self.run_synthetic(store)['steps']['b']['state'],'verified')
+        self.assertEqual(self.run_synthetic(store)['steps']['b']['runs'],0)
 
     def test_two_process_shared_file_reservation_is_exclusive(self):
         checks=[{'kind':'file','path':'shared.txt','sha256':'1'*64}]
@@ -231,7 +232,7 @@ class ProjectRuntimeTests(fixtures.FixtureCase):
         other,value=self.create('denied-effect',execution_mode='external',steps=steps);self.change(other,'approval',step='a',decision='denied',source_ref='synthetic:hard-refusal')
         with self.assertRaisesRegex(task.TaskError,'cannot clear'):self.observe(other)
 
-    def prepare_final_chain(self):
+    def prepare_final_chain(self,merge_after_review=None,allow_unbound=False):
         components=[]
         for p in ['core','business','resources']:components.append(self.complete_external(p,project=p,review=True)[1])
         versions=[];files=[]
@@ -240,11 +241,22 @@ class ProjectRuntimeTests(fixtures.FixtureCase):
             (repo/'result.txt').write_text('merged '+p);fixtures.run_git(repo,'add','.');fixtures.run_git(repo,'commit','-m','isolated merged delivery')
             commit=fixtures.run_git(repo,'rev-parse','HEAD');tree=fixtures.run_git(repo,'rev-parse','HEAD^{tree}')
             versions.append({'project_id':p,'repo':repo.name,'ref':'refs/heads/release','commit':commit,'tree':tree})
+            component=task.Store(self.a.codex_home,p);current=component.read()
+            reviewed=self.put_report(p+'-review.json',self.report(current,reviewer_thread='independent-'+p,candidate_tree=tree))
+            self.change(component,'review',report_path=str(self.root/reviewed['path']),report_sha256=reviewed['sha256'])
+            if merge_after_review:
+                merge_after_review(p,repo,component)
+                versions[-1].update(commit=fixtures.run_git(repo,'rev-parse','HEAD'),tree=fixtures.run_git(repo,'rev-parse','HEAD^{tree}'))
             loaded=self.root/('loaded-'+p);loaded.write_bytes((repo/'result.txt').read_bytes());files.append({'project_id':p,'source':'result.txt','loaded':loaded.name,'sha256':task.digest(loaded.read_bytes())})
         ref=self.put_report('loaded-manifest.json',{'versions':versions,'files':files});artifact={'manifest':ref['path'],'sha256':ref['sha256'],'versions':versions}
         integration,iv=self.complete_external('integrate',role='integration',requires=[self.edge(v) for v in components],artifact=artifact)
         regression,rv=self.complete_external('regress',role='final_regression',requires=[self.edge(iv)],artifact=artifact)
-        report=self.report(rv,artifact_sha256=artifact['sha256'],component_inputs={v['task_id']:v['acceptance_sha256'] for v in components},reviewer_thread='independent-cross-line')
+        originals={v['task_id']:task.Store(self.a.codex_home,v['task_id']).read() for v in components}
+        try:bindings=coord.component_bindings(originals,list(originals),iv,coord.artifact(iv))
+        except task.TaskError:
+            if not allow_unbound:raise
+            bindings={}
+        report=self.report(rv,artifact_sha256=artifact['sha256'],component_inputs={v['task_id']:v['acceptance_sha256'] for v in components},component_results=bindings,reviewer_thread='independent-cross-line')
         rr=self.put_report('final-regression.json',report)
         tracking,tv=self.complete_external('tracking',role='coordination',requires=[self.edge(rv)])
         # The own fixture tracking output is the existing ledger stand-in; no real ledger is accessed.
@@ -270,7 +282,7 @@ class ProjectRuntimeTests(fixtures.FixtureCase):
                 report['versions'][:]=[v for v in report['versions'] if v['project_id']=='core']
                 report['files'][:]=[v for v in report['files'] if v['project_id']=='core']
             return original(name,report)
-        with mock.patch.object(self,'put_report',side_effect=narrow):ids,final,report=self.prepare_final_chain()
+        with mock.patch.object(self,'put_report',side_effect=narrow):ids,final,report=self.prepare_final_chain(allow_unbound=True)
         (self.root/'loaded-business').unlink();(self.root/'loaded-resources').unlink()
         result=self.coordinate(ids,finalization=final);self.assertFalse(result['overall_complete'])
         self.assertTrue(any('omits a component project' in g.get('detail','') for g in result['finalization']['gaps']))
@@ -305,7 +317,7 @@ class ProjectRuntimeTests(fixtures.FixtureCase):
         result,reply=invoke({'operation':'coordinate','task_ids':['cli']});self.assertEqual(result.returncode,0);self.assertFalse(reply['overall_complete'])
         result,reply=invoke({'operation':'work','task_ids':['cli'],'expected_revisions':{'cli':reply['tasks']['cli']['revision']}});self.assertEqual(result.returncode,2);self.assertEqual(reply['executed'],[])
 
-    def test_optional_check_basis_does_not_change_omitted_input_semantics(self):
+    def test_progress_dependency_requires_proof_without_changing_independent_actions(self):
         import execution_check as check
         import test_progress_check as inputs
         helper=inputs.ProgressChecks();request=helper.progress(helper.base())
@@ -313,10 +325,12 @@ class ProjectRuntimeTests(fixtures.FixtureCase):
         self.assertEqual({v['id']:v['state'] for v in before['steps']}['verify'],'dependency_blocked')
         request['progress']['steps'][1]['depends_on_basis']={'status':'hypothesis','source_ref':'synthetic:unproven'}
         result=check.evaluate(request);by={v['id']:v for v in result['steps']}
-        self.assertEqual(by['verify']['state'],'ready');self.assertEqual(by['restore']['state'],'direct_refusal')
+        self.assertEqual(by['verify']['state'],'needs_evidence');self.assertEqual(by['restore']['state'],'direct_refusal')
         self.assertEqual(by['verify']['unproven_dependencies'],['restore'])
         del request['progress']['steps'][1]['depends_on_basis']
-        self.assertEqual(check.evaluate(request),before)
+        omitted=check.evaluate(request)
+        self.assertEqual(omitted['steps'][1]['state'],'needs_evidence')
+        self.assertEqual(omitted['work_partition']['ready_step_ids'],before['work_partition']['ready_step_ids'])
 
     def test_new_input_shape_errors_are_structured_not_exceptions(self):
         for field,value in [('project',[]),('assignment',[]),('request_identity',[]),('requires',[{}]),('artifact',[]),('known_tasks',[[]])]:
