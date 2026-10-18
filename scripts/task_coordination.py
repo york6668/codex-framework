@@ -151,7 +151,7 @@ def validate(spec):
         need(all(c['kind']=='file' for step in spec['steps'] for c in step['checks']),'external effect collection only supports passive file checks; run authorized verification separately in its original task')
     identity=spec.get('request_identity')
     if identity is not None:
-        need(isinstance(identity,dict) and set(identity)=={'thread_id','turn_id','message_id'} and all(text(v) for v in identity.values()),'invalid current native request identity')
+        need(isinstance(identity,dict) and {'thread_id','turn_id','message_id'}<=set(identity)<= {'thread_id','turn_id','message_id','automation_id'} and all(text(v) for v in identity.values()),'invalid current native request identity')
     peers=spec.get('known_tasks',[])
     need(isinstance(peers,list) and len(peers)<=32 and all(identifier(v) for v in peers) and len(set(peers))==len(peers),'invalid known task references')
     requires=spec.get('requires',[])
@@ -575,7 +575,16 @@ def workset(codex_home,request):
     ids=request.get('task_ids');need(isinstance(ids,list) and 0<len(ids)<=32 and all(identifier(v) for v in ids) and len(set(ids))==len(ids),'workset needs named existing task IDs')
     operation=request['operation'];maximum=request.get('max_turns',3)
     need(type(maximum) is int and 1<=maximum<=4,'workset invocation allows1..4 turns')
-    root=Path(codex_home)/'task-runtime';errors={};values={};executed=[]
+    root=Path(codex_home)/'task-runtime';errors={};values={};executed=[];received=[];intake_errors=[];failed_intakes=set()
+    incoming=request.get('results',{})
+    need(isinstance(incoming,dict) and set(incoming)<=set(ids),'workset results must name selected original tasks')
+    need(not incoming or operation=='work','result intake needs an explicit bounded work invocation')
+    for item in incoming.values():
+        need(isinstance(item,dict) and {'result'}<=set(item)<= {'result','review'},'invalid original result intake')
+        for key in ('result','review'):
+            if key in item:
+                ref=item[key];need(isinstance(ref,dict) and set(ref)=={'path','sha256'} and hashes(ref.get('sha256')),'invalid intake reference')
+                relative(ref.get('path'),'original intake path')
     def refresh():
         values.clear();errors.clear()
         for identity in ids:
@@ -586,12 +595,25 @@ def workset(codex_home,request):
         if operation=='work':
             expected=request.get('expected_revisions');need(isinstance(expected,dict) and set(expected)==set(ids) and all(type(v) is int for v in expected.values()),'workset needs exact task revision expectations')
             need(all(value['revision']==expected[identity] for identity,value in values.items()),'workset input revision changed')
+            for identity,item in incoming.items():
+                if identity not in values:continue
+                store=task().Store(codex_home,identity)
+                try:
+                    for operation_name,key in [('collect-result','result'),('review-result','review')]:
+                        if key not in item:continue
+                        before=store.read();change={'operation':operation_name,'expected_revision':before['revision'],**item[key]}
+                        current=task().change(store,change)
+                        received.append({'task_id':identity,'operation':operation_name,'revision':current['revision'],
+                                         'state':'duplicate_reused' if before['revision']==current['revision'] else 'consumed'})
+                except (task().TaskError,OSError,ValueError) as exc:
+                    failed_intakes.add(identity);intake_errors.append({'task_id':identity,'detail':str(exc)})
+                refresh()
             cursor=0
             for _ in range(maximum):
                 selected=None
                 for offset in range(len(ids)):
                     index=(cursor+offset)%len(ids);identity=ids[index]
-                    if identity in values and not values[identity]['accepted'] and task().partition(values[identity])['ready'] and values[identity]['execution'] is None:
+                    if identity not in failed_intakes and identity in values and not values[identity]['accepted'] and task().partition(values[identity])['ready'] and values[identity]['execution'] is None:
                         if values[identity]['spec'].get('execution_mode')=='external' and identity not in request.get('observations',{}):continue
                         selected=identity;cursor=(index+1)%len(ids);break
                 if selected is None:break
@@ -620,7 +642,7 @@ def workset(codex_home,request):
         if remaining:
             closed['gaps'].append({'kind':'named_tasks_remaining','task_ids':remaining})
             closed['complete']=False
-        return {'scope':'named existing task/project workset; no permissions or original-record authenticity granted','tasks':projected,'errors':errors,'projects':projects,'executed':executed,'finalization':closed,'overall_complete':closed['complete'],'model_adoption':'not established by this projection or synthetic tests'}
+        return {'scope':'named existing task/project workset; no permissions or original-record authenticity granted','tasks':projected,'errors':errors,'projects':projects,'executed':executed,'received':received,'intake_errors':intake_errors,'continuation':continuation_projection(projected,closed),'finalization':closed,'overall_complete':closed['complete'],'model_adoption':'not established by this projection or synthetic tests'}
 
 # Optional original-result scope, held in the existing task record. These
 # relationships do not authenticate a native source or grade domain reasoning.
@@ -650,7 +672,7 @@ def initialize_result(value,prior=None):
         state['obligations'][row['id']]=row['acceptance']
     # Current-request acceptance always requires a current result/review. Old
     # finite results stay in history, not as an answer to the amended input.
-    state['pending']=list(state['obligations']);state['result']=None;state['review']=None
+    state['pending']=list(state['obligations']);state['result']=None;state['review']=None;state['receipts']=[]
     need(len(state['obligations'])<=64,'retained original obligation bound')
     value['result_state']=state
 
@@ -718,40 +740,180 @@ def continue_original(value,request):
     saved['source_authentication']='caller must verify permitted original native read; JSON labels are not authentication'
     return saved
 
+def result_receipts(state):
+    if 'receipts' in state:
+        return state['receipts']
+    # Read old records without inventing a native source. A later mutation
+    # persists the same original references; old input history is untouched.
+    if state.get('result') is None:
+        return []
+    return [{'result':state['result'], 'native_sha256':None,
+             'reviews':[state['review']] if state.get('review') else []}]
+
+
+def review_content(value,state,result,reference,report):
+    bound_report(value,report)
+    need(report.get('object_ref')==state['object_ref'],'result belongs to another original business object')
+    need(report.get('result_sha256')==reference['sha256'],'substantive review is not for current actual result')
+    reviewer=report.get('reviewer_thread')
+    need(text(reviewer) and reviewer not in (value['spec'].get('assignment',{}).get('owner'),
+         value['spec'].get('request_identity',{}).get('thread_id')),'independent substantive reviewer missing')
+    rows=report.get('assessments');need(isinstance(rows,list) and len(rows)<=64,'invalid substantive assessments')
+    seen=set()
+    for row in rows:
+        need(isinstance(row,dict) and set(row)=={'id','verdict','reason'} and
+             isinstance(row.get('id'),str) and row['id'] in state['obligations'] and row['id'] not in seen and
+             row['verdict'] in ('PASS','FAIL','NOT_RUN','UNKNOWN') and text(row['reason']),'invalid substantive assessment')
+        seen.add(row['id']);answer=next((a for a in result['answers'] if a['id']==row['id']),None)
+        if row['verdict']=='PASS':
+            need(answer is not None and answer['status']=='answered' and answer['method_fit']=='applicable',
+                 'partial/unknown/inapplicable result cannot satisfy original obligation')
+    return {row['id']:row['verdict'] for row in rows}
+
+
+def native_identity(report):
+    native=report.get('native_result')
+    need(isinstance(native,dict) and set(native)=={'thread_id','turn_id','final_ref','final_sha256'} and
+         all(text(native.get(k)) for k in ('thread_id','turn_id','final_ref')) and hashes(native.get('final_sha256')),
+         'actual current native result identity missing')
+    # Thread/turn identify the returned execution. Its source reference and
+    # content fingerprint cannot manufacture another native execution.
+    return {key:native[key] for key in ('thread_id','turn_id')}
+
+
+def retained_native_identity(value,receipt):
+    if receipt.get('native_identity') is not None:
+        return receipt['native_identity']
+    # Old records did not retain the stable identity. Derive it only from
+    # the original bounded report; an unavailable old read stays unverified.
+    try:
+        ref=receipt['result']
+        report=read_json(value['spec']['workspace'],ref['path'],ref['sha256'],value=value)
+        bound_report(value,report)
+        return native_identity(report)
+    except (task().TaskError,OSError,ValueError):
+        return None
+
+
+def pending_result_actions(value,pending):
+    state=result_state(value);ready=[];followup=[];errors=[]
+    for receipt in result_receipts(state):
+        ref=receipt['result']
+        if receipt['reviews'] and not pending:continue
+        try:
+            report=read_json(value['spec']['workspace'],ref['path'],ref['sha256'],value=value)
+            bound_report(value,report);_result_content(value,state,report)
+            if not receipt['reviews']:
+                ready.append(copy.deepcopy(ref))
+            else:
+                unresolved=[row['id'] for row in report['answers'] if row['id'] in pending]
+                if unresolved:followup.append({'kind':'continue_original_result','result':copy.deepcopy(ref),'obligations':unresolved})
+        except (task().TaskError,OSError,ValueError) as exc:
+            errors.append({'result_sha256':ref['sha256'],'detail':str(exc)})
+    return ready,followup,errors
+
+
+def receipt_coverage(value):
+    state=result_state(value);assessed={};errors=[];identities={}
+    for receipt in result_receipts(state):
+        if not receipt['reviews']:
+            continue
+        try:
+            actual=receipt['result'];evidence_reference(value,actual)
+            result=read_json(value['spec']['workspace'],actual['path'],actual['sha256'],value=value)
+            bound_report(value,result);_result_content(value,state,result)
+            identity=native_identity(result);key=tuple(identity.values())
+            need(receipt.get('native_identity') in (None,identity),'retained native identity differs from original report')
+            need(key not in identities or identities[key]==actual['sha256'],
+                 'same original native return has conflicting result bytes')
+            identities[key]=actual['sha256']
+            current={}
+            for ref in receipt['reviews']:
+                evidence_reference(value,ref)
+                report=read_json(value['spec']['workspace'],ref['path'],ref['sha256'],value=value)
+                current.update(review_content(value,state,result,actual,report))
+            for key,verdict in current.items():assessed.setdefault(key,set()).add(verdict)
+        except (task().TaskError,OSError,ValueError) as exc:
+            # One held/stale original cannot stop intake of an independent
+            # return. It contributes no current coverage until proved again.
+            errors.append({'result_sha256':receipt['result']['sha256'],'detail':str(exc)})
+    return [key for key in state['obligations'] if 'PASS' not in assessed.get(key,set()) or assessed[key]&{'FAIL','UNKNOWN'}],errors
+
+
 def collect_result(value,reference,review=False):
     state=result_state(value);need(state is not None,'original result scope missing')
     evidence_reference(value,reference)
     report=read_json(value['spec']['workspace'],reference['path'],reference['sha256'],value=value);bound_report(value,report)
     need(report.get('object_ref')==state['object_ref'],'result belongs to another original business object')
+    receipts=copy.deepcopy(result_receipts(state))
+    changed='receipts' not in state
     if review:
-        need(state.get('result') is not None,'current actual result missing')
-        actual=state['result'];need(report.get('result_sha256')==actual['sha256'],'substantive review is not for current actual result')
-        evidence_reference(value,actual)
+        receipt=next((r for r in receipts if r['result']['sha256']==report.get('result_sha256')),None)
+        need(receipt is not None,'current actual result missing')
+        actual=receipt['result'];evidence_reference(value,actual)
         result=read_json(value['spec']['workspace'],actual['path'],actual['sha256'],value=value)
-        _result_content(value,state,result)
-        reviewer=report.get('reviewer_thread');need(text(reviewer) and reviewer not in (value['spec'].get('assignment',{}).get('owner'),value['spec'].get('request_identity',{}).get('thread_id')),'independent substantive reviewer missing')
-        rows=report.get('assessments');need(isinstance(rows,list) and len(rows)<=64,'invalid substantive assessments')
-        seen=set();passed=[]
-        for row in rows:
-            need(isinstance(row,dict) and set(row)=={'id','verdict','reason'} and isinstance(row.get('id'),str) and row['id'] in state['obligations'] and row['id'] not in seen and row['verdict'] in ('PASS','FAIL','NOT_RUN','UNKNOWN') and text(row['reason']),'invalid substantive assessment')
-            seen.add(row['id']);answer=next((a for a in result['answers'] if a['id']==row['id']),None)
-            if row['verdict']=='PASS':
-                need(answer is not None and answer['status']=='answered' and answer['method_fit']=='applicable','partial/unknown/inapplicable result cannot satisfy original obligation')
-                passed.append(row['id'])
-        state['pending']=[i for i in state['obligations'] if i not in passed];state['review']=copy.deepcopy(reference)
-        # Only an actually consumed original COMPLETE result releases its hold.
+        bound_report(value,result);_result_content(value,state,result)
+        review_content(value,state,result,actual,report)
+        if not any(r['sha256']==reference['sha256'] for r in receipt['reviews']):
+            receipt['reviews'].append(copy.deepcopy(reference));changed=True
+        if changed:
+            state['review']=copy.deepcopy(reference)
         for step in value['steps'].values():
             cp=step.get('continuation')
-            if cp and cp['terminal']=='completed' and cp['origin'] in result['origins']:cp['resolved']=True
+            if cp and cp['terminal']=='completed' and cp['origin'] in result['origins'] and not cp['resolved']:
+                cp['resolved']=True;changed=True
     else:
         _result_content(value,state,report)
-        state['result']=copy.deepcopy(reference);state['review']=None;state['pending']=list(state['obligations'])
+        native_sha=task().digest(task().encoded(report['native_result']));identity=native_identity(report)
+        receipt=next((r for r in receipts if r['result']['sha256']==reference['sha256']),None)
+        need(not any(r['result']['sha256']!=reference['sha256'] and
+                     retained_native_identity(value,r)==identity for r in receipts),
+             'same original native return has conflicting result bytes')
+        if receipt is None:
+            receipts.append({'result':copy.deepcopy(reference),'native_sha256':native_sha,'native_identity':identity,'reviews':[]});changed=True
+            state['result']=copy.deepcopy(reference);state['review']=None
+        elif receipt['native_sha256'] is None:
+            receipt['native_sha256']=native_sha;receipt['native_identity']=identity;changed=True
+    need(len(receipts)<=64 and sum(len(r['reviews']) for r in receipts)<=64,'current result receipt bound')
+    if not changed:
+        return False
+    state['receipts']=receipts
+    state['pending']=receipt_coverage(value)[0]
     value['accepted']=False
+    return True
+
+
+def continuation_projection(projected,closed):
+    actions=[];waiting=[]
+    for identity,current in projected.items():
+        owner=current['spec'].get('assignment',{}).get('owner')
+        for key in current['work_partition']['ready']:
+            actions.append({'task_id':identity,'step':key,'kind':'execute_or_collect_original_step',
+                            'owner':owner,'expected_revision':current['revision']})
+        for item in current['work_partition']['unresolved']:
+            actions.append({'task_id':identity,'kind':'verify_original_dependency_evidence','step':item['step'],'owner':owner})
+        dimensions=current.get('result_dimensions')
+        if dimensions:
+            if dimensions['reviewable_results']:
+                actions.append({'task_id':identity,'kind':'review_original_results','owner':owner,
+                                'expected_revision':current['revision'],'results':dimensions['reviewable_results']})
+            for action in dimensions['continuable_results']:
+                actions.append({'task_id':identity,'owner':owner,'expected_revision':current['revision'],**action})
+            if dimensions['pending_obligations'] and not current['work_partition']['waiting'] and not current['work_partition']['ready']:
+                actions.append({'task_id':identity,'kind':'continue_original_obligations','owner':owner,
+                                'obligations':dimensions['pending_obligations']})
+        waiting.extend({'task_id':identity,**item} for item in current['work_partition']['waiting'])
+    if not closed['complete'] and not actions and not waiting:
+        actions.append({'kind':'resolve_original_finalization','gaps':closed['gaps']})
+    return {'must_continue':bool(actions),'may_wait':bool(waiting) and not actions,
+            'next_actions':actions,'scoped_waits':waiting,'host_execution_required':True,'background_active':False,
+            'scope':'bounded existing-task decision; caller needs an actual authorised original host opportunity, not a new scheduler or delivery claim'}
+
 
 def _result_content(value,state,report):
     need(report.get('object_ref')==state['object_ref'],'original object mismatch')
     evidence_reference(value,report.get('answer'))
-    native=report.get('native_result');need(isinstance(native,dict) and set(native)=={'thread_id','turn_id','final_ref','final_sha256'} and all(text(native.get(k)) for k in ('thread_id','turn_id','final_ref')) and hashes(native.get('final_sha256')),'actual current native result identity missing')
+    native_identity(report)
     rows=report.get('answers');need(isinstance(rows,list) and len(rows)<=64,'invalid current result answers')
     seen=set();checked=set()
     for row in rows:
@@ -774,11 +936,18 @@ def _result_content(value,state,report):
 def result_projection(value):
     state=result_state(value)
     if state is None:return None
-    return {'object_ref':state['object_ref'],'original_goal':state['original_goal'],'pending_obligations':state['pending'],
+    pending,errors=receipt_coverage(value)
+    reviewable,followup,unavailable=pending_result_actions(value,pending);errors+=unavailable
+    unreviewed=[r['result'] for r in result_receipts(state) if not r['reviews']]
+    original_unknown=any(s.get('continuation') and not s['continuation']['resolved'] for s in value['steps'].values())
+    return {'object_ref':state['object_ref'],'original_goal':state['original_goal'],'pending_obligations':pending,
         'program_checks_passed':all(s['state']=='verified' for s in value['steps'].values()),
         'model_turn_terminal':[{'origin':s['continuation']['origin'],'status':s['continuation']['terminal']} for s in value['steps'].values() if s.get('continuation')],
         'current_result':state.get('result'),'substantive_review':state.get('review'),
-        'business_outcome':'pending' if state['pending'] or any(s.get('continuation') and not s['continuation']['resolved'] for s in value['steps'].values()) else 'reviewed_declared_scope',
+        'result_receipts':copy.deepcopy(result_receipts(state)),'unreviewed_results':unreviewed,
+        'reviewable_results':reviewable,'continuable_results':followup,
+        'receipt_errors':errors,
+        'business_outcome':'pending' if pending or original_unknown or unreviewed or errors else 'reviewed_declared_scope',
         'native_authenticity':'not established by file labels; original caller must verify actual native records',
         'wake_source':'not provided by this task runtime; each continuation requires an actual host execution opportunity',
         'original_operations':[s['continuation'] for s in value['steps'].values() if s.get('continuation')]}
@@ -787,10 +956,10 @@ def result_projection(value):
 def validate_current_result(value):
     state=result_state(value)
     if state is None:return
-    need(not state['pending'] and state.get('result') and state.get('review'),'original user result is still pending')
-    probe=copy.deepcopy(value)
-    collect_result(probe,state['review'],review=True)
-    need(not probe['result_state']['pending'],'current substantive review does not cover original obligations')
+    pending,errors=receipt_coverage(value)
+    need(not pending and state.get('result') and result_receipts(state) and
+         all(r['reviews'] for r in result_receipts(state)),'original user result is still pending')
+    need(not errors,'current original result evidence is stale or unavailable')
 
 
 def current_accepted(value):
@@ -804,7 +973,7 @@ def validate_result_state(value):
     state=result_state(value)
     need(('result_scope' in value['spec'])==(state is not None),'original result state/scope mismatch')
     if state is None:return
-    need(isinstance(state,dict) and set(state)=={'object_ref','original_goal','obligations','pending','result','review'},'invalid original result state')
+    need(isinstance(state,dict) and {'object_ref','original_goal','obligations','pending','result','review'}<=set(state)<= {'object_ref','original_goal','obligations','pending','result','review','receipts'},'invalid original result state')
     need(state['object_ref']==value['spec']['result_scope']['object_ref'] and text(state['original_goal']),'original goal/object changed')
     obligations=state['obligations'];pending=state['pending']
     need(isinstance(obligations,dict) and 0<len(obligations)<=64 and all(identifier(k) and text(v) for k,v in obligations.items()),'invalid retained original obligations')
@@ -815,6 +984,24 @@ def validate_result_state(value):
             need(isinstance(ref,dict) and set(ref)=={'path','sha256'} and hashes(ref.get('sha256')),'invalid retained result reference')
             relative(ref['path'],'retained result path')
 
+
+    receipts=state.get('receipts',[])
+    need(isinstance(receipts,list) and len(receipts)<=64,'invalid current result receipts')
+    seen=set();reviews=0
+    for receipt in receipts:
+        need(isinstance(receipt,dict) and {'result','native_sha256','reviews'}<=set(receipt)<= {'result','native_sha256','reviews','native_identity'} and
+             (receipt['native_sha256'] is None or hashes(receipt['native_sha256'])),'invalid retained result receipt')
+        identity=receipt.get('native_identity')
+        need(identity is None or (isinstance(identity,dict) and set(identity)=={'thread_id','turn_id'} and
+             all(text(identity[k]) for k in identity)),'invalid retained native identity')
+        need(isinstance(receipt['result'],dict) and set(receipt['result'])=={'path','sha256'} and hashes(receipt['result'].get('sha256')),'invalid result receipt reference')
+        relative(receipt['result'].get('path'),'retained result path')
+        need(receipt['result']['sha256'] not in seen,'duplicate current result receipt');seen.add(receipt['result']['sha256'])
+        need(isinstance(receipt['reviews'],list),'invalid retained review references');reviews+=len(receipt['reviews'])
+        for ref in receipt['reviews']:
+            need(isinstance(ref,dict) and set(ref)=={'path','sha256'} and hashes(ref.get('sha256')),'invalid retained review reference')
+            relative(ref.get('path'),'retained review path')
+    need(reviews<=64,'current substantive review bound')
 
 def check_passive_object(value,path,device,inode,step_id=None):
     """Check the actual opened read object, including peer READ refusals.

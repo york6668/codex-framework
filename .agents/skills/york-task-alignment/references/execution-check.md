@@ -32,7 +32,7 @@ OpenAI 设计与能力依据按 [官方依据与能力核验](../../york-enginee
 
 `progress` 的交接、等待及阶段收尾也核对本轮选定的 `goal_ref`（如已给 `resume.goal_ref`，可沿用），不能只在 `resume` 审查较新用户目标。`claim: completed` 须明确目标、版本、相同目标/资源及版本的验收原件，并提供 `continuation.review_ref`；该本轮 `goal_review` 正文除 `goal_ref/step_ids` 外还须绑定 `version/resource`。缺少回看不能用空 steps 表示完成，已给同目标较新回看时不能选旧空回看跳过；当前有效用户目标或项目验收契约要求独立验收时，再提供该资源的独立验证历史。只给开发自测、旧目标验收或空步骤不能表示完成。`publish` 同样需要 `release.goal_ref` 和已通过的开发测试；`release_test.related_ref` 关联该原目标，`resource` 精确匹配发布对象，不能复用另一目标/资源的成功；独立验收适用时，另需与发布版本一致的 `release.independent_verification`。这两个入口复用下面的独立验证关系检查；局部失败仍只影响有依赖的步骤。
 
-`claim: completed` 仍需目标验收来源，且不能留下剩余步骤；本地事故还须使用 `close_issue` 核对实际节点采用和效果，合成 CI 不能替代。`continuous_tracking` 始终返回未验证：静态检查与 SessionStart Hook 不提供空闲时模型执行或未来唤醒保证。若没有实际执行机会，只能报告当前无法持续跟踪。此入口不自动拦截计划工具、等待或交接，使用点依任务规范由模型执行，真实行为仍需正常任务入口复测。
+`claim: completed` 仍需目标验收来源，且不能留下剩余步骤；本地事故还须使用 `close_issue` 核对实际节点采用和效果，合成 CI 不能替代。`continuous_tracking` 的静态投影仍返回未验证：它不能承诺未来执行，也不判定 App 调度不可用、不暂停已开启调度或拦截实际回合中的获准步骤。SessionStart Hook 不提供空闲唤醒；用户控制的 App 原生触发及其运行记录按实际范围单独验收，缺少执行机会时只说明该范围未知。此入口不自动拦截计划工具、等待或交接，使用点依任务规范由模型执行，真实行为仍需正常任务入口复测。
 
 先从 Codex 原生 `read_thread(includeOutputs=true)` 定位原线程、用户目标与相关工具调用；从节点实际入口读取能力、预算、数据状态及采用版本。项目规范、Git 提交和节点事实仍在原处。把适用规范引用、项目与任务范围、原线程、拟执行动作及相关来源放入临时 JSON，经标准输入调用：
 

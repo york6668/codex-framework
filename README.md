@@ -108,6 +108,8 @@ python3 /path/to/codex-framework/scripts/codex_framework.py install \
 
 ## 持久任务执行入口
 
+核心持续工作由 Codex App 原生任务、用户控制的调度和原有结果记录承载，模型负责实际回合中的目标推进与验证，见[任务对齐](.agents/skills/york-task-alignment/SKILL.md)。下述 `task` 是按需使用的有限关系/验收适配，不是 App 的顶层任务库或调度层，不是每条聊天的必经入口；不以另起 Agent、Temporal、API Key 或独立计费作为前提。
+
 `codex-framework task` 读取 JSON 请求，在节点 Codex home 的 `task-runtime/` 保存已登记任务的需求、验收、当前执行、结果和下一动作。记录不进 Git，也不替代业务总表；模型负责从已授权原输入准备登记和修订。安装不自动接入现有桌面或云端任务；Goal、Hook、消息回收和实际采用分别验证。
 
 `register` 接收 `task_id` 和 `spec`。spec 包含原 `request_id`、需求正文、`acceptance_version`、准确 `workspace` 和 `steps`；每步声明 `id`、当前指令、`depends_on`、可证伪的 `checks`。检查支持精确文件 SHA256、精确结果文本、已获准且可重复的验证命令。验证先执行命令，再只读核文件；不能把真实变更、不可恢复动作或秘密处理藏在验证命令里。每步 `max_runs` 上限1–8；`review_required`、`load_required` 按实际验收使用。已有授权覆盖的步骤不另加审批条件。
@@ -265,6 +267,11 @@ const got = await api.readReview(retainedDispatches, dispatch.contract.request, 
 
 已采用持久任务的当前原目标，可在 spec 附可选 `result_scope`：
 `{object_ref,goal,source_ref,obligations:[{id,acceptance}]}`。不是所有小查询的必填门禁。
+采用有限适配且当前目标确实来自原生计划时，原 `request_identity` 可附可选
+`automation_id`，与原 `thread_id/turn_id/message_id` 一同参与当前输入及结果绑定。
+这里 turn/message 标识原目标来源；实际执行回合沿已有 native_result/checkpoint 另记。
+这些字段只关联现有原生对象，不认证来源、启停调度或新增权限，也不要求每次 heartbeat amend 输入。
+
 `task collect-result` 在实际工作后读取本任务 workspace 内 `{path,sha256}`：
 报告保留原 `request_id/task_id/input_revision/task_input_sha256/request_identity` 绑定，
 另有 `object_ref`、实际 `answer:{path,sha256}`、
@@ -301,11 +308,32 @@ UNKNOWN/running 不启动第二模型、提交或发送；COMPLETE 提示消费�
 资源局部拒绝和本步 UNKNOWN 只限制其动作及真实消费者，独立步骤继续。
 
 原义务初始最多32项，明确修订后累计最多64项；当前实际结果与对应一次实质审查均可
-覆盖完整64项，仍使用原文件/IO/调用预算。分批收取另一份当前结果会重新要求覆盖全部原义务，
-不把旧回答/旧审查自动累加成新回答。动态报告、回答、执行证据和终态引用按实际打开的
+覆盖完整64项，仍使用原文件/IO/调用预算。同一当前输入的不同实际结果及其审查按原义务累积，
+后到的部分结果保留前份已核覆盖。结果和审查的相同字节重复收取不改修订或已有覆盖；
+同一原生 thread/turn 的返回若报告字节冲突则拒收；
+final_ref 或 final_sha256 改变不产生第二原生身份。合法纠偏沿实际当前输入修订和来源，
+不在原输入内累积相互矛盾的同一返回。每次输入修订重新要求当前结果，旧输入仅留历史。
+后续审查只替代同一结果中明确评估的义务；不同结果出现 FAIL/UNKNOWN 冲突仍待解决。
+原记录最多保留64份结果与合计64份审查引用，不复制原文、另建收件台账或扩大调用预算。动态报告、回答、执行证据和终态引用按实际打开的
 只读FD对象核本任务及peer限制，未列在原checks中也不跳过既有读拒绝。
 
 被动引用按实际读取对象核限制，不借第一步的身份、文件检查或拒绝。A 的确切对象被拒
 不妨碍独立 B 的安全动态报告收取；B 只回答自己范围，A 的拒绝、UNKNOWN、原义务
 和外层依赖/验收继续保留。部分结果只列自身真正完成的origins，不把未决A冒作已完成；
 未决原operation始终留在原任务记录，不能由缺列/部分结果解除。
+
+当前执行机会需要一起核收已到结果并继续独立工作时，可对原有明确 task_ids 调用
+有界 `task work`，附 `results:{task_id:{result:{path,sha256},review:{path,sha256}}}`
+（review 可省）。仍须原 `expected_revisions`，先用原 collect/review 入口落同一任务，
+再在原1..4次上限内执行可做项；external 项须提供原 `observations`，不启动模型。
+某项收取失败只跳过该任务本轮执行，独立项继续；重复收取回 `duplicate_reused`。
+`continuation` 给出原目标尚需执行/取证的 next_actions、scoped_waits 及 must_continue/may_wait，
+不因有限命令 exit0 或子项返回清除父目标。原清单由其既有 owner 依据本次实际结果更新，
+此投影不是第二执行队列。调用方仍负责真实宿主接入、原通知送达及原清单消费；
+没有这些实际证据，程序通过不能签自动接续。
+
+已到且可安全读取的当前未审结果在 `reviewable_results` 和原 `next_action/continuation`
+中暴露审阅动作。其他原步骤 UNKNOWN 不遮住该动作；实际读取仍核原报告、回答、证据
+及 origins 的准确拒绝/未决关系，B 审过也不解除 A 的原 attempt、限制或未答义务。
+已审但其范围仍有未决义务的安全结果返回 `continuable_results`，继续原范围查证或纠正，
+不要求重复审同一不足结果；已核完 B 后只剩 A 的真实未知时可等待 A。

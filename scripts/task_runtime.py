@@ -401,6 +401,9 @@ def specification(value, filesystem=True):
     return copy.deepcopy(value)
 
 
+NO_CHANGE = object()
+
+
 class Store:
     def __init__(self, codex_home, task_id):
         require(isinstance(task_id, str) and ID.fullmatch(task_id), "invalid task id")
@@ -467,7 +470,8 @@ class Store:
             if value["revision"] != expected:
                 raise RevisionConflict("task revision conflict; reread before changing it")
             def apply():
-                operation(value)
+                if operation(value) is NO_CHANGE:
+                    return value
                 value["revision"] += 1
                 # Publish a conservative claim before the task record: a crash
                 # cannot leave a live producer invisible to another task.
@@ -538,6 +542,12 @@ def view(value):
     result["unproven_dependencies"] = [e for e in value["spec"].get("requires", []) if e["basis"]["status"] != "proven"]
     if result["work_partition"]["ready"]:
         result["next_action"] = {"kind": "execute_or_collect", "step": result["work_partition"]["ready"][0], "bounded": True}
+    elif result.get("result_dimensions",{}).get("reviewable_results"):
+        result["next_action"] = {"kind":"review_original_results","results":result["result_dimensions"]["reviewable_results"],"bounded":True}
+    elif result.get("result_dimensions",{}).get("continuable_results"):
+        result["next_action"] = {**result["result_dimensions"]["continuable_results"][0],"bounded":True}
+    elif result.get("result_dimensions",{}).get("pending_obligations") and not result["work_partition"]["waiting"]:
+        result["next_action"] = {"kind":"continue_original_obligations","obligations":result["result_dimensions"]["pending_obligations"],"bounded":True}
     elif len(result["work_partition"]["verified"]) == len(value["steps"]):
         result["next_action"] = {"kind": "completed" if result["accepted"] else "review_load_or_accept", "bounded": True}
     else:
@@ -1029,7 +1039,8 @@ def change(store, request):
         elif operation == "continue":
             coordination.continue_original(value,request)
         elif operation in ("collect-result", "review-result"):
-            coordination.collect_result(value,{"path":request.get("path"),"sha256":request.get("sha256")},review=operation=="review-result")
+            changed=coordination.collect_result(value,{"path":request.get("path"),"sha256":request.get("sha256")},review=operation=="review-result")
+            if not changed:return NO_CHANGE
         elif operation == "block":
             key = request.get("step")
             require(key in value["steps"] and text(request.get("condition")) and text(request.get("evidence_ref")), "block needs step, exact condition and evidence")
