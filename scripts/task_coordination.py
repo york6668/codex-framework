@@ -303,7 +303,8 @@ def dependency_gaps(value,trail=()):
                 gaps.append(dict(base,kind='required_result_stale'));break
     return gaps
 
-def related(value,step):return dependency_gaps(value)+effect_conflicts(value,step)
+def related(value,step,dependencies=True):
+    return (dependency_gaps(value) if dependencies else [])+effect_conflicts(value,step)
 
 def prompt(value):
     spec=value['spec'];project=spec.get('project')

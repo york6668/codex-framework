@@ -290,7 +290,7 @@ def same_restricted_scope(hold, step, scope):
     return hold["step"] == step["id"]
 
 
-def assessment(value, key, expected_scope=None, related=True):
+def assessment(value, key, expected_scope=None, related=True, dependencies=True):
     spec = next(s for s in value["spec"]["steps"] if s["id"] == key)
     scope = file_scope(value["spec"], spec)
     matches = [h for h in value.get("restrictions", []) if same_restricted_scope(h, spec, scope)]
@@ -305,7 +305,7 @@ def assessment(value, key, expected_scope=None, related=True):
         reason = "object_changed_between_decisions"
     elif value.get("accepted") and isinstance(value.get("acceptance_observation"), dict) and value["acceptance_observation"].get("scope_sha256", {}).get(key) != digest(encoded(scope)):
         reason = "accepted_object_changed; inspect current artifact before reacceptance"
-    relationships = coordination.related(value, spec) if related and reason is None else []
+    relationships = coordination.related(value, spec, dependencies=dependencies) if related and reason is None else []
     if reason is None and relationships:
         reason = "related_" + relationships[0]["kind"]
     return {"scope": scope, "reason": reason, "restriction_refs": [digest(encoded(h)) for h in matches],
@@ -539,7 +539,11 @@ def checked_file(value, step_id, check):
         return {**result,'io':receipt}
     started=time.monotonic();byte_limit=check.get('max_bytes',FILE_BYTES);total=0
     step = next(s for s in value["spec"]["steps"] if s["id"] == step_id)
-    before = assessment(value, step_id)
+    # Dependency closure belongs to the outer validation/acceptance decision.
+    # Re-entering it inside every FD read recursively scans loaded artifacts
+    # and floods this bounded worker's progress channel. Keep actual object
+    # restrictions and peer effects checked on both sides of the read.
+    before = assessment(value, step_id, dependencies=False)
     require(not before["blocked"], before["reason"] or "object constraint")
     path = cf.safe_path(value["spec"]["workspace"], check["path"])
     parts = Path(check["path"]).parts
@@ -584,7 +588,7 @@ def checked_file(value, step_id, check):
         current = os.stat(cf.safe_path(value["spec"]["workspace"], check["path"]), follow_symlinks=False)
         require((current.st_dev,current.st_ino,current.st_size,current.st_mtime_ns,current.st_ctime_ns) ==
                 (end.st_dev,end.st_ino,end.st_size,end.st_mtime_ns,end.st_ctime_ns), "file target changed after validation read")
-        after = assessment(value, step_id)
+        after = assessment(value, step_id, dependencies=False)
         require(not after["blocked"], after["reason"] or "object constraint after read")
         actual = hasher.hexdigest()
         return {"actual_sha256": actual, "passed": actual == check["sha256"], "opened_object": actual_scope["file_objects"][0]}
