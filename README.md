@@ -247,3 +247,63 @@ const got = await api.readReview(retainedDispatches, dispatch.contract.request, 
 实际 `cloud_threads.read` 的 `content` 可仅含 `Action completed.`，正文位于 `structuredContent={threadId,latestTurn,items,nextCursor,...}`。适配器直接识别并保留此原结构，不改造成 `schemaVersion:1`。当前已见助手投影没有原始委托或原生 final 身份，因此识别后仍为 `unknown`，返回原游标供原调用者有界核对；不会自动翻页、读取报告或重发。`latestTurn` 的完成状态不能签历史请求 turn。尚缺的输入、分页/排序和 final 身份合同须从原提供方核实，不能由报告自报 request、助手 role 或人为包装补足。
 
 纯函数的64 KiB上限也不扩大宿主原生读回能力：当前 codex_app read_thread 的单项读取配置最多20000字符。完整 final、原输入或证据不可取得时保留 unknown 或格式未匹配，不截取可用片段来通过；支持其他提供方须沿其实际原件另验。
+
+
+### 原目标结果与当前执行机会的接续
+
+普通未知结果继续使用上面的 `review_handoff`，不预填未来 PASS/hash。
+当前宿主轮次可调用 `api.continueReview(record, retainedDispatches, selectedRequest, io)`：
+沿原 `readNative/readReport` 核当前输入和实际 final，先经 `io.retain` 在原交接证据
+持久化 consumption 意图，再调用一次 `io.consume(bound)`（原消费者）并保存实际
+`{status:"committed",receipt_ref}`。这里 committed 仅为该消费者的有限读回，父目标
+仍是 pending_original_scope_review。原消费中断、丢回执或 UNKNOWN 时，下次只调用
+`io.inspectConsumption(originalIdentity)` 核原效果；未核清不重复消费、模型或投递。
+该回调须沿实际已有能力与授权；适配器不提供调度、原生作者认证或新的读/写权限。
+实际入口若只返回缺输入/终态的 projection，继续 UNKNOWN，不换产品接口代签。
+
+已采用持久任务的当前原目标，可在 spec 附可选 `result_scope`：
+`{object_ref,goal,source_ref,obligations:[{id,acceptance}]}`。不是所有小查询的必填门禁。
+`task collect-result` 在实际工作后读取本任务 workspace 内 `{path,sha256}`：
+报告保留原 `request_id/task_id/input_revision/task_input_sha256/request_identity` 绑定，
+另有 `object_ref`、实际 `answer:{path,sha256}`、
+`native_result:{thread_id,turn_id,final_ref,final_sha256}`、
+`answers:[{id,status,method_fit,evidence:[{path,sha256}]}]` 及 `origins`。
+status 为 answered/partial/unanswered/unknown，method_fit 为
+applicable/limited/not_applicable/unknown。原生字段须来自上面实际已绑定的原 read；
+文件中的字段自述不能认证来源或证明专业方法正确。
+
+原独立实质审查实际完成后，`task review-result` 读取同一原请求/对象的报告，
+用 `result_sha256` 锁当前实际结果，`reviewer_thread` 标识原独验，
+`assessments:[{id,verdict,reason}]` 记录领域判断（PASS/FAIL/NOT_RUN/UNKNOWN）。
+只有当前 answered/applicable 且原独验 PASS 的对应义务从 pending 移除；
+程序不理解任意数学/市场/诊断推理，必须由原独验核方法、实际过程、结论和原问题覆盖。
+已答较窄子问题不会关闭其余义务。amend 保留原目标/未决义务和旧结果历史；
+不能静默换对象、删义务或改原验收。accept 和当前读回重新核实际回答/审查字节。
+有限程序检查、原生模型终态及用户结果在 `result_dimensions` 分别列出。
+
+`task checkpoint` 只关联原 step 已有 operation/attempt/native 与持久效果：
+`origin:{operation_id,attempt_id,session_id,turn_id}`，
+`effects:[{kind:"input|freeze|commit|delivery",path,sha256}]`。
+它不创建业务 operation，不执行取数、冻结、提交或发送。首次输入/freeze 的引用不可改写。
+同一原生执行尚在途时保留该 execution，不能按新名字再运行。
+`task continue`（同 task、expected_revision、step）被动核原效果，可附实际保存的
+`terminal_ref:{path,sha256}`；该原件为 `{origin,status,source_ref}`，status 为
+unknown/running/completed/not_executed/failed。它只接受同一原映射，已知终态不可回写。
+NOT_EXECUTED 不撤销已经提交/投递的效果，也不重置原预算；输入取得仍独立保留。
+UNKNOWN/running 不启动第二模型、提交或发送；COMPLETE 提示消费原结果。
+此入口不替代原 native final 结果消费和领域 operation journal：旧 native 未决执行
+仍须在有获准原结果能力时沿既有恢复入口核清，不能用一个 JSON 状态宣告实际恢复。
+
+上述命令只在宿主实际给定的轮次执行。workset 仍不是后台 scheduler；未读到原触发启用、
+真实 fire/接收、后续事实与实际消费时，跨轮现场验收保持 NOT_VERIFIED。
+资源局部拒绝和本步 UNKNOWN 只限制其动作及真实消费者，独立步骤继续。
+
+原义务初始最多32项，明确修订后累计最多64项；当前实际结果与对应一次实质审查均可
+覆盖完整64项，仍使用原文件/IO/调用预算。分批收取另一份当前结果会重新要求覆盖全部原义务，
+不把旧回答/旧审查自动累加成新回答。动态报告、回答、执行证据和终态引用按实际打开的
+只读FD对象核本任务及peer限制，未列在原checks中也不跳过既有读拒绝。
+
+被动引用按实际读取对象核限制，不借第一步的身份、文件检查或拒绝。A 的确切对象被拒
+不妨碍独立 B 的安全动态报告收取；B 只回答自己范围，A 的拒绝、UNKNOWN、原义务
+和外层依赖/验收继续保留。部分结果只列自身真正完成的origins，不把未决A冒作已完成；
+未决原operation始终留在原任务记录，不能由缺列/部分结果解除。

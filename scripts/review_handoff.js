@@ -110,7 +110,7 @@ function createReviewHandoff(sha256Utf8, receiveKnownFinal=null) {
     try {
       need(hash(raw)===pinnedSha256,"original sender record fingerprint");
       const record=parse(raw,true);
-      need(keys(record,["dispatch","attempt","native_receipt"]) && ["prepared","started","returned","unknown"].includes(record.attempt),"sender record fields");
+      need((keys(record,["dispatch","attempt","native_receipt"]) || keys(record,["dispatch","attempt","native_receipt","consumption"])) && ["prepared","started","returned","unknown"].includes(record.attempt),"sender record fields");
       dispatch(record.dispatch);
       return {state:"recovered",record,may_resend:false,reason:"inspect_original_native_state_before_continuation"};
     } catch(e) { if(e.name!=="ReviewHandoffError") throw e; return {state:"unknown",reason:e.message,may_resend:false}; }
@@ -118,10 +118,10 @@ function createReviewHandoff(sha256Utf8, receiveKnownFinal=null) {
   async function sendReview(record,io) {
     // Caller retains in its existing handoff evidence. No cache lookup or implicit
     // fresh record, deduplication claim, resend, retry, alternate tool or recipient.
-    need(object(record) && keys(record,["dispatch","attempt","native_receipt"]),"original sender record required");
+    need(object(record) && (keys(record,["dispatch","attempt","native_receipt"]) || keys(record,["dispatch","attempt","native_receipt","consumption"])),"original sender record required");
     dispatch(record.dispatch);
     need(object(io) && typeof io.retain==="function" && typeof io.send==="function","original send/retain callbacks required");
-    if(record.attempt!=="prepared") return {state:"unknown",reason:"attempt_already_started_inspect_original",may_resend:false};
+    if(record.consumption || record.attempt!=="prepared") return {state:"unknown",reason:"attempt_already_started_inspect_original",may_resend:false};
     record.attempt="started";
     need(await io.retain(canon(record))===true,"original sender record not retained; no send");
     let receipt;
@@ -383,6 +383,54 @@ function createReviewHandoff(sha256Utf8, receiveKnownFinal=null) {
       accepted_requests:accepted?[bound.request]:[],
       pending_requests:accepted?bound.pending_requests.filter(r=>!same(r,bound.request)):bound.pending_requests};
   }
-  return {makeReviewDispatch,parseReviewDispatch,sendReview,recoverDispatch,recoverNativeDispatch,observeReview,receiveReview,readReview,decideReview};
+  async function continueReview(record,dispatches,selectedRequest,io) {
+    // Called only in an ACTUAL host turn. It neither schedules a future turn nor
+    // sends, launches or repeats a business operation. Consumption is retained
+    // before the original caller's effect, and UNKNOWN is never reset by time.
+    need(object(record),"original continuation record missing");
+    dispatch(record.dispatch);
+    need(same(record.dispatch.contract.request,selectedRequest),"original continuation record mismatch");
+    need(["started","returned","unknown"].includes(record.attempt),"original send has not started");
+    need(object(io) && typeof io.retain==="function" && typeof io.consume==="function","original retain/consume callbacks required");
+    const got=await readReview(dispatches,selectedRequest,io);
+    const bound=got.evaluation;
+    const answer=(state,reason,extra={})=>({state,reason,binding:bound,
+      parent_goal:"pending_original_scope_review",may_launch:false,may_commit:false,may_send:false,
+      requires_actual_host_opportunity:true,...extra});
+    if(!bound || bound.binding!=="bound") return answer("unknown","original current result not established; do not replay");
+    const identity={request:selectedRequest,final_ref:bound.native_final_ref,
+      final_utf8_sha256:bound.final_utf8_sha256,report_sha256:bound.report_sha256};
+    const prior=record.consumption;
+    if(prior) {
+      need(keys(prior,["identity","state","receipt_ref"]) && same(prior.identity,identity) &&
+        ["started","returned","unknown"].includes(prior.state),"original consumption identity/state mismatch");
+      if(prior.state==="returned") {need(text(prior.receipt_ref),"original consumer receipt missing");return answer("consumed","reuse original consumer receipt",{receipt_ref:prior.receipt_ref});}
+      if(typeof io.inspectConsumption!=="function") return answer("unknown","inspect original consumer effect before continuation");
+      let observed;
+      try {observed=await io.inspectConsumption(identity);} catch(e) {return answer("unknown","original consumer effect unavailable");}
+      // A receipt is an explicit readback in the original caller, not permission
+      // to start again. NOT_EXECUTED requires the original budget decision.
+      if(!object(observed) || !same(observed.identity,identity) || observed.status!=="committed" || !text(observed.receipt_ref))
+        return answer("unknown","original consumer effect not established; preserve original attempt");
+      prior.state="returned";prior.receipt_ref=observed.receipt_ref;
+      if(await io.retain(canon(record))!==true) return answer("unknown","consumer receipt not retained");
+      return answer("consumed","original effect recovered without repetition",{receipt_ref:prior.receipt_ref});
+    }
+    record.consumption={identity,state:"started",receipt_ref:null};
+    if(await io.retain(canon(record))!==true) return answer("unknown","consumption intent not retained; no effect");
+    let receipt;
+    try {receipt=await io.consume(bound);} catch(e) {
+      record.consumption.state="unknown";await io.retain(canon(record));
+      return answer("unknown","consumer outcome unknown; inspect original effect");
+    }
+    if(!object(receipt) || receipt.status!=="committed" || !text(receipt.receipt_ref)) {
+      record.consumption.state="unknown";await io.retain(canon(record));
+      return answer("unknown","consumer has no committed readback; do not repeat");
+    }
+    record.consumption.state="returned";record.consumption.receipt_ref=receipt.receipt_ref;
+    if(await io.retain(canon(record))!==true) return answer("unknown","consumer receipt not retained; inspect original effect");
+    return answer("consumed","actual original consumer returned; original goal still reviewed separately",{receipt_ref:receipt.receipt_ref});
+  }
+  return {continueReview,makeReviewDispatch,parseReviewDispatch,sendReview,recoverDispatch,recoverNativeDispatch,observeReview,receiveReview,readReview,decideReview};
 }
 if(typeof module!=="undefined") module.exports={createReviewHandoff};

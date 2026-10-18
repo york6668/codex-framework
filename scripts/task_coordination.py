@@ -69,6 +69,7 @@ def local_dependencies(step):
     return [edge for edge in edges if edge not in declared or declared[edge]['status']=='proven']
 
 def validate(spec):
+    if 'result_scope' in spec:validate_result_scope(spec['result_scope'])
     p=spec.get('project');assignment=spec.get('assignment')
     need(p is None or assignment is not None,'project context needs an assignment')
     need(spec.get('execution_mode','native') in ('native','external'),'invalid task execution mode')
@@ -240,6 +241,10 @@ def own_entries(value):
                 if original:item['object_identity']={'device':original['device'],'inode':original['inode']}
                 effects.append(item)
         result.append({'task_id':value['task_id'],'execution_id':task().digest(task().encoded(hold)),'state':'denial','resources':effects,'source_ref':hold['wait'].get('source_ref') or hold['wait'].get('evidence_ref') or 'retained original restriction'})
+    for name,state in value['steps'].items():
+        cp=state.get('continuation')
+        if cp and not cp['resolved']:
+            result.append({'task_id':value['task_id'],'execution_id':cp['origin']['attempt_id'],'state':'uncertain','resources':resources(value,specs[name]),'source_ref':'retained original continuation'})
     return [x for x in result if x['resources']]
 
 def sync_index(store,value):
@@ -253,10 +258,10 @@ def sync_index(store,value):
     else:
         with index_lock(store.root):write()
 
-def effect_conflicts(value,step):
+def effect_conflicts(value,step,wanted=None):
     root=ROOT.get()
     if root is None:return []
-    wanted=resources(value,step)
+    wanted=resources(value,step) if wanted is None else wanted
     if value['spec'].get('execution_mode')=='external':wanted=[dict(e,mode='read',operation='read') for e in wanted]
     if not wanted:return []
     def inspect():
@@ -291,7 +296,7 @@ def dependency_gaps(value,trail=()):
         nested=dependency_gaps(other,trail+(value['task_id'],))
         if nested:gaps.append(dict(base,kind='upstream_dependency_unresolved',upstream=nested));continue
         names=[edge['step_id']] if edge['step_id'] else list(other['steps'])
-        if any(n not in other['steps'] or other['steps'][n]['state']!='verified' for n in names) or (edge['step_id'] is None and not other['accepted']):
+        if any(n not in other['steps'] or other['steps'][n]['state']!='verified' for n in names) or (edge['step_id'] is None and not current_accepted(other)):
             gaps.append(dict(base,kind='required_result_not_accepted'));continue
         if other['spec'].get('artifact'):
             try:artifact(other)
@@ -308,9 +313,9 @@ def related(value,step,dependencies=True):
 
 def prompt(value):
     spec=value['spec'];project=spec.get('project')
-    if project is None and not spec.get('assignment') and not spec.get('request_identity'):return ''
+    if project is None and not spec.get('assignment') and not spec.get('request_identity') and not spec.get('result_scope'):return ''
     identity={'request_id':spec['request_id'],'task_id':value['task_id'],'input_revision':value['input_revision'],'acceptance_sha256':value['acceptance_sha256'],'native_request':spec.get('request_identity')}
-    return '\nCurrent request identity: '+json.dumps(identity,ensure_ascii=False)+'\nProject goal/responsibility: '+json.dumps(project,ensure_ascii=False)+'\nThis assignment: '+json.dumps(spec.get('assignment'),ensure_ascii=False)+'\nDeclared input relationships: '+json.dumps(spec.get('requires',[]),ensure_ascii=False)+'\nThese facts do not grant permissions. Answer this current request and assigned deliverables; an older PASS or another project result is not its acceptance.'
+    return '\nCurrent request identity: '+json.dumps(identity,ensure_ascii=False)+'\nProject goal/responsibility: '+json.dumps(project,ensure_ascii=False)+'\nThis assignment: '+json.dumps(spec.get('assignment'),ensure_ascii=False)+'\nDeclared input relationships: '+json.dumps(spec.get('requires',[]),ensure_ascii=False)+'\nOriginal result scope: '+json.dumps(spec.get('result_scope'),ensure_ascii=False)+'\nThese facts do not grant permissions. Answer this current request and assigned deliverables; an older PASS or another project result is not its acceptance.'
 
 def bound_report(value,report):
     need(isinstance(report,dict),'report must be an object')
@@ -320,20 +325,26 @@ def bound_report(value,report):
     need(all(type(report.get(k)) is type(v) and report[k]==v for k,v in expected.items()),'report does not answer current project/task/native request/input')
     return expected
 
-def read_json(workspace,path,fingerprint):
+def read_json(workspace,path,fingerprint,value=None):
     relative(path,'evidence path');need(hashes(fingerprint),'invalid evidence fingerprint')
     def read():
         target=task().cf.safe_path(workspace,path)
         fd=os.open(target,os.O_RDONLY|getattr(os,'O_NONBLOCK',0)|getattr(os,'O_NOFOLLOW',0))
         try:
             info=os.fstat(fd);need(stat.S_ISREG(info.st_mode) and info.st_size<=task().LIMIT,'evidence must be a bounded ordinary file')
+            if value is not None:check_passive_object(value,str(target),info.st_dev,info.st_ino)
             raw=b''
             while len(raw)<=task().LIMIT:
                 chunk=os.read(fd,min(65536,task().LIMIT+1-len(raw)))
                 if not chunk:break
                 raw+=chunk
             need(len(raw)<=task().LIMIT and task().digest(raw)==fingerprint,'evidence bytes changed')
-            value=json.loads(raw);need(isinstance(value,dict),'evidence must be an object');return value
+            if value is not None:
+                end=os.fstat(fd);current=os.stat(target,follow_symlinks=False)
+                identity=lambda s:(s.st_dev,s.st_ino,s.st_size,s.st_mtime_ns,s.st_ctime_ns)
+                need(identity(info)==identity(end)==identity(current),'evidence changed during passive read')
+                check_passive_object(value,str(target),end.st_dev,end.st_ino)
+            parsed=json.loads(raw);need(isinstance(parsed,dict),'evidence must be an object');return parsed
         finally:os.close(fd)
     return task().isolated_io('project_evidence',read,3)[0]
 
@@ -379,7 +390,7 @@ def project_view(values,errors):
                 if value is None:result['gaps'].append({'kind':'required_task_missing','obligation':name,'task_id':member,'detail':errors.get(member)});continue
                 p=value['spec'].get('project');assignment=value['spec'].get('assignment',{})
                 if not p or p['id']!=identity or name not in assignment.get('covers',[]):result['gaps'].append({'kind':'wrong_task_assignment','task_id':member,'obligation':name})
-                elif not value['accepted'] or dependency_gaps(value) or any(task().assessment(value,n)['blocked'] for n in value['steps']):result['gaps'].append({'kind':'project_obligation_remaining','task_id':member,'obligation':name})
+                elif not current_accepted(value) or dependency_gaps(value) or any(task().assessment(value,n)['blocked'] for n in value['steps']):result['gaps'].append({'kind':'project_obligation_remaining','task_id':member,'obligation':name})
         result['complete']=not result['gaps']
     return projects
 
@@ -402,13 +413,13 @@ def finalization(values,project_results,declared):
         if omitted:result['gaps'].append({'kind':'final_component_omitted','task_ids':sorted(omitted)})
     integration=values[declared['integration']];regression=values[declared['regression']];tracking=values[declared['tracking']]
     for value,role in [(integration,'integration'),(regression,'final_regression'),(tracking,'coordination')]:
-        if value['spec'].get('assignment',{}).get('role')!=role or not value['accepted'] or dependency_gaps(value):result['gaps'].append({'kind':'final_stage_not_accepted','role':role,'task_id':value['task_id']})
+        if value['spec'].get('assignment',{}).get('role')!=role or not current_accepted(value) or dependency_gaps(value):result['gaps'].append({'kind':'final_stage_not_accepted','role':role,'task_id':value['task_id']})
     for identity in ids:
         value=values[identity]
         if not value['spec'].get('project') or not value['spec'].get('assignment'):
             result['gaps'].append({'kind':'component_project_responsibility_missing','task_id':identity})
             continue
-        if not value['accepted'] or not value.get('review') or value['review'].get('task_input_sha256')!=value['acceptance_sha256']:result['gaps'].append({'kind':'component_independent_verification_missing','task_id':identity})
+        if not current_accepted(value) or not value.get('review') or value['review'].get('task_input_sha256')!=value['acceptance_sha256']:result['gaps'].append({'kind':'component_independent_verification_missing','task_id':identity})
         if not declared_link(integration,identity,value['acceptance_sha256']):result['gaps'].append({'kind':'integration_input_not_bound','task_id':identity})
     if not declared_link(regression,integration['task_id'],integration['acceptance_sha256']):result['gaps'].append({'kind':'regression_not_after_integration'})
     if not declared_link(tracking,regression['task_id'],regression['acceptance_sha256']):result['gaps'].append({'kind':'tracking_not_after_final_regression'})
@@ -481,3 +492,211 @@ def workset(codex_home,request):
             closed['gaps'].append({'kind':'named_tasks_remaining','task_ids':remaining})
             closed['complete']=False
         return {'scope':'named existing task/project workset; no permissions or original-record authenticity granted','tasks':projected,'errors':errors,'projects':projects,'executed':executed,'finalization':closed,'overall_complete':closed['complete'],'model_adoption':'not established by this projection or synthetic tests'}
+
+# Optional original-result scope, held in the existing task record. These
+# relationships do not authenticate a native source or grade domain reasoning.
+def validate_result_scope(scope):
+    need(isinstance(scope,dict) and set(scope)=={'object_ref','goal','source_ref','obligations'},'invalid original result scope')
+    need(all(text(scope[k]) for k in ('object_ref','goal','source_ref')),'original object/goal/source missing')
+    rows=scope['obligations'];need(isinstance(rows,list) and 0<len(rows)<=32,'invalid original obligations')
+    seen=set()
+    for row in rows:
+        need(isinstance(row,dict) and set(row)=={'id','acceptance'} and identifier(row.get('id')) and text(row.get('acceptance')) and row['id'] not in seen,'invalid original obligation')
+        seen.add(row['id'])
+
+def result_state(value):
+    return value.get('result_state')
+
+def initialize_result(value,prior=None):
+    scope=value['spec'].get('result_scope')
+    if scope is None:
+        need(prior is None,'original result obligations cannot be removed by amendment');return
+    if prior:
+        need(scope['object_ref']==prior['object_ref'],'amendment cannot substitute original business object')
+    state=copy.deepcopy(prior) if prior else {'object_ref':scope['object_ref'],'original_goal':scope['goal'],'obligations':{},'pending':[]}
+    for row in scope['obligations']:
+        old=state['obligations'].get(row['id'])
+        need(old is None or old==row['acceptance'],'amendment cannot silently change original acceptance')
+        if old is None:state['pending'].append(row['id'])
+        state['obligations'][row['id']]=row['acceptance']
+    # Current-request acceptance always requires a current result/review. Old
+    # finite results stay in history, not as an answer to the amended input.
+    state['pending']=list(state['obligations']);state['result']=None;state['review']=None
+    need(len(state['obligations'])<=64,'retained original obligation bound')
+    value['result_state']=state
+
+def evidence_reference(value,ref):
+    need(isinstance(ref,dict) and set(ref)=={'path','sha256'},'invalid passive evidence reference')
+    relative(ref.get('path'),'passive evidence path');need(hashes(ref.get('sha256')),'invalid passive evidence hash')
+    check={'kind':'file',**ref}
+    # This is a passive evidence read, not execution of an arbitrary first
+    # registered step. Exact local/peer path and FD guards remain mandatory;
+    # original step/dependency constraints still govern execution/acceptance.
+    need(task().checked_file(value,None,check)['passed'],'passive evidence bytes unavailable, changed or blocked')
+
+def origin(value):
+    need(isinstance(value,dict) and set(value)=={'operation_id','attempt_id','session_id','turn_id'},'invalid original operation/attempt/native mapping')
+    need(text(value['operation_id']) and text(value['attempt_id']),'original operation/attempt missing')
+    need(all(value[k] is None or text(value[k]) for k in ('session_id','turn_id')),'invalid original native identity')
+    need(value['turn_id'] is None or value['session_id'] is not None,'native turn requires original session')
+
+def checkpoint(value,request):
+    need(result_state(value) is not None,'continuation checkpoint needs original result scope')
+    key=request.get('step');need(key in value['steps'],'unknown checkpoint step')
+    current=value['steps'][key];mapping=request.get('origin');origin(mapping)
+    prior=current.get('continuation');active=value.get('execution')
+    if prior:need(prior['origin']==mapping,'continuation must retain original operation/attempt/native turn')
+    if active and active['step']==key:
+        need(active['id']==mapping['attempt_id'] and active.get('session_id')==mapping['session_id'],'checkpoint is not the original native execution')
+        known=next((e.get('native_turn_id') for e in reversed(current['evidence']) if e.get('execution_id')==active['id'] and e.get('native_turn_id')),None)
+        need(known is None or known==mapping['turn_id'],'checkpoint substituted native turn')
+    refs=request.get('effects');need(isinstance(refs,list) and len(refs)<=16,'invalid original durable effects')
+    saved=copy.deepcopy(prior) if prior else {'origin':copy.deepcopy(mapping),'effects':[],'terminal':'unknown','terminal_ref':None,'resolved':False}
+    for ref in refs:
+        need(isinstance(ref,dict) and set(ref)=={'kind','path','sha256'} and ref.get('kind') in ('input','freeze','commit','delivery'),'invalid durable effect kind')
+        old=next((e for e in saved['effects'] if e['kind']==ref['kind'] and e['path']==ref['path']),None)
+        need(old is None or old==ref,'original input/freeze/effect cannot be overwritten')
+        evidence_reference(value,{k:ref[k] for k in ('path','sha256')})
+        if old is None:saved['effects'].append(copy.deepcopy(ref))
+    need(len(saved['effects'])<=16,'durable effect reference bound')
+    if prior:
+        for ref in prior['effects']:evidence_reference(value,{k:ref[k] for k in ('path','sha256')})
+    saved['resolved']=False;current['continuation']=saved
+    value['accepted']=False
+    if active and active['step']==key:
+        current['unresolved_execution']=active;current['state']='reconcile'
+        current['wait']={'kind':'original_continuation_unknown','next':'read_original_terminal_and_effects_without_replay'}
+        value['execution']=None
+    return saved
+
+def continue_original(value,request):
+    key=request.get('step');need(key in value['steps'],'unknown continuation step')
+    saved=value['steps'][key].get('continuation');need(saved is not None,'no original continuation checkpoint')
+    for ref in saved['effects']:evidence_reference(value,{k:ref[k] for k in ('path','sha256')})
+    ref=request.get('terminal_ref')
+    if ref is not None:
+        need(isinstance(ref,dict) and set(ref)=={'path','sha256'},'invalid original terminal reference')
+        evidence_reference(value,ref)
+        report=read_json(value['spec']['workspace'],ref['path'],ref['sha256'],value=value)
+        need(isinstance(report,dict) and set(report)=={'origin','status','source_ref'},'invalid original terminal readback')
+        origin(report['origin']);need(report['origin']==saved['origin'] and text(report['source_ref']),'terminal readback belongs to another original operation/attempt/turn')
+        need(report['status'] in ('unknown','running','completed','not_executed','failed'),'invalid original terminal status')
+        need(saved['terminal'] not in ('completed','not_executed','failed') or saved['terminal']==report['status'],'terminal observation cannot rewrite a known original outcome')
+        if report['status']=='not_executed':need(not any(e['kind'] in ('commit','delivery') for e in saved['effects']),'NOT_EXECUTED conflicts with already durable effects')
+        saved['terminal']=report['status'];saved['terminal_ref']=copy.deepcopy(ref)
+    saved['next_action']={'completed':'consume_original_result','not_executed':'decide_original_authorized_step_with_remaining_budget','failed':'inspect_original_failure_without_replay'}.get(saved['terminal'],'inspect_original_native_and_durable_effects')
+    saved['may_launch']=saved['may_commit']=saved['may_send']=False
+    saved['source_authentication']='caller must verify permitted original native read; JSON labels are not authentication'
+    return saved
+
+def collect_result(value,reference,review=False):
+    state=result_state(value);need(state is not None,'original result scope missing')
+    evidence_reference(value,reference)
+    report=read_json(value['spec']['workspace'],reference['path'],reference['sha256'],value=value);bound_report(value,report)
+    need(report.get('object_ref')==state['object_ref'],'result belongs to another original business object')
+    if review:
+        need(state.get('result') is not None,'current actual result missing')
+        actual=state['result'];need(report.get('result_sha256')==actual['sha256'],'substantive review is not for current actual result')
+        evidence_reference(value,actual)
+        result=read_json(value['spec']['workspace'],actual['path'],actual['sha256'],value=value)
+        _result_content(value,state,result)
+        reviewer=report.get('reviewer_thread');need(text(reviewer) and reviewer not in (value['spec'].get('assignment',{}).get('owner'),value['spec'].get('request_identity',{}).get('thread_id')),'independent substantive reviewer missing')
+        rows=report.get('assessments');need(isinstance(rows,list) and len(rows)<=64,'invalid substantive assessments')
+        seen=set();passed=[]
+        for row in rows:
+            need(isinstance(row,dict) and set(row)=={'id','verdict','reason'} and isinstance(row.get('id'),str) and row['id'] in state['obligations'] and row['id'] not in seen and row['verdict'] in ('PASS','FAIL','NOT_RUN','UNKNOWN') and text(row['reason']),'invalid substantive assessment')
+            seen.add(row['id']);answer=next((a for a in result['answers'] if a['id']==row['id']),None)
+            if row['verdict']=='PASS':
+                need(answer is not None and answer['status']=='answered' and answer['method_fit']=='applicable','partial/unknown/inapplicable result cannot satisfy original obligation')
+                passed.append(row['id'])
+        state['pending']=[i for i in state['obligations'] if i not in passed];state['review']=copy.deepcopy(reference)
+        # Only an actually consumed original COMPLETE result releases its hold.
+        for step in value['steps'].values():
+            cp=step.get('continuation')
+            if cp and cp['terminal']=='completed' and cp['origin'] in result['origins']:cp['resolved']=True
+    else:
+        _result_content(value,state,report)
+        state['result']=copy.deepcopy(reference);state['review']=None;state['pending']=list(state['obligations'])
+    value['accepted']=False
+
+def _result_content(value,state,report):
+    need(report.get('object_ref')==state['object_ref'],'original object mismatch')
+    evidence_reference(value,report.get('answer'))
+    native=report.get('native_result');need(isinstance(native,dict) and set(native)=={'thread_id','turn_id','final_ref','final_sha256'} and all(text(native.get(k)) for k in ('thread_id','turn_id','final_ref')) and hashes(native.get('final_sha256')),'actual current native result identity missing')
+    rows=report.get('answers');need(isinstance(rows,list) and len(rows)<=64,'invalid current result answers')
+    seen=set();checked=set()
+    for row in rows:
+        need(isinstance(row,dict) and set(row)=={'id','status','method_fit','evidence'} and isinstance(row.get('id'),str) and row['id'] in state['obligations'] and row['id'] not in seen,'unrequested/duplicate original obligation')
+        seen.add(row['id']);need(row['status'] in ('answered','partial','unanswered','unknown') and row['method_fit'] in ('applicable','limited','not_applicable','unknown'),'invalid actual result dimensions')
+        refs=row['evidence'];need(isinstance(refs,list) and len(refs)<=16 and (row['status']!='answered' or refs),'actual answered result needs execution evidence')
+        for ref in refs:
+            need(isinstance(ref,dict) and set(ref)=={'path','sha256'} and isinstance(ref.get('path'),str) and hashes(ref.get('sha256')),'invalid execution evidence')
+            identity=(ref['path'],ref['sha256'])
+            if identity not in checked:
+                need(len(checked)<64,'distinct execution evidence bound');evidence_reference(value,ref);checked.add(identity)
+    origins=report.get('origins');need(isinstance(origins,list) and len(origins)<=32,'invalid original result operation mappings')
+    for mapping in origins:origin(mapping)
+    for step in value['steps'].values():
+        cp=step.get('continuation')
+        if cp and cp['origin'] in origins:
+            need(cp['terminal']=='completed','UNKNOWN/running/failed original outcome cannot be consumed as complete')
+            for ref in cp['effects']:evidence_reference(value,{k:ref[k] for k in ('path','sha256')})
+
+def result_projection(value):
+    state=result_state(value)
+    if state is None:return None
+    return {'object_ref':state['object_ref'],'original_goal':state['original_goal'],'pending_obligations':state['pending'],
+        'program_checks_passed':all(s['state']=='verified' for s in value['steps'].values()),
+        'model_turn_terminal':[{'origin':s['continuation']['origin'],'status':s['continuation']['terminal']} for s in value['steps'].values() if s.get('continuation')],
+        'current_result':state.get('result'),'substantive_review':state.get('review'),
+        'business_outcome':'pending' if state['pending'] or any(s.get('continuation') and not s['continuation']['resolved'] for s in value['steps'].values()) else 'reviewed_declared_scope',
+        'native_authenticity':'not established by file labels; original caller must verify actual native records',
+        'wake_source':'not provided by this task runtime; each continuation requires an actual host execution opportunity',
+        'original_operations':[s['continuation'] for s in value['steps'].values() if s.get('continuation')]}
+
+
+def validate_current_result(value):
+    state=result_state(value)
+    if state is None:return
+    need(not state['pending'] and state.get('result') and state.get('review'),'original user result is still pending')
+    probe=copy.deepcopy(value)
+    collect_result(probe,state['review'],review=True)
+    need(not probe['result_state']['pending'],'current substantive review does not cover original obligations')
+
+
+def current_accepted(value):
+    if not value['accepted']:return False
+    try:validate_current_result(value)
+    except (task().TaskError,OSError,ValueError):return False
+    return True
+
+
+def validate_result_state(value):
+    state=result_state(value)
+    need(('result_scope' in value['spec'])==(state is not None),'original result state/scope mismatch')
+    if state is None:return
+    need(isinstance(state,dict) and set(state)=={'object_ref','original_goal','obligations','pending','result','review'},'invalid original result state')
+    need(state['object_ref']==value['spec']['result_scope']['object_ref'] and text(state['original_goal']),'original goal/object changed')
+    obligations=state['obligations'];pending=state['pending']
+    need(isinstance(obligations,dict) and 0<len(obligations)<=64 and all(identifier(k) and text(v) for k,v in obligations.items()),'invalid retained original obligations')
+    need(isinstance(pending,list) and all(isinstance(k,str) and k in obligations for k in pending) and len(set(pending))==len(pending),'invalid pending original obligations')
+    for key in ('result','review'):
+        ref=state[key]
+        if ref is not None:
+            need(isinstance(ref,dict) and set(ref)=={'path','sha256'} and hashes(ref.get('sha256')),'invalid retained result reference')
+            relative(ref['path'],'retained result path')
+
+
+def check_passive_object(value,path,device,inode,step_id=None):
+    """Check the actual opened read object, including peer READ refusals.
+
+    The identity is captured from this FD, not supplied as a permission label.
+    No original step declaration is changed or used as a substitute for it.
+    """
+    scope={'files':[path],'file_objects':[{'device':device,'inode':inode}]}
+    step={'id':step_id,'checks':[]}
+    need(not any(task().same_restricted_scope(h,step,scope) for h in value.get('restrictions',[])),'passive object matches retained local restriction')
+    wanted=[{'kind':'file','identity':path,'object':'','mode':'read','operation':'read','source_ref':'actual passive descriptor',
+             'object_identity':{'device':device,'inode':inode}}]
+    conflicts=effect_conflicts(value,step,wanted=wanted)
+    need(not conflicts,'passive object has retained refusal or unresolved peer effect')

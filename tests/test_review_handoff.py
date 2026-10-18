@@ -62,6 +62,28 @@ const d=JSON.parse(fs.readFileSync(0,'utf8'));
    r={...got,calls};
  }
  else if(d.op==='decide') r=api.decideReview(d.bound,d.decision);
+ else if(d.op==='continue') {
+   const calls=[], retained=[]; const record=d.record;
+   const io={readNative:async target=>{calls.push('read');return d.native;},
+     readReport:async ref=>d.readback,
+     retain:async raw=>{retained.push(JSON.parse(raw));return d.retain!==false;},
+     consume:async bound=>{calls.push('consume');if(d.consumeThrows)throw Error('lost consumer ack');
+       if(d.consumerCli) {
+         const report={...d.consumerTemplate,native_result:{thread_id:d.selected.target_thread,
+           turn_id:bound.native_turn_id,final_ref:bound.native_final_ref,final_sha256:bound.final_utf8_sha256}};
+         const text=JSON.stringify(report);fs.writeFileSync(d.consumerPath,text);
+         const request={...d.consumerRequest,sha256:old.sha256Utf8(text)};
+         const r=require('child_process').spawnSync(d.consumerCli[0],d.consumerCli.slice(1),{input:JSON.stringify(request),encoding:'utf8'});
+         if(r.status!==0 || r.stderr)throw Error('original consumer failed: '+r.stdout+r.stderr);
+         const actual=JSON.parse(r.stdout);if(actual.result_state.result.sha256!==request.sha256)throw Error('consumer readback mismatch');
+         return {status:'committed',receipt_ref:actual.task_id+'/revision/'+actual.revision};
+       }
+       return {status:'committed',receipt_ref:'original-consumer-receipt'};}};
+   if(d.inspect)io.inspectConsumption=async identity=>{calls.push('inspect');return {identity,status:d.inspect,receipt_ref:'original-consumer-receipt'};};
+   const outputs=[];
+   for(let i=0;i<(d.repeat||1);i++)outputs.push(await api.continueReview(record,d.dispatches,d.selected,io));
+   r={outputs,record,calls,retained};
+ }
  else if(d.op==='io') {
    const calls=[], record=d.record;
    try {

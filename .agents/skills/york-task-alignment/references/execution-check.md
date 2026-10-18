@@ -163,3 +163,12 @@ rebuild 需要当前契约可重建、当前数据无需保留、重建来源、
 已登记文件输出及显式逻辑资源使用有界占用元数据协调；索引不持有项目待办，不能按项目/数据库标签制造全局停工。历史拒绝沿原对象效果保存；普通资源共享、兼容读和离线工作分别判断。无原生真实调用的确定性回归只证明程序分流。
 
 finalization 关联当前 components→integration→实际合并/加载 artifact→独立 final_regression→coordination 原清单更新。统一 artifact 逐项绑定项目 Git ref/commit/tree 与实际加载文件；最终报告必须对应本轮 task/request/input、同一 artifact 和当前分项输入。缺合并、实际加载、总回归或原清单文件效果时，三个局部 PASS 不能令 overall_complete 为真。当前请求报告可用 verify-return 核对，旧报告不能仅换任务标题后回收。
+
+
+可选持久原目标接续使用核心 README 的“原目标结果与当前执行机会的接续”：
+复用已有未知结果 `review_handoff`，实际 final 绑定后由原消费者收取；消费前保存原意图，
+丢回执/UNKNOWN 只核原消费，不重复操作。`result_scope/collect-result/review-result`
+把当前实际结果及领域独验关联原义务，文件检查通过或模型轮次结束不关闭未答原目标。
+`checkpoint/continue` 只读回已有 operation/attempt/native turn 和输入/首次冻结/效果，
+没有新增唤醒、模型、业务提交或投递能力。字段不能认证原件作者，原生结果不可见就保持未知；
+每次继续须有真实宿主执行机会，现场连贯性另按真实触发、接收和后续事实验收。

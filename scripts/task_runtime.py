@@ -347,7 +347,7 @@ def enforce_constraints(value, phase, key=None, expected_scope=None):
 
 def specification(value, filesystem=True):
     require(isinstance(value, dict), "task specification must be an object")
-    require(set(value) <= {"request_id", "requirement", "acceptance_version", "workspace", "steps", "max_runs", "review_required", "load_required", "native_model", "native_reasoning_effort", "project", "assignment", "request_identity", "known_tasks", "requires", "artifact", "execution_mode"}, "unknown task specification field")
+    require(set(value) <= {"request_id", "requirement", "acceptance_version", "workspace", "steps", "max_runs", "review_required", "load_required", "native_model", "native_reasoning_effort", "project", "assignment", "request_identity", "known_tasks", "requires", "artifact", "execution_mode", "result_scope"}, "unknown task specification field")
     if value.get("native_model") is not None:
         require(isinstance(value["native_model"], str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:/-]{0,127}", value["native_model"]), "invalid explicit native model")
     if value.get("native_reasoning_effort") is not None:
@@ -425,7 +425,7 @@ class Store:
         require(isinstance(value, dict) and value.get("format") == 1 and type(value.get("revision")) is int, "invalid task state")
         require(value.get("record_sha256") == digest(encoded({k: v for k, v in value.items() if k != "record_sha256"})), "task record fingerprint mismatch")
         fields = {"format", "task_id", "revision", "input_revision", "spec", "acceptance_sha256", "steps", "execution", "native_session_id", "history", "review", "loaded", "delivery", "accepted", "record_sha256"}
-        require(fields <= set(value) <= fields | {"restrictions", "acceptance_observation"} and isinstance(value.get("restrictions", []), list), "invalid task record fields")
+        require(fields <= set(value) <= fields | {"restrictions", "acceptance_observation", "result_state"} and isinstance(value.get("restrictions", []), list), "invalid task record fields")
         require(value["revision"] >= 1 and type(value["input_revision"]) is int and value["input_revision"] >= 1 and type(value["accepted"]) is bool, "invalid task version or acceptance")
         spec = specification(value["spec"], filesystem=False)
         require(value["acceptance_sha256"] == digest(encoded(spec)), "acceptance specification mismatch")
@@ -434,6 +434,7 @@ class Store:
             require(isinstance(step, dict) and step.get("state") in ("pending", "running", "verified", "blocked", "reconcile") and type(step.get("runs")) is int and step["runs"] >= 0 and isinstance(step.get("evidence"), list), "invalid step state")
         require(value["execution"] is None or isinstance(value["execution"], dict), "invalid execution state")
         require(isinstance(value["history"], list) and len(value["history"]) <= 64 and isinstance(value["delivery"], dict), "invalid task history/delivery")
+        coordination.validate_result_state(value)
         return value
 
     def save(self, value):
@@ -454,6 +455,7 @@ class Store:
             value["steps"] = {step["id"]: {"state": "pending", "runs": 0, "session_id": None,
                                            "evidence": [], "validation": None, "wait": None} for step in spec["steps"]}
             coordination.membership(value)
+            coordination.initialize_result(value)
             self.save(value)
             return value
 
@@ -489,6 +491,8 @@ def partition(value, observations=None):
         step = value["steps"][key]
         if observations[key]["blocked"]:
             waiting.append({"step": key, "condition": observations[key]["reason"], "restriction_refs": observations[key]["restriction_refs"]})
+        elif step.get("continuation") and not step["continuation"]["resolved"]:
+            waiting.append({"step": key, "condition": "original_continuation_requires_readback", "origin": step["continuation"]["origin"]})
         elif step["state"] == "verified":
             done.append(key)
         elif step["state"] in ("blocked", "reconcile", "running") and not (
@@ -513,6 +517,14 @@ def view(value):
         result["acceptance_receipt_before_current_observation"] = value["accepted"]
         result["accepted"] = False
     result["work_partition"] = partition(value, observations)
+    if coordination.result_state(value) is not None:
+        result["result_dimensions"] = coordination.result_projection(value)
+        if result["accepted"]:
+            try:coordination.validate_current_result(value)
+            except (TaskError,OSError,ValueError) as exc:
+                result["accepted"]=False
+                result["result_dimensions"]["current_result_error"]=str(exc)
+                result["result_dimensions"]["business_outcome"]="unverified"
     result["completion_scope"] = "this task only; not project or all-project completion"
     if value["spec"].get("project"):
         result["project_context"] = copy.deepcopy(value["spec"]["project"])
@@ -538,13 +550,22 @@ def checked_file(value, step_id, check):
         result,receipt=isolated_io('file',lambda:checked_file(value,step_id,check),check.get('timeout',FILE_SECONDS))
         return {**result,'io':receipt}
     started=time.monotonic();byte_limit=check.get('max_bytes',FILE_BYTES);total=0
-    step = next(s for s in value["spec"]["steps"] if s["id"] == step_id)
+    passive = step_id is None
+    step = ({"id": None, "checks": [check], "resources": []} if passive else
+            next(s for s in value["spec"]["steps"] if s["id"] == step_id))
     # Dependency closure belongs to the outer validation/acceptance decision.
     # Re-entering it inside every FD read recursively scans loaded artifacts
     # and floods this bounded worker's progress channel. Keep actual object
     # restrictions and peer effects checked on both sides of the read.
-    before = assessment(value, step_id, dependencies=False)
-    require(not before["blocked"], before["reason"] or "object constraint")
+    if passive:
+        # No borrowed step: this read is checked against its actual object.
+        # Preserve bounded workspace/path observation before opening its FD.
+        scope=file_scope(value["spec"],step)
+        require(not scope["file_identity_errors"], "passive evidence object identity unavailable")
+        before={"scope":scope}
+    else:
+        before = assessment(value, step_id, dependencies=False)
+        require(not before["blocked"], before["reason"] or "object constraint")
     path = cf.safe_path(value["spec"]["workspace"], check["path"])
     parts = Path(check["path"]).parts
     require(parts, "file check must name an ordinary file")
@@ -571,6 +592,7 @@ def checked_file(value, step_id, check):
         require(start.st_size<=byte_limit,'validation file exceeds declared byte budget')
         actual_scope = {"files": [str(path.resolve())], "file_objects": [{"device": start.st_dev, "inode": start.st_ino}]}
         require(not any(same_restricted_scope(h, step, actual_scope) for h in value.get("restrictions", [])), "opened descriptor matches retained object restriction")
+        coordination.check_passive_object(value,str(path.resolve()),start.st_dev,start.st_ino,step_id)
         hasher = hashlib.sha256()
         io_progress('read_target')
         while True:
@@ -588,8 +610,10 @@ def checked_file(value, step_id, check):
         current = os.stat(cf.safe_path(value["spec"]["workspace"], check["path"]), follow_symlinks=False)
         require((current.st_dev,current.st_ino,current.st_size,current.st_mtime_ns,current.st_ctime_ns) ==
                 (end.st_dev,end.st_ino,end.st_size,end.st_mtime_ns,end.st_ctime_ns), "file target changed after validation read")
-        after = assessment(value, step_id, dependencies=False)
-        require(not after["blocked"], after["reason"] or "object constraint after read")
+        coordination.check_passive_object(value,str(path.resolve()),end.st_dev,end.st_ino,step_id)
+        if not passive:
+            after = assessment(value, step_id, dependencies=False)
+            require(not after["blocked"], after["reason"] or "object constraint after read")
         actual = hasher.hexdigest()
         return {"actual_sha256": actual, "passed": actual == check["sha256"], "opened_object": actual_scope["file_objects"][0]}
     except FileNotFoundError:
@@ -868,7 +892,7 @@ def run(store, expected, max_turns=3):
         if not partition(value)["ready"]:
             break
         value = run_once(store, value["revision"])
-    if not value["accepted"] and all(s["state"] == "verified" for s in value["steps"].values()) and not value["spec"].get("review_required") and not value["spec"].get("load_required"):
+    if not value["accepted"] and all(s["state"] == "verified" for s in value["steps"].values()) and not value["spec"].get("review_required") and not value["spec"].get("load_required") and (coordination.result_state(value) is None or not coordination.result_state(value)["pending"]):
         value = change(store, {"operation": "accept", "expected_revision": value["revision"]})
     return value
 
@@ -926,7 +950,7 @@ def resume(store, max_turns=3):
                                   "error": "missing_native_identity_inspect_original_effect_no_replay"})
     if partition(value)["ready"]:
         value = run(store, value["revision"], max_turns)
-    elif not value["accepted"] and all(s["state"] == "verified" for s in value["steps"].values()) and not value["spec"].get("review_required") and not value["spec"].get("load_required"):
+    elif not value["accepted"] and all(s["state"] == "verified" for s in value["steps"].values()) and not value["spec"].get("review_required") and not value["spec"].get("load_required") and (coordination.result_state(value) is None or not coordination.result_state(value)["pending"]):
         value = change(store, {"operation": "accept", "expected_revision": value["revision"]})
     return value
 
@@ -937,12 +961,15 @@ def change(store, request):
     def apply(value):
         if operation == "amend":
             spec = specification(request.get("spec"))
+            prior_result = copy.deepcopy(coordination.result_state(value))
+            retained = {k:copy.deepcopy(v["continuation"]) for k,v in value["steps"].items() if v.get("continuation")}
+            require(set(retained) <= {s["id"] for s in spec["steps"]}, "amendment cannot drop original continuation steps")
             prior_spec = value["spec"]
             prior_workspace = value["spec"]["workspace"]
             prior_session = value["native_session_id"]
             old = {"input_revision": value["input_revision"], "acceptance_sha256": value["acceptance_sha256"], "spec": prior_spec,
                    "execution": value["execution"], "steps": value["steps"], "delivery": value["delivery"],
-                   "acceptance_observation": value.get("acceptance_observation")}
+                   "acceptance_observation": value.get("acceptance_observation"), "result_state": prior_result}
             value["history"].append({"superseded_input": old})
             value["input_revision"] += 1
             value["spec"] = spec
@@ -953,6 +980,8 @@ def change(store, request):
             value["delivery"] = {"sent": False, "read": False, "user_decision": None}
             value["steps"] = {s["id"]: {"state": "pending", "runs": 0, "session_id": None,
                                          "evidence": [], "validation": None, "wait": None} for s in spec["steps"]}
+            coordination.initialize_result(value,prior_result)
+            for key,checkpoint in retained.items():value["steps"][key]["continuation"]=checkpoint
             # A new acceptance version changes criteria, not an existing refusal
             # or unresolved producer. Preserve the actual affected scope, also
             # when a file-effect step is renamed or its expected bytes change.
@@ -990,6 +1019,12 @@ def change(store, request):
                         step["unresolved_execution"] = held_execution
             value["execution"] = None
             value["native_session_id"] = prior_session if old["execution"] is None and spec["workspace"] == prior_workspace else None
+        elif operation == "checkpoint":
+            coordination.checkpoint(value,request)
+        elif operation == "continue":
+            coordination.continue_original(value,request)
+        elif operation in ("collect-result", "review-result"):
+            coordination.collect_result(value,{"path":request.get("path"),"sha256":request.get("sha256")},review=operation=="review-result")
         elif operation == "block":
             key = request.get("step")
             require(key in value["steps"] and text(request.get("condition")) and text(request.get("evidence_ref")), "block needs step, exact condition and evidence")
@@ -1093,6 +1128,10 @@ def change(store, request):
             value["loaded"] = {"revision": revision, "tree": tree, "manifest_sha256": active["manifest_sha256"],
                                "review_sha256": value["review"]["sha256"], "task_input_sha256": value["acceptance_sha256"]}
         elif operation == "accept":
+            coordination.validate_current_result(value)
+            result_state=coordination.result_state(value)
+            require(result_state is None or not result_state["pending"], "original user obligations remain; finite program PASS is insufficient")
+            require(not any(s.get("continuation") and not s["continuation"]["resolved"] for s in value["steps"].values()), "original continuation outcome/effect remains unresolved")
             require(value["execution"] is None, "execution still unresolved")
             observations = enforce_constraints(value, "accept")
             require(not any(o["blocked"] for o in observations.values()), "current object constraints prevent acceptance")
@@ -1191,7 +1230,7 @@ def observe_external(store, expected, reference):
             current["execution"] = None
         value = execution_update(store, value["revision"], selected["id"], consume)
         if value["steps"][key]["state"] != "verified":return value
-    if not value["spec"].get("review_required") and not value["spec"].get("load_required"):
+    if not value["spec"].get("review_required") and not value["spec"].get("load_required") and (coordination.result_state(value) is None or not coordination.result_state(value)["pending"]):
         value = change(store, {"operation": "accept", "expected_revision": value["revision"]})
     return value
 
@@ -1218,7 +1257,7 @@ def dispatch(codex_home):
             value = run(store, request.get("expected_revision"), request.get("max_turns", 3))
         elif operation == "resume":
             value = resume(store, request.get("max_turns", 3))
-        elif operation in ("amend", "block", "approval", "delivery", "reconcile", "review", "accept"):
+        elif operation in ("amend", "block", "approval", "delivery", "reconcile", "review", "accept", "checkpoint", "continue", "collect-result", "review-result"):
             value = change(store, request)
         elif operation == "verify-effects":
             value = observe_external(store, request.get("expected_revision"), {"path": request.get("path"), "sha256": request.get("sha256")})
