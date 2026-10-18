@@ -128,6 +128,18 @@ python3 /path/to/codex-framework/scripts/codex_framework.py install \
 
 工作方默认沿用现有配置和账户，不新建 API、凭据、付费方式，不代工具批准。只有本任务据实际官方能力选定时才显式登记 `native_model`、`native_reasoning_effort`；不静默换模型或重试不支持名称。成功退出0；`run/resume` 未验收退出2并返回下一动作或具体等待；输入、冲突或必需验证失败退出1。`status` 返回当前约束投影及验收观察，不能把源码、安装或一次回合结束当作整体实际闭环。
 
+### 项目职责和多任务接续
+
+既有单任务 spec 继续使用。需要多项目协同时，模型按项目来源补 `project={id,goal,responsibility,source_ref,obligations:[{id,acceptance,task_ids}]}` 与 `assignment={owner,role,delivery_owner,covers}`；role 为 implementation、investigation、verification、integration、final_regression 或 coordination。`request_identity={thread_id,turn_id,message_id}` 绑定本轮选定原生输入。它们不证明授权或来源原件真实；旧 PASS 不能替代当前任务输入。`verify-return` 读取 workspace 内给定 path/sha256 的报告，核对 request_id/task_id/project_id/input_revision/task_input_sha256 及适用原生身份，只回报关联状态，不签收项目。
+
+步骤可用 `depends_on_basis` 表明已有箭头的来源状态。单边可给 `{status,source_ref,reason}`，多边按依赖 ID 映射；显式 hypothesis/unknown 不成为硬阻断。跨任务 `requires=[{task_id,step_id,input_sha256,basis}]` 只阻断依赖准确结果的消费者；step_id=null 表示整个已验任务，否则只消费指定已验步骤。未知来源先查证，不抹去原动作拒绝。步骤 `resources=[{kind,identity,object,mode,operation,source_ref}]` 声明具体效果：file 的 identity 是 workspace 内相对路径，logical 使用已知非敏感资源身份和对象层次；mode 为 read/write/exclusive，操作名独立保存。兼容读取可共享，不同逻辑对象不因同属一库阻断；exclusive 仅覆盖声明对象及子对象。未显式覆盖的文件输出检查按可能写输出登记。原生工具仍执行其权限与确认，关系字段不授权读秘密或绕过拒绝。
+
+`coordinate` 接收明确 `task_ids`，只读回收原记录、项目义务、依赖和占用；不枚举其他任务，不创建第二总台账。`work` 再给逐项 `expected_revisions`、max_turns1–4，在已有授权与当前关系下轮转执行可做项；错误留在原任务，其他独立任务继续。它不会自动取得消息、系统修改或模型用量授权，未调用不宣称后台推进。内部 `.effects` 元数据只用于原执行/未知效果/拒绝的占用，不保存业务待办，也不以换任务解除原限制。
+
+已有外部任务成果可在登记时选 `execution_mode:"external"`，保留原执行方，使用 `verify-effects`（task_id、expected_revision、path、sha256）核验当前返回和已登记的实际文件；不再启动模型，也不伪造 native worker 或增加模型 runs。返回 JSON 须绑定 request_id、task_id、input_revision、task_input_sha256，已声明 project/request_identity 时一并完全相等；verdict 只能 PASS、FAIL、NOT_RUN。此入口只接受被动 file 检查，不接受任意命令并将其自称为读；已获准的验证由原任务沿原工具完成，再核验实际文件。PASS 仍须真实物理检查通过，历史拒绝或未知在途执行不能由该入口清除。`verify-return` 只核当前返回身份，不验收成果；原协调核原生来源，填写身份不能认证来源或授予权限。`work` 对此类任务只在 observations 提供该 task 的 `{path,sha256}` 时核验。未选此模式的既有任务继续沿原 run/resume；外部模式禁止模型 run/resume。
+
+最终收口由 `finalization={components,integration,regression,tracking,regression_report:{path,sha256},tracking_file:{path,sha256}}` 绑定现有任务。三类后续角色各有原责任：分项独验后集成，实际加载同一明确发布集合，再独立跨线总回归，最后更新原唯一清单。integration 与 final_regression 的 `artifact={manifest,sha256,versions}` 相同；versions 各项为 `{project_id,repo,ref,commit,tree}`，repo/manifest 相对该任务 workspace。manifest 内容为 `{versions,files:[{project_id,source,loaded,sha256}]}`，逐项核当前 Git ref、tree、source blob 和实际 loaded 文件，缺件不通过。它只验证声明的加载范围，业务部署完整性仍由项目契约和独验负责。最终报告须为当前回归任务身份、PASS、artifact_sha256、component_inputs 精确映射和独立 reviewer_thread；tracking 必须有原清单当前文件哈希验收。依赖版本改变、任务遗漏、旧报告或任何阶段未验，overall_complete 都保持 false。没有 finalization 时仅展示局部进展，不能把全部选中任务 PASS 当总体完结。
+
 ## Codex 云端执行环境
 
 以下是可选执行环境的部署方式。GitHub 仍持有共享框架；Mac mini 直接访问 GitHub 时无需先更新或启动这些环境。

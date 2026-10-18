@@ -154,3 +154,12 @@ rebuild 需要当前契约可重建、当前数据无需保留、重建来源、
 ## 持久执行与即时检查的边界
 
 `check` 继续只核已给输入关系，不持有任务。用户明确采用持久执行时，正式 `codex-framework task` 入口负责登记、版本提交、原生运行结果后的必经验证、有界接续与恢复，方法见核心仓 README 的“持久任务执行入口”。节点保存当前需求/验收、执行身份、结果及下一步；模型维护记录，不要求用户填写。没有调用该入口、当前宿主不能接入或原生权限/确认仍缺时，分别保留未采用和具体阻塞，不能以源码/安装通过冒签实际闭环；独立工作继续。
+
+
+## 项目关系与最终收口
+
+持久 `task` 可保留项目 goal/responsibility/obligations、assignment owner/role/delivery_owner/covers 和原生 request_identity。模型从项目与当前请求原件维护，不以自报身份扩大授权。原任务状态和 `accepted` 只覆盖该任务；`coordinate`/`work` 按明确 task_ids 查看义务遗漏、真实依赖及当前可做项。命令 `depends_on` 旧输入保持原控制顺序；显式 depends_on_basis 的 hypothesis/unknown 只作为查证线索，不成为硬依赖。跨任务 requires 的 proven 关系必须有准确任务、输入版本、来源与消费者原因；源码关系不能认证来源正文或授权本身。
+
+已登记文件输出及显式逻辑资源使用有界占用元数据协调；索引不持有项目待办，不能按项目/数据库标签制造全局停工。历史拒绝沿原对象效果保存；普通资源共享、兼容读和离线工作分别判断。无原生真实调用的确定性回归只证明程序分流。
+
+finalization 关联当前 components→integration→实际合并/加载 artifact→独立 final_regression→coordination 原清单更新。统一 artifact 逐项绑定项目 Git ref/commit/tree 与实际加载文件；最终报告必须对应本轮 task/request/input、同一 artifact 和当前分项输入。缺合并、实际加载、总回归或原清单文件效果时，三个局部 PASS 不能令 overall_complete 为真。当前请求报告可用 verify-return 核对，旧报告不能仅换任务标题后回收。

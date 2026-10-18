@@ -22,8 +22,9 @@ FORMAT = 1
 INPUT_CONTRACT = 1
 MODULES = ("codex_framework.py", "execution_check.py", "framework_refresh.py",
            "source_evidence.py", "workstation_check.py", "workstation_entry.py",
-           "framework_runtime.py", "task_runtime.py", "task_worker.py")
-LEGACY_MODULES = MODULES[:-2]
+           "framework_runtime.py", "task_runtime.py", "task_worker.py", "task_coordination.py")
+LEGACY_MODULES = MODULES[:7]
+SUPPORTED_MODULES = (LEGACY_MODULES, MODULES[:9], MODULES)
 SHA = re.compile(r"[0-9a-f]{40}\Z")
 
 
@@ -40,7 +41,7 @@ def declared_modules(raw):
         value = ast.literal_eval(declarations[0].value) if len(declarations) == 1 else None
     except (ValueError, TypeError):
         value = None
-    if value not in (MODULES, LEGACY_MODULES):
+    if value not in SUPPORTED_MODULES:
         raise cf.SyncError("候选模块闭包不兼容")
     return value
 
@@ -128,7 +129,7 @@ def validate(directory, expected_hash=None):
     if not isinstance(m, dict):
         raise cf.SyncError("运行包 manifest 必须是对象")
     required = set(m.get("files", {})) if isinstance(m.get("files"), dict) else set()
-    closures = [{"scripts/" + n for n in names} | {"snapshot.json"} for names in (MODULES, LEGACY_MODULES)]
+    closures = [{"scripts/" + n for n in names} | {"snapshot.json"} for names in SUPPORTED_MODULES]
     if (type(m.get("version")) is not int or type(m.get("input_contract")) is not int
             or m.get("version") != FORMAT or m.get("input_contract") != INPUT_CONTRACT
             or m.get("source") != cf.REMOTE or m.get("branch") != cf.BRANCH
@@ -260,7 +261,7 @@ def pointer_value(value):
 def manifest_value(value, revision):
     m = object_value(value, "runtime manifest")
     names = set(m.get("files", {})) if isinstance(m.get("files"), dict) else set()
-    closures = [{"scripts/" + name for name in group} | {"snapshot.json"} for group in (MODULES, MODULES[:-2])]
+    closures = [{"scripts/" + name for name in group} | {"snapshot.json"} for group in (MODULES[:7], MODULES[:9], MODULES)]
     if (type(m.get("version")) is not int or m["version"] != 1
             or type(m.get("input_contract")) is not int or m["input_contract"] != 1
             or m.get("revision") != revision or not isinstance(m.get("files"), dict)
@@ -334,7 +335,7 @@ def main():
             modules = ast.literal_eval(declarations[0].value) if len(declarations)==1 else None
         except (SyntaxError, ValueError, TypeError) as exc:
             raise ValueError("invalid runtime module declaration") from exc
-        if modules not in (MODULES, MODULES[:-2]) or {"scripts/" + n for n in modules} | {"snapshot.json"} != names:
+        if modules not in (MODULES[:7], MODULES[:9], MODULES) or {"scripts/" + n for n in modules} | {"snapshot.json"} != names:
             raise ValueError("runtime manifest/source closure mismatch")
         sys.path.insert(0, str(directory / "scripts"))
         sys.dont_write_bytecode = True

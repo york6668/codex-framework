@@ -1,0 +1,482 @@
+"""Project context and scoped relationships for the existing task runtime.
+
+These declarations identify work, not permissions. The effect index contains
+only live/uncertain reservations and retained refusals, never a second todo list.
+"""
+from contextlib import contextmanager
+from contextvars import ContextVar
+import copy
+import fcntl
+import functools
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import stat
+import subprocess
+import time
+
+ROOT=ContextVar('task_coordination_root',default=None)
+LOCKED=ContextVar('task_effect_index_locked',default=False)
+WORKSET=ContextVar('task_coordination_workset',default=())
+ROLES={'implementation','investigation','verification','integration','final_regression','coordination'}
+MODES={'read','write','exclusive'}
+
+def task():
+    import task_runtime
+    return task_runtime
+
+def need(ok,reason):task().require(ok,reason)
+
+def identifier(value):return isinstance(value,str) and bool(task().ID.fullmatch(value))
+
+def hashes(value):return isinstance(value,str) and bool(task().SHA.fullmatch(value))
+
+def text(value):return task().text(value)
+
+@contextmanager
+def context(root,workset=None):
+    token=ROOT.set(Path(root));other=WORKSET.set(tuple(workset)) if workset is not None else None
+    try:yield
+    finally:
+        if other is not None:WORKSET.reset(other)
+        ROOT.reset(token)
+
+def scoped(function):
+    @functools.wraps(function)
+    def call(store,*args,**kwargs):
+        with context(store.root):return function(store,*args,**kwargs)
+    return call
+
+def relative(value,label):
+    need(isinstance(value,str) and value and not Path(value).is_absolute() and '..' not in Path(value).parts,'invalid '+label)
+
+def basis(value):
+    need(isinstance(value,dict) and set(value)<={'status','source_ref','reason'},'invalid dependency basis')
+    need(value.get('status') in ('proven','hypothesis','unknown'),'invalid dependency basis status')
+    if value['status']=='proven':need(text(value.get('source_ref')) and text(value.get('reason')),'proven dependency needs its source and consumer reason')
+
+def local_dependencies(step):
+    edges=step.get('depends_on',[]);declared=step.get('depends_on_basis')
+    if declared is None:return edges
+    need(isinstance(declared,dict),'invalid depends_on_basis')
+    if 'status' in declared:
+        need(len(edges)<=1,'single dependency basis requires at most one edge');basis(declared)
+        return edges if declared['status']=='proven' else []
+    need(set(declared)<=set(edges),'dependency basis names unknown edge')
+    for value in declared.values():basis(value)
+    return [edge for edge in edges if edge not in declared or declared[edge]['status']=='proven']
+
+def validate(spec):
+    p=spec.get('project');assignment=spec.get('assignment')
+    need(p is None or assignment is not None,'project context needs an assignment')
+    need(spec.get('execution_mode','native') in ('native','external'),'invalid task execution mode')
+    if p is not None:
+        need(isinstance(p,dict) and set(p)=={'id','goal','responsibility','source_ref','obligations'},'invalid project context')
+        need(identifier(p['id']) and all(text(p[k]) for k in ('goal','responsibility','source_ref')),'project goal/responsibility/source missing')
+        need(isinstance(p['obligations'],list) and 0<len(p['obligations'])<=32,'invalid project obligations')
+        seen=set()
+        for item in p['obligations']:
+            need(isinstance(item,dict) and set(item)=={'id','acceptance','task_ids'},'invalid project obligation')
+            need(identifier(item['id']) and item['id'] not in seen and text(item['acceptance']),'invalid obligation identity/acceptance')
+            ids=item['task_ids'];need(isinstance(ids,list) and 0<len(ids)<=32 and all(identifier(x) for x in ids) and len(set(ids))==len(ids),'invalid obligation task membership');seen.add(item['id'])
+        need(isinstance(assignment,dict) and set(assignment)=={'owner','role','delivery_owner','covers'},'invalid task assignment')
+        need(text(assignment['owner']) and text(assignment['delivery_owner']) and isinstance(assignment['role'],str) and assignment['role'] in ROLES,'invalid assignment responsibility')
+        need(isinstance(assignment['covers'],list) and assignment['covers'] and all(identifier(x) and x in seen for x in assignment['covers']) and len(set(assignment['covers']))==len(assignment['covers']),'assignment must cover declared obligations')
+    if p is None and assignment is not None:
+        need(isinstance(assignment,dict) and set(assignment)=={'owner','role','delivery_owner','covers'},'invalid cross-project assignment')
+        need(text(assignment['owner']) and text(assignment['delivery_owner']) and isinstance(assignment['role'],str) and assignment['role'] in ROLES and assignment['covers']==[],'invalid cross-project responsibility')
+    if spec.get('execution_mode')=='external':
+        need(all(c['kind']=='file' for step in spec['steps'] for c in step['checks']),'external effect collection only supports passive file checks; run authorized verification separately in its original task')
+    identity=spec.get('request_identity')
+    if identity is not None:
+        need(isinstance(identity,dict) and set(identity)=={'thread_id','turn_id','message_id'} and all(text(v) for v in identity.values()),'invalid current native request identity')
+    peers=spec.get('known_tasks',[])
+    need(isinstance(peers,list) and len(peers)<=32 and all(identifier(v) for v in peers) and len(set(peers))==len(peers),'invalid known task references')
+    requires=spec.get('requires',[])
+    need(isinstance(requires,list) and len(requires)<=32,'invalid cross-task dependencies')
+    for item in requires:
+        need(isinstance(item,dict) and set(item)=={'task_id','step_id','input_sha256','basis'},'invalid cross-task dependency')
+        need(identifier(item['task_id']) and (item['step_id'] is None or identifier(item['step_id'])) and hashes(item['input_sha256']),'invalid dependency identity/version');basis(item['basis'])
+    for step in spec['steps']:
+        local_dependencies(step)
+        resources=step.get('resources',[])
+        need(isinstance(resources,list) and len(resources)<=32,'invalid declared resources')
+        for resource in resources:
+            need(isinstance(resource,dict) and set(resource)=={'kind','identity','object','mode','operation','source_ref'},'invalid resource descriptor')
+            need(resource['kind'] in ('file','logical') and isinstance(resource['mode'],str) and resource['mode'] in MODES and identifier(resource['operation']) and text(resource['source_ref']),'invalid resource effect/source')
+            need(text(resource['identity']) and isinstance(resource['object'],str) and len(resource['object'])<=1024,'invalid resource identity/object')
+            if resource['kind']=='file':relative(resource['identity'],'resource file path');need(resource['object']=='','file object must use its path identity')
+            else:need(not resource['object'].startswith('/') and '..' not in resource['object'].split('/'),'invalid logical object path')
+    artifact=spec.get('artifact')
+    if artifact is not None:
+        need(isinstance(artifact,dict) and set(artifact)=={'manifest','sha256','versions'},'invalid delivery artifact')
+        relative(artifact['manifest'],'loaded manifest path');need(hashes(artifact['sha256']),'invalid loaded manifest fingerprint')
+        need(isinstance(artifact['versions'],list) and 0<len(artifact['versions'])<=16,'invalid release versions')
+        ids=set()
+        for v in artifact['versions']:
+            need(isinstance(v,dict) and set(v)=={'project_id','repo','ref','commit','tree'},'invalid release version')
+            need(identifier(v['project_id']) and v['project_id'] not in ids,'duplicate release project');ids.add(v['project_id']);relative(v['repo'],'release repository')
+            need(isinstance(v['ref'],str) and v['ref'].startswith('refs/heads/') and not any(c in v['ref'] for c in '\n\r\x00 '),'invalid release target ref')
+            need(all(isinstance(v[k],str) and re.fullmatch('[0-9a-f]{40}',v[k]) for k in ('commit','tree')),'invalid immutable release identity')
+
+def membership(value):
+    p=value['spec'].get('project')
+    if p:
+        selected=[o for o in p['obligations'] if o['id'] in value['spec']['assignment']['covers']]
+        need(all(value['task_id'] in o['task_ids'] for o in selected),'task assignment does not belong to declared project obligation')
+
+def resources(value,step,scope=None):
+    spec=value['spec'];declared=step.get('resources')
+    if declared is None:
+        declared=[]
+    declared=copy.deepcopy(declared)
+    explicit_files={r['identity'] for r in declared if r['kind']=='file'}
+    declared += [{'kind':'file','identity':c['path'],'object':'','mode':'write','operation':'write','source_ref':'registered file-output acceptance target'} for c in step['checks'] if c['kind']=='file' and c['path'] not in explicit_files]
+    result=[]
+    for original in declared:
+        item=copy.deepcopy(original)
+        if item['kind']=='file':
+            # Filesystem identity comes from the bounded captured scope below.
+            # Do not resolve/stat the target again outside that IO budget.
+            item['identity']=os.path.abspath(Path(spec['workspace'])/item['identity'])
+            original=next((t for t in (scope or {}).get('targets',[]) if t['path']==item['identity'] and t.get('exists') and t.get('inode',0)>0),None)
+            if original:item['object_identity']={'device':original['device'],'inode':original['inode']}
+        result.append(item)
+    return result
+
+def overlaps(a,b):
+    if a['kind']!=b['kind']:return False
+    if a['kind']=='file':
+        if a['identity']==b['identity']:return True
+        identities=[]
+        for item in (a,b):
+            retained=item.get('object_identity')
+            if retained:identities.append((retained['device'],retained['inode']));continue
+            try:
+                info=os.stat(item['identity'],follow_symlinks=False)
+                identities.append((info.st_dev,info.st_ino) if info.st_ino>0 else None)
+            except OSError:identities.append(None)
+        if identities[0] is not None and identities[0]==identities[1]:return True
+        try:
+            x=os.stat(a['identity'],follow_symlinks=False);y=os.stat(b['identity'],follow_symlinks=False)
+            return x.st_ino>0 and (x.st_dev,x.st_ino)==(y.st_dev,y.st_ino)
+        except OSError:return False
+    if a['identity']!=b['identity']:return False
+    if a['object']==b['object']:return True
+    return ((a['mode']=='exclusive' and (not a['object'] or b['object'].startswith(a['object']+'/'))) or
+            (b['mode']=='exclusive' and (not b['object'] or a['object'].startswith(b['object']+'/'))))
+
+def incompatible(a,b,denial=False):
+    if not overlaps(a,b):return False
+    if denial:
+        # Operation names are caller labels, not permission distinctions.
+        # Retain the observed read/change category on the actual object.
+        return a['operation']=='legacy_unknown' or (a['mode']=='read')==(b['mode']=='read')
+    return a['mode']!='read' or b['mode']!='read'
+
+def index_path(root):return task().cf.safe_path(root,'.effects.json')
+
+def read_index(root):
+    path=index_path(root)
+    try:fd=os.open(path,os.O_RDONLY|getattr(os,'O_NONBLOCK',0)|getattr(os,'O_NOFOLLOW',0))
+    except FileNotFoundError:return []
+    try:
+        info=os.fstat(fd);need(stat.S_ISREG(info.st_mode) and info.st_size<=1048576,'effect reservation index must be bounded regular data')
+        raw=b''
+        while len(raw)<=1048576:
+            chunk=os.read(fd,min(65536,1048577-len(raw)))
+            if not chunk:break
+            raw+=chunk
+        need(len(raw)<=1048576,'effect reservation index size bound')
+    finally:os.close(fd)
+    value=json.loads(raw);need(isinstance(value,dict) and set(value)=={'version','entries'} and value['version']==1 and isinstance(value['entries'],list) and len(value['entries'])<=256,'invalid effect reservation index')
+    for e in value['entries']:
+        need(isinstance(e,dict) and set(e)=={'task_id','execution_id','state','resources','source_ref'} and identifier(e['task_id']) and isinstance(e['resources'],list) and e['state'] in ('active','uncertain','denial'),'invalid effect reservation entry')
+        for item in e['resources']:
+            need(isinstance(item,dict) and {'kind','identity','object','mode','operation','source_ref'}<=set(item)<={'kind','identity','object','mode','operation','source_ref','object_identity'},'invalid stored resource effect')
+            need(item['kind'] in ('file','logical') and isinstance(item['mode'],str) and item['mode'] in MODES and text(item['identity']) and isinstance(item['object'],str) and identifier(item['operation']),'invalid stored effect identity/mode')
+            if 'object_identity' in item:
+                original=item['object_identity'];need(item['kind']=='file' and isinstance(original,dict) and set(original)=={'device','inode'} and all(type(v) is int and v>=0 for v in original.values()) and original['inode']>0,'invalid retained file object identity')
+    return value['entries']
+
+@contextmanager
+def index_lock(root):
+    root=Path(root);root.mkdir(parents=True,exist_ok=True)
+    fd=os.open(task().cf.safe_path(root,'.effects.lock'),os.O_CREAT|os.O_RDWR|getattr(os,'O_NOFOLLOW',0),0o600)
+    token=None
+    try:
+        need(stat.S_ISREG(os.fstat(fd).st_mode),'effect index lock is not a regular file')
+        until=time.monotonic()+2
+        while True:
+            try:fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB);break
+            except BlockingIOError:
+                need(time.monotonic()<until,'effect reservation update is busy; keep its original owner')
+                time.sleep(.01)
+        token=LOCKED.set(True);yield
+    finally:
+        if token is not None:LOCKED.reset(token)
+        os.close(fd)
+
+def own_entries(value):
+    result=[];specs={s['id']:s for s in value['spec']['steps']};execution=value.get('execution')
+    if execution:
+        effects=resources(value,specs[execution['step']],execution.get('dispatch_scope'))
+        if execution.get('producer_kind')=='external_observation':
+            effects=[dict(e,mode='read',operation='read') for e in effects]
+        result.append({'task_id':value['task_id'],'execution_id':execution['id'],'state':'active','resources':effects,'source_ref':'current durable execution'})
+    for name,state in value['steps'].items():
+        unresolved=state.get('unresolved_execution')
+        if state['state'] in ('running','blocked','reconcile') and unresolved and not(execution and unresolved['id']==execution['id']):
+            result.append({'task_id':value['task_id'],'execution_id':unresolved['id'],'state':'uncertain','resources':resources(value,specs[name],unresolved.get('dispatch_scope')),'source_ref':(state.get('wait') or {}).get('source_ref','unresolved original effect')})
+    for hold in value.get('restrictions',[]):
+        effects=hold.get('resource_effects')
+        if effects is None:
+            effects=[]
+            for path in hold['files']:
+                item={'kind':'file','identity':path,'object':'','mode':'write','operation':'legacy_unknown','source_ref':'retained original file restriction'}
+                original=next((t for t in hold.get('targets',[]) if t['path']==path and t.get('exists') and t.get('inode',0)>0),None)
+                if original:item['object_identity']={'device':original['device'],'inode':original['inode']}
+                effects.append(item)
+        result.append({'task_id':value['task_id'],'execution_id':task().digest(task().encoded(hold)),'state':'denial','resources':effects,'source_ref':hold['wait'].get('source_ref') or hold['wait'].get('evidence_ref') or 'retained original restriction'})
+    return [x for x in result if x['resources']]
+
+def sync_index(store,value):
+    own=own_entries(value)
+    if not own and not index_path(store.root).exists():return
+    def write():
+        entries=[e for e in read_index(store.root) if e['task_id']!=value['task_id']]+own
+        need(len(entries)<=256,'effect reservation capacity reached; resolve originals, do not evict')
+        task().cf.write_file(index_path(store.root),task().encoded({'version':1,'entries':entries}))
+    if LOCKED.get():write()
+    else:
+        with index_lock(store.root):write()
+
+def effect_conflicts(value,step):
+    root=ROOT.get()
+    if root is None:return []
+    wanted=resources(value,step)
+    if value['spec'].get('execution_mode')=='external':wanted=[dict(e,mode='read',operation='read') for e in wanted]
+    if not wanted:return []
+    def inspect():
+        matches=[]
+        entries=read_index(root)
+        known=set(value['spec'].get('known_tasks',[]))|set(WORKSET.get())
+        for identity in sorted(known-{value['task_id']}):
+            try:entries+=own_entries(peer(root,identity))
+            except (task().TaskError,OSError,ValueError):continue
+        for entry in entries:
+            if entry['task_id']==value['task_id']:continue
+            if any(incompatible(old,new,entry['state']=='denial') for old in entry['resources'] for new in wanted):
+                matches.append({'kind':'retained_refusal' if entry['state']=='denial' else 'occupied_effect','task_id':entry['task_id'],'execution_id':entry['execution_id'],'source_ref':entry['source_ref'],'state':entry['state']})
+        return matches
+    try:return task().isolated_io('effect_conflict_metadata',inspect,2)[0]
+    except (task().TaskError,OSError) as exc:return [{'kind':'effect_identity_unknown','detail':str(exc),'source_ref':'effect reservation metadata'}]
+
+def peer(root,identity):
+    return task().isolated_io('related_task_metadata',lambda:task().Store(Path(root).parent,identity).read(),2)[0]
+
+def dependency_gaps(value,trail=()):
+    root=ROOT.get();gaps=[]
+    if value['task_id'] in trail:return [{'kind':'dependency_cycle','task_id':value['task_id']}]
+    need(len(trail)<=32,'dependency graph depth bound')
+    for edge in value['spec'].get('requires',[]):
+        if edge['basis']['status']!='proven':continue
+        base={'task_id':edge['task_id'],'step_id':edge['step_id'],'source_ref':edge['basis']['source_ref'],'reason':edge['basis']['reason']}
+        if root is None:gaps.append(dict(base,kind='related_task_context_missing'));continue
+        try:other=peer(root,edge['task_id'])
+        except (task().TaskError,OSError,ValueError) as exc:gaps.append(dict(base,kind='dependency_not_observed',detail=str(exc)));continue
+        if other['acceptance_sha256']!=edge['input_sha256']:gaps.append(dict(base,kind='dependency_version_changed'));continue
+        nested=dependency_gaps(other,trail+(value['task_id'],))
+        if nested:gaps.append(dict(base,kind='upstream_dependency_unresolved',upstream=nested));continue
+        names=[edge['step_id']] if edge['step_id'] else list(other['steps'])
+        if any(n not in other['steps'] or other['steps'][n]['state']!='verified' for n in names) or (edge['step_id'] is None and not other['accepted']):
+            gaps.append(dict(base,kind='required_result_not_accepted'));continue
+        if other['spec'].get('artifact'):
+            try:artifact(other)
+            except (task().TaskError,OSError,ValueError) as exc:
+                gaps.append(dict(base,kind='loaded_dependency_changed',detail=str(exc)));continue
+        for name in names:
+            state=other['steps'][name];checked=state.get('validation') or {}
+            if checked.get('acceptance_sha256')!=other['acceptance_sha256'] or not checked.get('passed') or task().assessment(other,name,checked.get('scope_after'),related=False)['blocked']:
+                gaps.append(dict(base,kind='required_result_stale'));break
+    return gaps
+
+def related(value,step):return dependency_gaps(value)+effect_conflicts(value,step)
+
+def prompt(value):
+    spec=value['spec'];project=spec.get('project')
+    if project is None and not spec.get('assignment') and not spec.get('request_identity'):return ''
+    identity={'request_id':spec['request_id'],'task_id':value['task_id'],'input_revision':value['input_revision'],'acceptance_sha256':value['acceptance_sha256'],'native_request':spec.get('request_identity')}
+    return '\nCurrent request identity: '+json.dumps(identity,ensure_ascii=False)+'\nProject goal/responsibility: '+json.dumps(project,ensure_ascii=False)+'\nThis assignment: '+json.dumps(spec.get('assignment'),ensure_ascii=False)+'\nDeclared input relationships: '+json.dumps(spec.get('requires',[]),ensure_ascii=False)+'\nThese facts do not grant permissions. Answer this current request and assigned deliverables; an older PASS or another project result is not its acceptance.'
+
+def bound_report(value,report):
+    need(isinstance(report,dict),'report must be an object')
+    expected={'request_id':value['spec']['request_id'],'task_id':value['task_id'],'input_revision':value['input_revision'],'task_input_sha256':value['acceptance_sha256']}
+    if value['spec'].get('project'):expected['project_id']=value['spec']['project']['id']
+    if value['spec'].get('request_identity'):expected['request_identity']=value['spec']['request_identity']
+    need(all(type(report.get(k)) is type(v) and report[k]==v for k,v in expected.items()),'report does not answer current project/task/native request/input')
+    return expected
+
+def read_json(workspace,path,fingerprint):
+    relative(path,'evidence path');need(hashes(fingerprint),'invalid evidence fingerprint')
+    def read():
+        target=task().cf.safe_path(workspace,path)
+        fd=os.open(target,os.O_RDONLY|getattr(os,'O_NONBLOCK',0)|getattr(os,'O_NOFOLLOW',0))
+        try:
+            info=os.fstat(fd);need(stat.S_ISREG(info.st_mode) and info.st_size<=task().LIMIT,'evidence must be a bounded ordinary file')
+            raw=b''
+            while len(raw)<=task().LIMIT:
+                chunk=os.read(fd,min(65536,task().LIMIT+1-len(raw)))
+                if not chunk:break
+                raw+=chunk
+            need(len(raw)<=task().LIMIT and task().digest(raw)==fingerprint,'evidence bytes changed')
+            value=json.loads(raw);need(isinstance(value,dict),'evidence must be an object');return value
+        finally:os.close(fd)
+    return task().isolated_io('project_evidence',read,3)[0]
+
+def artifact(value):
+    declared=value['spec'].get('artifact')
+    if declared is None:return None
+    workspace=value['spec']['workspace'];manifest=read_json(workspace,declared['manifest'],declared['sha256'])
+    need(set(manifest)=={'versions','files'} and manifest['versions']==declared['versions'],'loaded artifact version set mismatch')
+    files=manifest['files'];need(isinstance(files,list) and 0<len(files)<=64,'invalid loaded artifact closure')
+    projects={v['project_id']:v for v in declared['versions']};seen=set();covered=set()
+    for version in declared['versions']:
+        repo=task().cf.safe_path(workspace,version['repo'])
+        for argv,expected in [(['git','-C',str(repo),'show-ref','--verify','--hash',version['ref']],version['commit']),(['git','-C',str(repo),'rev-parse',version['commit']+'^{tree}'],version['tree'])]:
+            observed=task().checked_command(workspace,{'kind':'command','argv':argv,'timeout':3,'max_output_bytes':4096})
+            need(observed['passed'] and observed['stdout_sha256']==task().digest((expected+'\n').encode()),'merged source ref/tree does not match delivery')
+    for item in files:
+        need(isinstance(item,dict) and set(item)=={'project_id','source','loaded','sha256'} and item['project_id'] in projects and hashes(item['sha256']),'invalid loaded file mapping')
+        relative(item['source'],'source artifact path');relative(item['loaded'],'loaded artifact path');need(item['loaded'] not in seen,'duplicate loaded destination');seen.add(item['loaded']);covered.add(item['project_id'])
+        version=projects[item['project_id']];repo=task().cf.safe_path(workspace,version['repo'])
+        blob=task().checked_command(workspace,{'kind':'command','argv':['git','-C',str(repo),'cat-file','blob',version['commit']+':'+item['source']],'timeout':3,'max_output_bytes':task().FILE_BYTES})
+        need(blob['passed'] and blob['stdout_sha256']==item['sha256'],'merged source artifact mismatch')
+        checked=task().checked_file(value,value['spec']['steps'][0]['id'],{'kind':'file','path':item['loaded'],'sha256':item['sha256'],'timeout':3})
+        need(checked['passed'],'actual loaded file differs from merged source')
+    need(covered==set(projects),'release part has no actual loaded file evidence')
+    return {'sha256':declared['sha256'],'versions':declared['versions'],'loaded_files':len(files)}
+
+def project_view(values,errors):
+    projects={}
+    for value in values.values():
+        p=value['spec'].get('project')
+        if not p:continue
+        result=projects.setdefault(p['id'],{'goal':p['goal'],'responsibility':p['responsibility'],'obligations':{},'gaps':[],'complete':False})
+        if (result['goal'],result['responsibility'])!=(p['goal'],p['responsibility']):result['gaps'].append({'kind':'project_context_disagrees','task_id':value['task_id']})
+        for obligation in p['obligations']:
+            old=result['obligations'].get(obligation['id'])
+            if old and old['acceptance']!=obligation['acceptance']:result['gaps'].append({'kind':'obligation_criteria_disagree','obligation':obligation['id']})
+            item=result['obligations'].setdefault(obligation['id'],{'acceptance':obligation['acceptance'],'task_ids':[]})
+            item['task_ids']=sorted(set(item['task_ids'])|set(obligation['task_ids']))
+    for identity,result in projects.items():
+        for name,obligation in result['obligations'].items():
+            for member in obligation['task_ids']:
+                value=values.get(member)
+                if value is None:result['gaps'].append({'kind':'required_task_missing','obligation':name,'task_id':member,'detail':errors.get(member)});continue
+                p=value['spec'].get('project');assignment=value['spec'].get('assignment',{})
+                if not p or p['id']!=identity or name not in assignment.get('covers',[]):result['gaps'].append({'kind':'wrong_task_assignment','task_id':member,'obligation':name})
+                elif not value['accepted'] or dependency_gaps(value) or any(task().assessment(value,n)['blocked'] for n in value['steps']):result['gaps'].append({'kind':'project_obligation_remaining','task_id':member,'obligation':name})
+        result['complete']=not result['gaps']
+    return projects
+
+def declared_link(value,identity,fingerprint):
+    return any(e['task_id']==identity and e['step_id'] is None and e['input_sha256']==fingerprint and e['basis']['status']=='proven' for e in value['spec'].get('requires',[]))
+
+def finalization(values,project_results,declared):
+    result={'complete':False,'gaps':[]}
+    if declared is None:result['gaps'].append({'kind':'cross_line_finalization_not_provided'});return result
+    need(isinstance(declared,dict) and set(declared)=={'components','integration','regression','tracking','regression_report','tracking_file'},'invalid finalization contract')
+    ids=declared['components'];need(isinstance(ids,list) and 0<len(ids)<=32 and all(identifier(x) for x in ids) and len(set(ids))==len(ids),'invalid final component set')
+    for name in ('integration','regression','tracking'):need(identifier(declared[name]),'invalid finalization task identity')
+    need(len(set(ids+[declared[n] for n in ('integration','regression','tracking')]))==len(ids)+3,'finalization responsibilities overlap')
+    needed=set(ids+[declared[n] for n in ('integration','regression','tracking')])
+    if needed-set(values):result['gaps'].append({'kind':'finalization_tasks_missing','task_ids':sorted(needed-set(values))});return result
+    for identity,p in project_results.items():
+        if p['gaps']:result['gaps'].append({'kind':'project_scope_incomplete','project_id':identity,'gaps':p['gaps']})
+        required={m for o in p['obligations'].values() for m in o['task_ids']}
+        omitted=[m for m in required if values.get(m,{}).get('spec',{}).get('assignment',{}).get('role') in ('implementation','investigation') and m not in ids]
+        if omitted:result['gaps'].append({'kind':'final_component_omitted','task_ids':sorted(omitted)})
+    integration=values[declared['integration']];regression=values[declared['regression']];tracking=values[declared['tracking']]
+    for value,role in [(integration,'integration'),(regression,'final_regression'),(tracking,'coordination')]:
+        if value['spec'].get('assignment',{}).get('role')!=role or not value['accepted'] or dependency_gaps(value):result['gaps'].append({'kind':'final_stage_not_accepted','role':role,'task_id':value['task_id']})
+    for identity in ids:
+        value=values[identity]
+        if not value['spec'].get('project') or not value['spec'].get('assignment'):
+            result['gaps'].append({'kind':'component_project_responsibility_missing','task_id':identity})
+            continue
+        if not value['accepted'] or not value.get('review') or value['review'].get('task_input_sha256')!=value['acceptance_sha256']:result['gaps'].append({'kind':'component_independent_verification_missing','task_id':identity})
+        if not declared_link(integration,identity,value['acceptance_sha256']):result['gaps'].append({'kind':'integration_input_not_bound','task_id':identity})
+    if not declared_link(regression,integration['task_id'],integration['acceptance_sha256']):result['gaps'].append({'kind':'regression_not_after_integration'})
+    if not declared_link(tracking,regression['task_id'],regression['acceptance_sha256']):result['gaps'].append({'kind':'tracking_not_after_final_regression'})
+    try:
+        loaded=artifact(integration);tested=artifact(regression)
+        need(loaded is not None and loaded==tested,'final regression did not use the same actual merged/loaded release')
+        required_projects={values[i]['spec'].get('project',{}).get('id') for i in ids}
+        need(required_projects<={v['project_id'] for v in loaded['versions']},'common loaded release omits a component project')
+        reportref=declared['regression_report'];need(isinstance(reportref,dict) and set(reportref)=={'path','sha256'},'invalid final regression report reference')
+        report=read_json(regression['spec']['workspace'],reportref['path'],reportref['sha256']);bound_report(regression,report)
+        need(report.get('verdict')=='PASS' and report.get('artifact_sha256')==loaded['sha256'] and report.get('component_inputs')=={i:values[i]['acceptance_sha256'] for i in ids},'final regression result does not cover current common inputs')
+        implementers={values[i]['spec'].get('assignment',{}).get('owner') for i in ids}|{integration['spec'].get('assignment',{}).get('owner')}
+        need(text(report.get('reviewer_thread')) and report['reviewer_thread'] not in implementers,'final regression is not independent of implementation/integration')
+        for item in [values[i] for i in ids]+[integration]:need(report['reviewer_thread'] not in {s.get('session_id') for s in item['steps'].values()},'worker self-test cannot sign cross-line final regression')
+        ledger=declared['tracking_file'];need(isinstance(ledger,dict) and set(ledger)=={'path','sha256'},'invalid unique tracking-file reference')
+        registered=[c for step in tracking['spec']['steps'] for c in step['checks'] if c['kind']=='file' and c['path']==ledger['path'] and c['sha256']==ledger['sha256']]
+        need(registered,'tracking update has no registered actual file acceptance')
+        need(task().checked_file(tracking,tracking['spec']['steps'][0]['id'],dict(registered[0]))['passed'],'unique tracking file update not observed')
+        result['artifact']=loaded;result['independent_report_sha256']=reportref['sha256']
+    except (task().TaskError,OSError,ValueError) as exc:result['gaps'].append({'kind':'final_acceptance_unproven','detail':str(exc)})
+    result['complete']=not result['gaps'];return result
+
+def workset(codex_home,request):
+    ids=request.get('task_ids');need(isinstance(ids,list) and 0<len(ids)<=32 and all(identifier(v) for v in ids) and len(set(ids))==len(ids),'workset needs named existing task IDs')
+    operation=request['operation'];maximum=request.get('max_turns',3)
+    need(type(maximum) is int and 1<=maximum<=4,'workset invocation allows1..4 turns')
+    root=Path(codex_home)/'task-runtime';errors={};values={};executed=[]
+    def refresh():
+        values.clear();errors.clear()
+        for identity in ids:
+            try:values[identity]=peer(root,identity)
+            except (task().TaskError,OSError,ValueError) as exc:errors[identity]=str(exc)
+    with context(root,ids):
+        refresh()
+        if operation=='work':
+            expected=request.get('expected_revisions');need(isinstance(expected,dict) and set(expected)==set(ids) and all(type(v) is int for v in expected.values()),'workset needs exact task revision expectations')
+            need(all(value['revision']==expected[identity] for identity,value in values.items()),'workset input revision changed')
+            cursor=0
+            for _ in range(maximum):
+                selected=None
+                for offset in range(len(ids)):
+                    index=(cursor+offset)%len(ids);identity=ids[index]
+                    if identity in values and not values[identity]['accepted'] and task().partition(values[identity])['ready'] and values[identity]['execution'] is None:
+                        if values[identity]['spec'].get('execution_mode')=='external' and identity not in request.get('observations',{}):continue
+                        selected=identity;cursor=(index+1)%len(ids);break
+                if selected is None:break
+                try:
+                    store=task().Store(codex_home,selected)
+                    if values[selected]['spec'].get('execution_mode')=='external':
+                        observation=request['observations'][selected]
+                        need(isinstance(observation,dict) and set(observation)=={'path','sha256'},'invalid external observation reference')
+                        task().observe_external(store,values[selected]['revision'],observation)
+                    else:task().run(store,values[selected]['revision'],1)
+                    executed.append({'task_id':selected,'result':'returned'})
+                except (task().TaskError,OSError,ValueError) as exc:executed.append({'task_id':selected,'result':'scoped_error','detail':str(exc)})
+                refresh()
+        projected={identity:task().view(value) for identity,value in values.items()}
+        # Read only explicitly declared missing members, never enumerate tasks.
+        extra={member for value in values.values() for obligation in value['spec'].get('project',{}).get('obligations',[]) for member in obligation['task_ids']}-set(values)
+        need(len(extra)<=64,'project membership lookup bound')
+        for identity in sorted(extra):
+            try:values[identity]=peer(root,identity)
+            except (task().TaskError,OSError,ValueError) as exc:errors[identity]=str(exc)
+        projects=project_view(values,errors);closed=finalization(values,projects,request.get('finalization'))
+        if errors:
+            closed['gaps'] += [{'kind':'named_task_not_observed','task_id':identity,'detail':detail} for identity,detail in sorted(errors.items())]
+            closed['complete']=False
+        remaining=[identity for identity,current in projected.items() if not current['accepted']]
+        if remaining:
+            closed['gaps'].append({'kind':'named_tasks_remaining','task_ids':remaining})
+            closed['complete']=False
+        return {'scope':'named existing task/project workset; no permissions or original-record authenticity granted','tasks':projected,'errors':errors,'projects':projects,'executed':executed,'finalization':closed,'overall_complete':closed['complete'],'model_adoption':'not established by this projection or synthetic tests'}

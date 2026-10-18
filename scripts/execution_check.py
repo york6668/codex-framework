@@ -1025,6 +1025,32 @@ def evaluate(payload):
             dependencies = items(entry.get("depends_on", []), "progress step.depends_on")
             if len(set(dependencies)) != len(dependencies) or any(d not in by_id for d in dependencies):
                 raise CheckError("progress dependencies must name earlier steps once")
+            basis = entry.get("depends_on_basis")
+            effective_dependencies = dependencies
+            unproven_dependencies = []
+            if basis is not None:
+                basis = obj(basis, "progress step.depends_on_basis")
+                if "status" in basis:
+                    if len(dependencies) > 1:
+                        raise CheckError("one dependency basis cannot stand for multiple edges")
+                    mappings = {d: basis for d in dependencies}
+                    if not dependencies and basis.get("status") not in ("proven", "hypothesis", "unknown"):
+                        raise CheckError("dependency basis status is invalid")
+                else:
+                    if set(basis) - set(dependencies):
+                        raise CheckError("dependency basis names an unknown edge")
+                    mappings = basis
+                for dependency, fact in mappings.items():
+                    fact = obj(fact, "dependency basis")
+                    if set(fact) - {"status", "source_ref", "reason"} or fact.get("status") not in ("proven", "hypothesis", "unknown"):
+                        raise CheckError("dependency basis fields/status are invalid")
+                    if fact["status"] == "proven":
+                        identifier(fact.get("source_ref"), "dependency source_ref")
+                        if not isinstance(fact.get("reason"), str) or not fact["reason"].strip():
+                            raise CheckError("proven dependency needs its consumer reason")
+                    else:
+                        unproven_dependencies.append(dependency)
+                effective_dependencies = [d for d in dependencies if d not in unproven_dependencies]
             action = obj(entry.get("action"), "progress step.action")
             single_payload = {**payload, "phase": "action", "action": action}
             # Review evidence belongs to the aggregate goal, not every
@@ -1033,7 +1059,7 @@ def evaluate(payload):
             single = evaluate(single_payload)
             if "platform_denied_action" in single["blocked"]:
                 state = "direct_refusal"
-            elif any(by_id[d]["state"] != "ready" for d in dependencies):
+            elif any(by_id[d]["state"] != "ready" for d in effective_dependencies):
                 state = "dependency_blocked"
             elif (action.get("capabilities") or action.get("cost", 0)) and not node_snapshot_fresh(context):
                 state = "needs_evidence"
@@ -1046,6 +1072,8 @@ def evaluate(payload):
                 state = "blocked"
             decision = {"id": step_id, "state": state,
                         "blocked": single["blocked"], "missing": single["missing"]}
+            if basis is not None:
+                decision["unproven_dependencies"] = unproven_dependencies
             if "access_route" in single:
                 decision["access_route"] = single["access_route"]
             if "resource_route" in single:

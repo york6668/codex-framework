@@ -117,12 +117,17 @@ class TaskRuntimeTests(fixtures.FixtureCase):
 
     def test_descriptor_identity_is_checked_before_reading_a_racing_alias(self):
         store,value,original,destination=self.denied_then_new_target(existing=True)
-        real_open=os.open;swapped=[]
+        real_open=os.open;real_read=os.read;real_fstat=os.fstat;swapped=[]
+        target_identity=(original.stat().st_dev,original.stat().st_ino)
+        def reading(fd,n):
+            info=real_fstat(fd)
+            if (info.st_dev,info.st_ino)==target_identity:raise AssertionError('forbidden descriptor body read')
+            return real_read(fd,n)
         def opening(path,*args,**kwargs):
             if path=='new' and kwargs.get('dir_fd') is not None and not swapped:
                 destination.unlink();os.link(original,destination);swapped.append(True)
             return real_open(path,*args,**kwargs)
-        with mock.patch('task_worker.execute',return_value=self.worker()), mock.patch('task_runtime.os.open',side_effect=opening), mock.patch('task_runtime.os.read',side_effect=AssertionError('forbidden descriptor body read')):
+        with mock.patch('task_worker.execute',return_value=self.worker()), mock.patch('task_runtime.os.open',side_effect=opening), mock.patch('task_runtime.os.read',side_effect=reading):
             value=task.run(store,value['revision'])
         self.assertTrue(os.path.samefile(original,destination))
         self.assertIn('descriptor matches retained',value['steps']['a']['validation']['checks'][0]['detail'])
@@ -144,6 +149,7 @@ class TaskRuntimeTests(fixtures.FixtureCase):
     def test_file_open_type_and_read_delays_are_bounded_without_stopping_b(self):
         path=self.root/'slow';path.write_bytes(b'wanted')
         real_open,real_fstat,real_read=os.open,os.fstat,os.read
+        target_identity=(path.stat().st_dev,path.stat().st_ino)
         for index,phase in enumerate(['open_target','fstat_target','read_target']):
             with self.subTest(phase=phase):
                 spec=self.spec([{'id':'a','instruction':'Exact slow file','checks':[{'kind':'file','path':'slow','sha256':hashlib.sha256(b'wanted').hexdigest(),'timeout':1}]},
@@ -154,9 +160,12 @@ class TaskRuntimeTests(fixtures.FixtureCase):
                     return real_open(name,*args,**kwargs)
                 def stated(fd):
                     info=real_fstat(fd)
-                    if stat.S_ISREG(info.st_mode):time.sleep(5)
+                    if (info.st_dev,info.st_ino)==target_identity:time.sleep(5)
                     return info
-                def reading(fd,n):time.sleep(5);return real_read(fd,n)
+                def reading(fd,n):
+                    info=real_fstat(fd)
+                    if (info.st_dev,info.st_ino)==target_identity:time.sleep(5)
+                    return real_read(fd,n)
                 patch=mock.patch('task_runtime.os.open',side_effect=opening) if phase=='open_target' else mock.patch('task_runtime.os.fstat',side_effect=stated) if phase=='fstat_target' else mock.patch('task_runtime.os.read',side_effect=reading)
                 start=time.monotonic()
                 with patch,mock.patch('task_worker.execute',return_value=self.worker()):value=task.run(store,value['revision'])
@@ -187,7 +196,12 @@ class TaskRuntimeTests(fixtures.FixtureCase):
         spec=self.spec([{'id':'a','instruction':'Check bounded file','checks':[{'kind':'file','path':'large','sha256':hashlib.sha256(b'x'*512).hexdigest(),'max_bytes':16}]},
                         {'id':'b','instruction':'Independent message','checks':[{'kind':'message','equals':'42'}]}])
         store,value=self.create(spec)
-        with mock.patch('task_worker.execute',return_value=self.worker()),mock.patch('task_runtime.os.read',side_effect=AssertionError('over-budget file read')):value=task.run(store,value['revision'])
+        real_read,real_fstat=os.read,os.fstat;info=(self.root/'large').stat();target_identity=(info.st_dev,info.st_ino)
+        def reading(fd,n):
+            current=real_fstat(fd)
+            if (current.st_dev,current.st_ino)==target_identity:raise AssertionError('over-budget file read')
+            return real_read(fd,n)
+        with mock.patch('task_worker.execute',return_value=self.worker()),mock.patch('task_runtime.os.read',side_effect=reading):value=task.run(store,value['revision'])
         self.assertIn('byte budget',value['steps']['a']['validation']['checks'][0]['detail'])
         self.assertEqual(value['steps']['b']['state'],'verified')
 
@@ -722,7 +736,7 @@ class TaskRuntimeTests(fixtures.FixtureCase):
         self.assertEqual(result['status'],'installed')
         self.assertEqual(runtime.active(self.a)['revision'],new)
         self.assertEqual(runtime.launcher_path(self.a).read_bytes(),runtime.loader_bytes(self.a))
-        self.assertEqual(len(runtime.load(runtime.version_path(self.a,new)/'manifest.json')['files']),10)
+        self.assertEqual(len(runtime.load(runtime.version_path(self.a,new)/'manifest.json')['files']),len(runtime.MODULES)+1)
         self.assertFalse(marker.exists())
 
     def test_prior_loader_migration_preserves_unknown_or_unverified_state(self):
@@ -776,7 +790,7 @@ class TaskRuntimeTests(fixtures.FixtureCase):
     def test_manifest_cannot_disguise_nine_module_code_as_legacy_seven(self):
         revision=fixtures.seed_runtime(self.repo);runtime.install(self.a,revision)
         directory=runtime.version_path(self.a,revision);m=runtime.load(directory/'manifest.json')
-        for name in ['task_runtime.py','task_worker.py']:
+        for name in ['task_runtime.py','task_worker.py','task_coordination.py']:
             (directory/'scripts'/name).unlink();del m['files']['scripts/'+name]
         raw=runtime.encoded(m);(directory/'manifest.json').write_bytes(raw)
         active=runtime.active(self.a);active['manifest_sha256']=runtime.digest(raw)

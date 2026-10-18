@@ -21,6 +21,7 @@ import time
 import uuid
 
 import codex_framework as cf
+import task_coordination as coordination
 
 LIMIT = 262144
 ID = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{0,95}\Z")
@@ -205,12 +206,12 @@ def file_scope(spec, step):
     Symlink and escaping-path support remains the existing safe_path contract.
     """
     if not _IO_CHILD:
-        key=digest(encoded({'workspace':spec['workspace'],'checks':step['checks']}))
+        key=digest(encoded({'workspace':spec['workspace'],'checks':step['checks'],'resources':step.get('resources',[])}))
         if _IO_DEPTH and key in _SCOPE_FAILURES:return copy.deepcopy(_SCOPE_FAILURES[key])
         try:
             return isolated_io('scope',lambda:file_scope(spec,step),SCOPE_SECONDS)[0]
         except (TaskError,OSError) as exc:
-            failed={"files":sorted({os.path.abspath(Path(spec['workspace'])/c['path']) for c in step['checks'] if c['kind']=='file'}),
+            failed={"files":sorted({os.path.abspath(Path(spec['workspace'])/c['path']) for c in step['checks'] if c['kind']=='file'} | {os.path.abspath(Path(spec['workspace'])/r['identity']) for r in step.get('resources',[]) if r['kind']=='file'}),
                     "file_objects":[],"targets":[],"workspace_identity":None,
                     "file_identity_errors":[{"path":spec['workspace'],"error_type":type(exc).__name__,"io_budget":True,
                                              "io":getattr(exc,'report',{}),"detail":str(exc)}]}
@@ -228,7 +229,9 @@ def file_scope(spec, step):
         raise
     except (OSError, cf.SyncError) as exc:
         errors.append({"path": spec["workspace"], "error_type": type(exc).__name__, "workspace": True})
-    for check in step["checks"]:
+    checked_paths={c['path'] for c in step['checks'] if c['kind']=='file'}
+    file_checks=step['checks']+[{'kind':'file','path':r['identity']} for r in step.get('resources',[]) if r['kind']=='file' and r['identity'] not in checked_paths]
+    for check in file_checks:
         if check["kind"] != "file":
             continue
         path = Path(os.path.abspath(Path(spec["workspace"]) / check["path"]))
@@ -255,9 +258,11 @@ def file_scope(spec, step):
 
 
 def restriction(spec, state, step, input_revision, execution):
+    observed_scope = file_scope(spec, step)
     return {"workspace": str(Path(spec["workspace"]).resolve()), "step": step["id"], "instruction": step["instruction"],
-            **file_scope(spec, step), "input_revision": input_revision, "wait": copy.deepcopy(state.get("wait") or {}),
+            **observed_scope, "input_revision": input_revision, "wait": copy.deepcopy(state.get("wait") or {}),
             "state": "blocked" if state["state"] == "blocked" else "reconcile",
+            "resource_effects": coordination.resources({"spec": spec}, step, observed_scope),
             "execution": state.get("unresolved_execution") or execution}
 
 
@@ -285,7 +290,7 @@ def same_restricted_scope(hold, step, scope):
     return hold["step"] == step["id"]
 
 
-def assessment(value, key, expected_scope=None):
+def assessment(value, key, expected_scope=None, related=True):
     spec = next(s for s in value["spec"]["steps"] if s["id"] == key)
     scope = file_scope(value["spec"], spec)
     matches = [h for h in value.get("restrictions", []) if same_restricted_scope(h, spec, scope)]
@@ -300,8 +305,12 @@ def assessment(value, key, expected_scope=None):
         reason = "object_changed_between_decisions"
     elif value.get("accepted") and isinstance(value.get("acceptance_observation"), dict) and value["acceptance_observation"].get("scope_sha256", {}).get(key) != digest(encoded(scope)):
         reason = "accepted_object_changed; inspect current artifact before reacceptance"
+    relationships = coordination.related(value, spec) if related and reason is None else []
+    if reason is None and relationships:
+        reason = "related_" + relationships[0]["kind"]
     return {"scope": scope, "reason": reason, "restriction_refs": [digest(encoded(h)) for h in matches],
-            "source_waits": [h["wait"] for h in matches], "blocked": reason is not None}
+            "source_waits": [h["wait"] for h in matches], "blocked": reason is not None,
+            "related_conditions": relationships}
 
 
 def enforce_constraints(value, phase, key=None, expected_scope=None):
@@ -312,13 +321,21 @@ def enforce_constraints(value, phase, key=None, expected_scope=None):
             continue
         observed = assessment(value, name, expected_scope if name == key else None)
         observations[name] = observed
+        step = value["steps"][name]
+        if not observed["blocked"] and step.get("coordination_wait") and step["state"] == "blocked":
+            previous = step.pop("coordination_wait")
+            if previous["state"] == "pending":
+                step.update(state="pending", wait=previous["wait"])
+                step.pop("constraint_derived", None)
         if observed["blocked"]:
-            step = value["steps"][name]
+            if observed["reason"].startswith("related_") and step["state"] == "pending" and "coordination_wait" not in step:
+                step["coordination_wait"] = {"state": "pending", "wait": copy.deepcopy(step.get("wait"))}
             prior_wait = step.get("wait") or {}
             source = next((w.get("source_ref") or w.get("evidence_ref") for w in observed["source_waits"] if w.get("source_ref") or w.get("evidence_ref")), None)
             step.update(state="reconcile" if step["state"] == "reconcile" else "blocked", constraint_derived=True,
                         wait={**prior_wait, "kind": "object_constraint", "reason": observed["reason"],
                         "phase": phase, "source_ref": source or prior_wait.get("source_ref"), "restriction_refs": observed["restriction_refs"],
+                        "related_conditions": observed["related_conditions"],
                         "next": "inspect_original_constraint_and_actual_object; use verified isolation if stronger stability is required"})
             value["accepted"] = False
         execution = value.get("execution")
@@ -330,7 +347,7 @@ def enforce_constraints(value, phase, key=None, expected_scope=None):
 
 def specification(value, filesystem=True):
     require(isinstance(value, dict), "task specification must be an object")
-    require(set(value) <= {"request_id", "requirement", "acceptance_version", "workspace", "steps", "max_runs", "review_required", "load_required", "native_model", "native_reasoning_effort"}, "unknown task specification field")
+    require(set(value) <= {"request_id", "requirement", "acceptance_version", "workspace", "steps", "max_runs", "review_required", "load_required", "native_model", "native_reasoning_effort", "project", "assignment", "request_identity", "known_tasks", "requires", "artifact", "execution_mode"}, "unknown task specification field")
     if value.get("native_model") is not None:
         require(isinstance(value["native_model"], str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:/-]{0,127}", value["native_model"]), "invalid explicit native model")
     if value.get("native_reasoning_effort") is not None:
@@ -346,7 +363,7 @@ def specification(value, filesystem=True):
     require(isinstance(steps, list) and 0 < len(steps) <= 32, "task needs 1..32 steps")
     seen = set()
     for step in steps:
-        require(isinstance(step, dict) and set(step) <= {"id", "instruction", "depends_on", "checks", "approval_required", "stable_objects_required"}, "invalid step fields")
+        require(isinstance(step, dict) and set(step) <= {"id", "instruction", "depends_on", "checks", "approval_required", "stable_objects_required", "depends_on_basis", "resources"}, "invalid step fields")
         key = step.get("id")
         require(isinstance(key, str) and ID.fullmatch(key) and key not in seen, "invalid/duplicate step id")
         require(text(step.get("instruction")), "missing step instruction")
@@ -380,6 +397,7 @@ def specification(value, filesystem=True):
     require(type(value.get("max_runs", 3)) is int and 1 <= value.get("max_runs", 3) <= 8, "max_runs must be 1..8")
     for key in ("review_required", "load_required"):
         require(type(value.get(key, False)) is bool, key + " must be boolean")
+    coordination.validate(value)
     return copy.deepcopy(value)
 
 
@@ -435,19 +453,32 @@ class Store:
                      "delivery": {"sent": False, "read": False, "user_decision": None}, "accepted": False}
             value["steps"] = {step["id"]: {"state": "pending", "runs": 0, "session_id": None,
                                            "evidence": [], "validation": None, "wait": None} for step in spec["steps"]}
+            coordination.membership(value)
             self.save(value)
             return value
 
-    def update(self, expected, operation):
+    @coordination.scoped
+    def update(self, expected, operation, reservation=False):
         require(type(expected) is int, "expected_revision is required")
         with self.locked():
             value = self.read()
             if value["revision"] != expected:
                 raise RevisionConflict("task revision conflict; reread before changing it")
-            operation(value)
-            value["revision"] += 1
-            self.save(value)
-            return value
+            def apply():
+                operation(value)
+                value["revision"] += 1
+                # Publish a conservative claim before the task record: a crash
+                # cannot leave a live producer invisible to another task.
+                if reservation:
+                    coordination.sync_index(self, value)
+                self.save(value)
+                if not reservation:
+                    coordination.sync_index(self, value)
+                return value
+            if reservation:
+                with coordination.index_lock(self.root):
+                    return apply()
+            return apply()
 
 
 def partition(value, observations=None):
@@ -460,10 +491,11 @@ def partition(value, observations=None):
             waiting.append({"step": key, "condition": observations[key]["reason"], "restriction_refs": observations[key]["restriction_refs"]})
         elif step["state"] == "verified":
             done.append(key)
-        elif step["state"] in ("blocked", "reconcile", "running"):
+        elif step["state"] in ("blocked", "reconcile", "running") and not (
+                step["state"] == "blocked" and step.get("coordination_wait", {}).get("state") == "pending"):
             waiting.append({"step": key, "condition": step.get("wait") or step["state"]})
-        elif any(value["steps"][d]["state"] != "verified" for d in spec.get("depends_on", [])):
-            waiting.append({"step": key, "condition": "dependencies", "depends_on": spec.get("depends_on", [])})
+        elif any(value["steps"][d]["state"] != "verified" for d in coordination.local_dependencies(spec)):
+            waiting.append({"step": key, "condition": "dependencies", "depends_on": coordination.local_dependencies(spec)})
         elif spec.get("approval_required") and step.get("approval", {}).get("decision") != "approved":
             waiting.append({"step": key, "condition": "explicit_approval_decision_required"})
         else:
@@ -481,6 +513,12 @@ def view(value):
         result["acceptance_receipt_before_current_observation"] = value["accepted"]
         result["accepted"] = False
     result["work_partition"] = partition(value, observations)
+    result["completion_scope"] = "this task only; not project or all-project completion"
+    if value["spec"].get("project"):
+        result["project_context"] = copy.deepcopy(value["spec"]["project"])
+        result["assignment"] = copy.deepcopy(value["spec"]["assignment"])
+        result["current_request"] = {"request_id": value["spec"]["request_id"], "task_id": value["task_id"], "input_revision": value["input_revision"], "task_input_sha256": value["acceptance_sha256"], "request_identity": value["spec"].get("request_identity")}
+    result["unproven_dependencies"] = [e for e in value["spec"].get("requires", []) if e["basis"]["status"] != "proven"]
     if result["work_partition"]["ready"]:
         result["next_action"] = {"kind": "execute_or_collect", "step": result["work_partition"]["ready"][0], "bounded": True}
     elif len(result["work_partition"]["verified"]) == len(value["steps"]):
@@ -638,6 +676,7 @@ def validate(value, step_id, message):
             "scope_after": file_scope(value["spec"], spec), "validator": "task_runtime.validate/v1"}
 
 
+@coordination.scoped
 @io_call
 def reserve(store, expected):
     selected = {}
@@ -665,7 +704,7 @@ def reserve(store, expected):
         step.update(state="running", runs=step["runs"] + 1)
         value["review"] = value["loaded"] = None
         selected.update(execution)
-    value = store.update(expected, begin)
+    value = store.update(expected, begin, reservation=True)
     return value, selected
 
 
@@ -679,6 +718,7 @@ def execution_update(store, expected, execution_id, operation):
         return store.update(current["revision"], operation)
 
 
+@coordination.scoped
 @io_call
 def finish(store, expected, execution_id, worker):
     require(isinstance(worker, dict) and worker.get("status") in ("completed", "failed", "unknown"), "invalid worker outcome")
@@ -760,6 +800,7 @@ def finish(store, expected, execution_id, worker):
     return execution_update(store, snapshot["revision"], execution_id, consume)
 
 
+@coordination.scoped
 def run_once(store, expected):
     from task_worker import execute
     value, execution = reserve(store, expected)
@@ -771,7 +812,7 @@ def run_once(store, expected):
               "\nCurrent step: " + step["instruction"] + "\nAttempt: " + str(value["steps"][execution["step"]]["runs"]) +
               "\nPrevious validation: " + json.dumps(value["steps"][execution["step"]].get("validation"), ensure_ascii=False) +
               "\nRequired checks: " + json.dumps(step["checks"], ensure_ascii=False) +
-              "\nRetained scoped restrictions: " + json.dumps(value.get("restrictions", []), ensure_ascii=False) +
+              "\nRetained scoped restrictions: " + json.dumps(value.get("restrictions", []), ensure_ascii=False) + coordination.prompt(value) +
               "\nContinue only this step. Inspect existing effects before repeating work. Keep native permissions and all refusals. A final message alone does not complete this task.")
     revision = value["revision"]
     def observed_process(pid):
@@ -811,10 +852,12 @@ def run_once(store, expected):
         raise
 
 
+@coordination.scoped
 @io_call
 def run(store, expected, max_turns=3):
     require(type(max_turns) is int and 1 <= max_turns <= 4, "one invocation allows 1..4 native turns")
     value = store.read()
+    require(value["spec"].get("execution_mode", "native") == "native", "external tasks collect existing effects without model dispatch")
     require(value["revision"] == expected, "task revision conflict")
     value = store.update(expected, lambda current: enforce_constraints(current, "run"))
     for _ in range(max_turns):
@@ -842,10 +885,12 @@ def require_stopped(execution):
         raise TaskError("original " + key + " is still running; retain its execution and do not dispatch a duplicate")
 
 
+@coordination.scoped
 @io_call
 def resume(store, max_turns=3):
     """Restart from durable facts only; never invent a fresh request or effect."""
     value = store.read()
+    require(value["spec"].get("execution_mode", "native") == "native", "external task outcome requires explicit effect collection/reconciliation, not model resume")
     execution = value.get("execution")
     if execution is None:
         pending = next((s.get("unresolved_execution") for s in value["steps"].values() if s["state"] == "reconcile" and
@@ -882,6 +927,7 @@ def resume(store, max_turns=3):
     return value
 
 
+@coordination.scoped
 def change(store, request):
     operation = request["operation"]
     def apply(value):
@@ -1015,10 +1061,16 @@ def change(store, request):
             raw = cf.read_file(cf.safe_path(path.parent, path.name))
             require(raw is not None and len(raw) <= LIMIT and digest(raw) == request["report_sha256"], "review report bytes mismatch")
             report = json.loads(raw)
+            if any(value["spec"].get(k) for k in ("project", "assignment", "request_identity")):
+                coordination.bound_report(value, report)
             require(isinstance(report, dict) and report.get("task_input_sha256") == value["acceptance_sha256"], "review is for a different task input")
             require(report.get("verdict") == "PASS" and text(report.get("reviewer_thread")) and text(report.get("candidate_tree")), "review is not a passing independent candidate report")
             require(re.fullmatch(r"[0-9a-f]{40}", report["candidate_tree"]), "invalid reviewed candidate tree")
             sessions = {s.get("session_id") for s in value["steps"].values()}
+            if value["spec"].get("assignment"):
+                sessions.add(value["spec"]["assignment"]["owner"])
+            if value["spec"].get("request_identity"):
+                sessions.add(value["spec"]["request_identity"]["thread_id"])
             require(report["reviewer_thread"] not in sessions, "worker self-test cannot sign independent review")
             value["review"] = {"path": str(path), "sha256": digest(raw), "candidate_tree": report["candidate_tree"],
                                "reviewer_thread": report["reviewer_thread"], "task_input_sha256": value["acceptance_sha256"],
@@ -1057,6 +1109,8 @@ def change(store, request):
                 active = runtime.active(target)
                 require(active and active["revision"] == value["loaded"]["revision"] and active["manifest_sha256"] == value["loaded"]["manifest_sha256"], "loaded release changed before acceptance")
                 runtime.validate(runtime.version_path(target, active["revision"]), active["manifest_sha256"])
+            if value["spec"].get("artifact"):
+                coordination.artifact(value)
             # Passive effects are checked again without rerunning commands or
             # model actions; old validation can't bless a changed deliverable.
             for spec in value["spec"]["steps"]:
@@ -1075,6 +1129,69 @@ def change(store, request):
     return store.update(request.get("expected_revision"), apply)
 
 
+
+@coordination.scoped
+@io_call
+def observe_external(store, expected, reference):
+    """Validate already produced effects; never fabricate a native worker turn."""
+    value = store.read()
+    require(value["spec"].get("execution_mode") == "external", "task did not select external effect collection")
+    require(value["revision"] == expected and value["execution"] is None, "external collection revision/execution conflict")
+    require(isinstance(reference, dict) and set(reference) == {"path", "sha256"}, "invalid external observation reference")
+    report = coordination.read_json(value["spec"]["workspace"], reference.get("path"), reference.get("sha256"))
+    coordination.bound_report(value, report)
+    require(report.get("verdict") in ("PASS", "FAIL", "NOT_RUN"), "invalid external result verdict")
+    if report["verdict"] != "PASS":
+        def unavailable(current):
+            for state in current["steps"].values():
+                if state["state"] == "pending":
+                    state.update(state="blocked", wait={"kind": "external_result_" + report["verdict"].lower(), "source_ref": reference, "next": "return current failure/not-run to original owner"})
+        return store.update(expected, unavailable)
+    for spec in value["spec"]["steps"]:
+        key = spec["id"]
+        if value["steps"][key]["state"] == "verified":
+            continue
+        require(value["steps"][key]["state"] == "pending" or
+                (value["steps"][key]["state"] == "blocked" and value["steps"][key].get("coordination_wait", {}).get("state") == "pending"),
+                "effect collection cannot clear a refusal/unresolved original execution")
+        selected = {}
+        def begin(current):
+            observations = enforce_constraints(current, "external_collection", key)
+            require(not observations[key]["blocked"] and all(current["steps"][d]["state"] == "verified" for d in coordination.local_dependencies(spec)), "external effect has unresolved relationship or refusal")
+            attempts = current["steps"][key].get("verification_attempts", 0)
+            require(attempts < current["spec"].get("max_runs", 3), "external verification attempt bound")
+            execution = {"id": uuid.uuid4().hex, "controller_pid": os.getpid(), "worker_pid": None, "session_id": None,
+                         "step": key, "input_revision": current["input_revision"], "acceptance_sha256": current["acceptance_sha256"],
+                         "state": "validating", "validation_started": True, "producer_kind": "external_observation", "prompt_authorized": False,
+                         "started_at": time.time(), "source_ref": reference}
+            execution["dispatch_scope"] = file_scope(current["spec"], spec)
+            current["execution"] = execution
+            current["steps"][key].update(state="running", verification_attempts=attempts + 1)
+            selected.update(execution)
+        value = store.update(value["revision"], begin, reservation=True)
+        checked = validate(value, key, "")
+        def consume(current):
+            require(current["execution"] and current["execution"]["id"] == selected["id"], "external result superseded")
+            constraints = enforce_constraints(current, "external_commit", key, checked.get("scope_after"))[key]
+            state = current["steps"][key]
+            state["validation"] = checked
+            state["external_evidence"] = {"reference": reference, "identity": coordination.bound_report(current, report), "origin_authentication": "actual native source must be checked by original coordinator; fields do not authenticate it"}
+            if checked["passed"] and not constraints["blocked"]:
+                state.update(state="verified", wait=None)
+            else:
+                possible = any(c.get("validator_possible_effects") for c in checked["checks"])
+                state.update(state="reconcile" if possible else "blocked", wait={"kind": "external_validation_failed", "checks": checked["checks"], "next": "original owner diagnoses; no automatic replay"})
+                if possible:state["unresolved_execution"] = copy.deepcopy(current["execution"])
+            current["history"].append({"external_observation": copy.deepcopy(current["execution"]), "validation": checked, "source_ref": reference})
+            require(len(current["history"]) <= 64, "task history bound reached")
+            current["execution"] = None
+        value = execution_update(store, value["revision"], selected["id"], consume)
+        if value["steps"][key]["state"] != "verified":return value
+    if not value["spec"].get("review_required") and not value["spec"].get("load_required"):
+        value = change(store, {"operation": "accept", "expected_revision": value["revision"]})
+    return value
+
+
 def dispatch(codex_home):
     import sys
     try:
@@ -1082,9 +1199,13 @@ def dispatch(codex_home):
         require(len(raw) <= LIMIT, "request too large")
         request = json.loads(raw)
         require(isinstance(request, dict), "request must be an object")
+        operation = request.get("operation")
+        if operation in ("coordinate", "work"):
+            result = coordination.workset(codex_home, request)
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+            return 2 if operation == "work" and not result["overall_complete"] else 0
         task_id = request.get("task_id")
         store = Store(codex_home, task_id)
-        operation = request.get("operation")
         if operation == "register":
             value = store.create(task_id, request.get("spec"))
         elif operation == "status":
@@ -1095,6 +1216,14 @@ def dispatch(codex_home):
             value = resume(store, request.get("max_turns", 3))
         elif operation in ("amend", "block", "approval", "delivery", "reconcile", "review", "accept"):
             value = change(store, request)
+        elif operation == "verify-effects":
+            value = observe_external(store, request.get("expected_revision"), {"path": request.get("path"), "sha256": request.get("sha256")})
+        elif operation == "verify-return":
+            value = store.read()
+            report = coordination.read_json(value["spec"]["workspace"], request.get("path"), request.get("sha256"))
+            bound = coordination.bound_report(value, report)
+            print(json.dumps({"status": "bound", "identity": bound, "completion_scope": "current request report binding only; no acceptance or permission granted"}, ensure_ascii=False))
+            return 0
         elif operation == "loaded":
             from codex_framework import Framework
             import framework_runtime as runtime
@@ -1102,8 +1231,9 @@ def dispatch(codex_home):
             value = change(store, request)
         else:
             raise TaskError("unsupported task operation")
-        print(json.dumps(view(value), ensure_ascii=False, indent=2))
-        return 2 if operation in ("run", "resume") and not value["accepted"] else 0
+        with coordination.context(store.root):
+            print(json.dumps(view(value), ensure_ascii=False, indent=2))
+        return 2 if operation in ("run", "resume", "verify-effects") and not value["accepted"] else 0
     except (TaskError, cf.SyncError, OSError, ValueError, TypeError) as exc:
         print(json.dumps({"status": "task_error", "reason": str(exc)}, ensure_ascii=False))
         return 1
