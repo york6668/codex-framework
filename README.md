@@ -41,6 +41,19 @@ Mac mini 上的全局文档和 Skills 是部署副本，供 Codex 加载使用�
 
 运行版本链实现与隔离回归见下节；独立验收、发布、真实安装及采用各自取证。原生来源适配与统一有界读取、结果后的主动协调及真实采用仍按后续工作包推进，不移动 BTC 额度权威或节点实际配置。
 
+## 只读展开已有义务引用
+
+```sh
+python3 scripts/obligation_projection.py /path/to/existing.json \
+  --frontier '#/integration_coordination/current_actionable_and_limited_frontier'
+```
+
+这是维护仓库中的独立纯读入口。默认同时读取 `first_ready_unassigned`、`assigned_inflight_do_not_duplicate`、`current_real_backlog_action`、`current_authorization_propagation_rootcause` 四族各自的 `_ref` 与 `_refs`；另选字段族时重复 `--family <不含后缀的名称>`。每条来源位置都保留，解析到同一实际 JSON pointer 的引用只展开一次。
+
+支持本文件 JSON pointer/fragment 及唯一精确 `workstreams[id=...]` 选择；普通字段名优先，重复 ID、错误转义、空/坏引用分别报具体位置。输出保留所引对象的完整 `value` 和文档 hash，逐条区分存储状态、原目标、回合、发送/接收、结果和验收字段；不自动查询原生状态或推断可执行。新回合完成不能代替旧义务验收。拒绝或错误仅留在该行，其他合法引用继续展开；退出 0 表示引用解析无误，2 表示部分引用有误，1 表示文档/入口输入无效，均不是业务验收结果。
+
+原生完成/失败通知处理先核收实际结果，再计算并启动获准后继；既有 App 每小时计划只作漏通知和过期状态兜底。两条路径可复用这个纯读入口，引用去重不等于原生通知去重、效果恰好执行一次或后继已启动，成功读取/轮询也不是推进证据。模型/原消费者结合实际原生收件与完成记录、当前授权及依赖判断后继，并沿原任务执行和回收。此投影不成为第二执行队列；当前稳定运行包不含该维护脚本，采用须核确切发布脚本版本。不会沿引用打开其他文件、发送消息或更改原文档。
+
 ## 在另一台电脑安装
 
 需要 Git、Python 3.9+ 和可用的 GitHub 私有仓库访问权限；配置与认证按 [共享资源入口](.codex/workstation/README.md) 发现。支持 macOS 与 Linux；Windows 可在 WSL 中使用。不要复制其他设备的登录凭据。
