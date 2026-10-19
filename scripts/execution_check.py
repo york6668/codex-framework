@@ -12,6 +12,7 @@ from pathlib import Path, PureWindowsPath
 from datetime import datetime, timezone
 
 from source_evidence import native_item, native_precedes, source_body, source_text, verify as verify_source
+from source_evidence import direct_user_message as source_direct_user_message
 
 
 class CheckError(ValueError):
@@ -37,14 +38,11 @@ def identifier(value, name):
 
 
 def direct_user_message(item, body):
-    """Filter known delegation forms from an already verified native item."""
-    if item is None or item.get("type") != "userMessage":
-        return False
-    blocks = item.get("content", [])
-    if not isinstance(blocks, list):
-        raise CheckError("user message content must be an array")
-    return ("<codex_delegation>" not in (body or "")
-            and not any(isinstance(block, dict) and "codexDelegation" in block for block in blocks))
+    """Reuse the same source boundary for permission, pause and dispatch."""
+    try:
+        return source_direct_user_message(item, body)
+    except ValueError as exc:
+        raise CheckError(str(exc)) from exc
 
 
 def received_request(item, body):

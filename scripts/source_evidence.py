@@ -10,6 +10,17 @@ import hashlib
 from pathlib import Path
 
 
+def direct_user_message(item, body):
+    """Keep known task delegations distinct from direct human evidence."""
+    if item is None or item.get("type") != "userMessage":
+        return False
+    blocks = item.get("content", [])
+    if not isinstance(blocks, list):
+        raise ValueError("user message content must be an array")
+    return ("<codex_delegation>" not in (body or "")
+            and not any(isinstance(block, dict) and "codexDelegation" in block for block in blocks))
+
+
 def _body(item):
     if item.get("type") in ("agentMessage", "userMessage"):
         content = item.get("content")
@@ -127,6 +138,8 @@ def verify(context, project, record):
         if isinstance(output, dict) and output.get("truncated") is not False:
             return False
         body = _body(item)
+        if record.get("kind") in ("authorization", "confirmation") and not direct_user_message(item, body):
+            return False
         digest = record.get("digest")
         if item.get("type") != "commandExecution" and not digest:
             return False
