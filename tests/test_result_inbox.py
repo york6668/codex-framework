@@ -97,7 +97,9 @@ class ResultInboxTests(fixtures.FixtureCase):
         _, _, value = self.collect_review(store, 'b', ('later',))
         self.assertEqual(value['result_state']['pending'], ['analysis'])
         view = task.view(value)['result_dimensions']
-        self.assertEqual(len(view['receipt_errors']), 1)
+        # The stale result and its review can both explain the same gap.
+        # Neither error may be attributed to the independently consumed B.
+        self.assertEqual({error['result_sha256'] for error in view['receipt_errors']}, {a['sha256']})
         self.assertEqual(view['business_outcome'], 'pending')
         with self.assertRaises(task.TaskError): self.change(store, 'accept')
 

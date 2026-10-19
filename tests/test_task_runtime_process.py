@@ -194,7 +194,10 @@ class TaskProcessTests(fixtures.FixtureCase):
         # The protected accept entry cannot be called around the worker/check path.
         result=self.call({'operation':'accept','task_id':'process-fixture','expected_revision':initial['revision']})
         self.assertEqual(result.returncode,1)
-        self.assertIn('mandatory current acceptance evidence missing',result.stdout)
+        self.assertEqual(json.loads(result.stdout)['status'],'task_error')
+        current=json.loads(self.call({'operation':'status','task_id':'process-fixture'}).stdout)
+        self.assertFalse(current['accepted'])
+        self.assertTrue(all(step['state']=='pending' for step in current['steps'].values()))
         self.assertFalse(any((self.work/(n+'.txt')).exists() for n in 'abc'))
 
     def test_installed_workspace_rebase_retains_denial_and_executes_other_target(self):

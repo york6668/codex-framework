@@ -648,11 +648,20 @@ def evaluate(payload):
                                or "incident" in context or "access" in action_input
                                or "maintenance" in action_input)))
 
+    # A verified upstream source is a provenance gap, not proof that the
+    # user withheld permission. This set changes diagnostics only.
+    upstream_authorization_links = set()
+
     def linked(ref, kind):
         record = evidence.get(ref)
         if (record is None or record.get("kind") != kind
                 or record.get("project_id") != project_id
                 or record.get("task_ref") != task_ref):
+            if (kind == "authorization" and record is not None
+                    and record.get("kind") == kind and record.get("project_id") == project_id
+                    and record.get("task_ref") != task_ref and record.get("result") == "granted"
+                    and direct_user_message(native_item(context, record), source_body(context, record))):
+                upstream_authorization_links.add(ref)
             need("unresolved_" + kind + "_reference")
             return None
         if strict_sources and not verify_source(context, project, record):
@@ -1824,8 +1833,11 @@ def evaluate(payload):
                                          else "authorization_ref")
                 authorization = linked(auth_ref, "authorization") if auth_ref else None
                 if authorization is None or authorization.get("result") != "granted":
-                    need("cross_environment_authorization" if cross_environment
-                         else "local_action_authorization")
+                    if not cross_environment and auth_ref in upstream_authorization_links:
+                        need("upstream_authorization_link_required")
+                    else:
+                        need("cross_environment_authorization" if cross_environment
+                             else "local_action_authorization")
                 else:
                     authorized = workspace_identity(obj(authorization.get("workspace", {}), "authorization.workspace"), plural=True)
                     coverage = authorization_covers(authorization.get("resource"), action.get("resource"),

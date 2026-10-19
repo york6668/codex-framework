@@ -586,8 +586,12 @@ class TaskBoundaryChecks(unittest.TestCase):
         adoption = action('read', live['resource'], None, [])
         request.update(phase='progress', progress={'checkpoint': 'after_failure', 'claim': 'working', 'steps': [
             {'id': 'code', 'action': code}, {'id': 'offline', 'action': offline},
-            {'id': 'live', 'action': live}, {'id': 'adoption', 'action': adoption, 'depends_on': ['live']}]})
+            {'id': 'live', 'action': live}, {'id': 'adoption', 'action': adoption, 'depends_on': ['code', 'live']}]})
+        # This consumer really needs the live observation. Supply that
+        # contract instead of relying on an unsupported dependency label.
         ContinuationChecks().review(request)
+        bind_dependency(request, 'code', 'adoption')
+        bind_dependency(request, 'live', 'adoption')
         request['progress']['continuation']['selected_step_id'] = 'code'
         return request
 
