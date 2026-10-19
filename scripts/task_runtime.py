@@ -487,10 +487,11 @@ class Store:
             return apply()
 
 
-def partition(value, observations=None):
+def partition(value, observations=None, selected=None):
     ready, waiting, done, unresolved = [], [], [], []
-    observations = observations or {s["id"]: assessment(value, s["id"]) for s in value["spec"]["steps"]}
-    for spec in value["spec"]["steps"]:
+    specs = [s for s in value["spec"]["steps"] if selected is None or s["id"] == selected]
+    observations = observations or {s["id"]: assessment(value, s["id"]) for s in specs}
+    for spec in specs:
         key = spec["id"]
         step = value["steps"][key]
         if observations[key]["blocked"]:
@@ -1206,13 +1207,20 @@ def observe_external(store, expected, reference):
                 if state["state"] == "pending":
                     state.update(state="blocked", wait={"kind": "external_result_" + report["verdict"].lower(), "source_ref": reference, "next": "return current failure/not-run to original owner"})
         return store.update(expected, unavailable)
+    attempted = False
+    unavailable_reason = None
     for spec in value["spec"]["steps"]:
         key = spec["id"]
         if value["steps"][key]["state"] == "verified":
             continue
-        require(value["steps"][key]["state"] == "pending" or
-                (value["steps"][key]["state"] == "blocked" and value["steps"][key].get("coordination_wait", {}).get("state") == "pending"),
-                "effect collection cannot clear a refusal/unresolved original execution")
+        # Consume only this step's actual ready route. A scoped refusal,
+        # unknown outcome or missing dependency must not swallow other returns.
+        if key not in partition(value, selected=key)["ready"]:
+            if unavailable_reason is None:
+                pending = value["steps"][key]["state"] == "pending" or value["steps"][key].get("coordination_wait", {}).get("state") == "pending"
+                unavailable_reason = ("external effect has unresolved relationship or refusal" if pending else
+                                      "effect collection cannot clear a refusal/unresolved original execution")
+            continue
         selected = {}
         def begin(current):
             observations = enforce_constraints(current, "external_collection", key)
@@ -1228,6 +1236,7 @@ def observe_external(store, expected, reference):
             current["steps"][key].update(state="running", verification_attempts=attempts + 1)
             selected.update(execution)
         value = store.update(value["revision"], begin, reservation=True)
+        attempted = True
         checked = validate(value, key, "")
         def consume(current):
             require(current["execution"] and current["execution"]["id"] == selected["id"], "external result superseded")
@@ -1245,8 +1254,9 @@ def observe_external(store, expected, reference):
             require(len(current["history"]) <= 64, "task history bound reached")
             current["execution"] = None
         value = execution_update(store, value["revision"], selected["id"], consume)
-        if value["steps"][key]["state"] != "verified":return value
-    if not value["spec"].get("review_required") and not value["spec"].get("load_required") and (coordination.result_state(value) is None or not coordination.result_state(value)["pending"]):
+    complete = all(state["state"] == "verified" for state in value["steps"].values())
+    require(attempted or complete, unavailable_reason or "external effect has unresolved relationship or refusal")
+    if complete and not value["spec"].get("review_required") and not value["spec"].get("load_required") and (coordination.result_state(value) is None or not coordination.result_state(value)["pending"]):
         value = change(store, {"operation": "accept", "expected_revision": value["revision"]})
     return value
 
