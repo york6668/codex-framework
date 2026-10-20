@@ -1273,6 +1273,9 @@ def dispatch(codex_home):
             result = coordination.workset(codex_home, request)
             print(json.dumps(result, ensure_ascii=False, indent=2))
             return 2 if operation == "work" and not result["overall_complete"] else 0
+        if operation == "delivery-view":
+            print(json.dumps(coordination.delivery_view(request), ensure_ascii=False, indent=2))
+            return 0
         task_id = request.get("task_id")
         store = Store(codex_home, task_id)
         if operation == "register":

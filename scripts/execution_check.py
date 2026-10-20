@@ -2205,12 +2205,36 @@ def evaluate(payload):
     return result
 
 
+def loaded_tool_revision():
+    """Identify this physical module from the stable loader's pinned context.
+
+    Request fields, environment values and an active pointer cannot substitute
+    for the version actually executing. This is not caller authentication.
+    """
+    context = getattr(sys, "_codex_framework_runtime", None)
+    if not isinstance(context, dict):
+        return None
+    revision, directory = context.get("revision"), context.get("directory")
+    if (not isinstance(revision, str) or re.fullmatch(r"[0-9a-f]{40}", revision) is None
+            or not isinstance(directory, str)):
+        return None
+    try:
+        directory = Path(directory)
+        if (not directory.is_absolute() or directory.name != revision
+                or Path(__file__).resolve(strict=True) != (directory / "scripts/execution_check.py").resolve(strict=True)):
+            return None
+    except (OSError, ValueError, RuntimeError):
+        return None
+    return revision
+
+
 def dispatch():
     try:
         result = evaluate(json.load(sys.stdin))
     except (CheckError, ValueError, TypeError) as exc:
-        print(json.dumps({"status": "invalid", "error": str(exc)}, ensure_ascii=False))
+        print(json.dumps({"status": "invalid", "error": str(exc), "tool_revision": loaded_tool_revision()}, ensure_ascii=False))
         return 1
+    result["tool_revision"] = loaded_tool_revision()
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0 if result["status"] == "ready" else 2
 

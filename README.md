@@ -143,6 +143,16 @@ python3 /path/to/codex-framework/scripts/codex_framework.py install \
 
 工作方默认沿用现有配置和账户，不新建 API、凭据、付费方式，不代工具批准。只有本任务据实际官方能力选定时才显式登记 `native_model`、`native_reasoning_effort`；不静默换模型或重试不支持名称。成功退出0；`run/resume` 未验收退出2并返回下一动作或具体等待；输入、冲突或必需验证失败退出1。`status` 返回当前约束投影及验收观察，不能把源码、安装或一次回合结束当作整体实际闭环。
 
+### 主线与交付的只读关系
+
+`task` 的 `delivery-view` 操作直接投影现有主线、交付、多个原生任务和当前阶段证据，在构造任何 TaskStore 之前返回；不登记副本、不写状态、不查询或调用原生工具。父聊天提供沟通和主动发起，原实施、独验与依赖方直接交接；现有每小时汇总可集中查漏，不是持续推进的许可或必经中转。
+
+请求给当前 `baseline={id,source_ref}`、`mainlines=[{id,goal,source_ref,delivery_ids}]`、`deliveries=[{id,goal,source_ref,task_ids,stages}]`、`tasks=[{id,thread_id,turn_id,source_ref}]`，可带已取得的 `native_sources` 和 `observations`。`stages` 按具体交付声明适用的 source/build/install/load/adoption/verification，不适用项不凭空补流程；每项为 `{version,inputs,checks?,independent?}`。version=null 显示尚无冻结目标；inputs 精确关联已声明的上游阶段版本。实施交付与验证交付分开返回，原生 completed 只表示选定回合结束。
+
+每项 observation 给 `delivery_id,stage,case,task_id,baseline,version,inputs,result,source_ref,sha256,report`；report 是原结果 JSON 正文，其指纹与前八个关系字段须匹配，结果为 PASS/FAIL/NOT_RUN/UNKNOWN。新用例不能只改旧报告的 case 名称；相同原任务/回合/用例出现冲突来源不按第一份或摘要时间覆盖。历史范围仅在明确的 `reuse={baseline,source_ref,requirements,code,input,environment,method}` 五轴均为 unchanged、且目标版本/输入/用例仍匹配时复用；有改变就保持待复验。来源和适用性仍由原负责人按真实原件判断，JSON 标签和散列不认证作者、授权或领域结论。
+
+此入口只核当前显式关系及原报告字节，不自动读取文件或证明实际部署。source、build、install、load、adoption 的实际证据来自各原入口，当前加载版本的组合仍走适用独验。输出没有执行权限或后台运行保证，不可用它解除原拒绝、UNKNOWN 或真实必要依赖。
+
 ### 项目职责和多任务接续
 
 既有单任务 spec 继续使用。需要多项目协同时，模型按项目来源补 `project={id,goal,responsibility,source_ref,obligations:[{id,acceptance,task_ids}]}` 与 `assignment={owner,role,delivery_owner,covers}`；role 为 implementation、investigation、verification、integration、final_regression 或 coordination。`request_identity={thread_id,turn_id,message_id}` 绑定本轮选定原生输入。它们不证明授权或来源原件真实；旧 PASS 不能替代当前任务输入。`verify-return` 读取 workspace 内给定 path/sha256 的报告，核对 request_id/task_id/project_id/input_revision/task_input_sha256 及适用原生身份，只回报关联状态，不签收项目。
@@ -153,9 +163,11 @@ python3 /path/to/codex-framework/scripts/codex_framework.py install \
 
 已有外部任务成果可在登记时选 `execution_mode:"external"`，保留原执行方，使用 `verify-effects`（task_id、expected_revision、path、sha256）核验当前返回和已登记的实际文件；不再启动模型，也不伪造 native worker 或增加模型 runs。返回 JSON 须绑定 request_id、task_id、input_revision、task_input_sha256，已声明 project/request_identity 时一并完全相等；verdict 只能 PASS、FAIL、NOT_RUN。此入口只接受被动 file 检查，不接受任意命令并将其自称为读；已获准的验证由原任务沿原工具完成，再核验实际文件。PASS 仍须真实物理检查通过，历史拒绝或未知在途执行不能由该入口清除。`verify-return` 只核当前返回身份，不验收成果；原协调核原生来源，填写身份不能认证来源或授予权限。`work` 对此类任务只在 observations 提供该 task 的 `{path,sha256}` 时核验。未选此模式的既有任务继续沿原 run/resume；外部模式禁止模型 run/resume。
 
-最终收口由 `finalization={components,integration,regression,tracking,regression_report:{path,sha256},tracking_file:{path,sha256}}` 绑定现有任务。三类后续角色各有原责任：分项独验后集成，实际加载同一明确发布集合，再独立跨线总回归，最后更新原唯一清单。integration 与 final_regression 的 `artifact={manifest,sha256,versions}` 相同；versions 各项为 `{project_id,repo,ref,commit,tree}`，repo/manifest 相对该任务 workspace。manifest 内容为 `{versions,files:[{project_id,source,loaded,sha256}]}`，逐项核当前 Git ref、tree、source blob 和实际 loaded 文件，缺件不通过。它只验证声明的加载范围，业务部署完整性仍由项目契约和独验负责。最终汇总还读回每个组件的原独验报告及 Git 内容，不能仅凭 task input 相同承接 A 树的验收到 B 树。原报告的 `candidate_tree` 与采用 tree 相同时可复用完整受检树；合并树不同则原独验须明确 `reviewed_files:[{path,sha256,mode?}]` 的受检范围（最多64项），逐项核原树与采用树的普通 blob、字节与 Git mode 相同，并对应 manifest 中实际加载文件。不同组件的有效范围可进入同一组合树；改变受检内容须取得适用新独验，原独验未声明的范围不能由集成方自行缩小。文件/树关系检查不认证审阅者身份或证明领域验收完整。
+最终收口由 `finalization={components,integration,regression,regression_report:{path,sha256}}`，可同时给出 `tracking` 与 `tracking_file:{path,sha256}` 绑定现有任务。原后续职责直接衔接：分项独验后集成，实际加载同一明确发布集合，再独立跨线总回归，汇总随后按原责任更新；tracking 的同步状态单列，不作为功能交付的许可或硬前置。integration 与 final_regression 的 `artifact={manifest,sha256,versions}` 相同；versions 各项为 `{project_id,repo,ref,commit,tree}`，repo/manifest 相对该任务 workspace。manifest 内容为 `{versions,files:[{project_id,source,loaded,sha256}]}`，逐项核当前 Git ref、tree、source blob 和实际 loaded 文件，缺件不通过。它只验证声明的加载范围，业务部署完整性仍由项目契约和独验负责。最终汇总还读回每个组件的原独验报告及 Git 内容，不能仅凭 task input 相同承接 A 树的验收到 B 树。原报告的 `candidate_tree` 与采用 tree 相同时可复用完整受检树；合并树不同则原独验须明确 `reviewed_files:[{path,sha256,mode?}]` 的受检范围（最多64项），逐项核原树与采用树的普通 blob、字节与 Git mode 相同，并对应 manifest 中实际加载文件。不同组件的有效范围可进入同一组合树；改变受检内容须取得适用新独验，原独验未声明的范围不能由集成方自行缩小。文件/树关系检查不认证审阅者身份或证明领域验收完整。
 
-最终报告须为当前回归任务身份、PASS、artifact_sha256、component_inputs 精确映射、`component_results` 精确映射和独立 reviewer_thread；`component_results` 各组件绑定 task_input_sha256、实际结果 result_sha256、原 review_sha256/candidate_tree、project_id、adopted_commit/adopted_tree 与经过字节核对的 reviewed_files。原件内容、结果或 review 被替换时，旧总回归报告不能只沿用旧输入哈希；tracking 必须有原清单当前文件哈希验收。依赖版本改变、任务遗漏、旧报告或任何阶段未验，overall_complete 都保持 false。没有 finalization 时仅展示局部进展，不能把全部选中任务 PASS 当总体完结。
+最终报告须为当前回归任务身份、PASS、artifact_sha256、component_inputs 精确映射、`component_results` 精确映射和独立 reviewer_thread；`component_results` 各组件绑定 task_input_sha256、实际结果 result_sha256、原 review_sha256/candidate_tree、project_id、adopted_commit/adopted_tree 与经过字节核对的 reviewed_files。原件内容、结果或 review 被替换时，旧总回归报告不能只沿用旧输入哈希；若声明 tracking/tracking_file，则核其原清单当前文件哈希并单列 summary.synchronized 与具体缺口；两者可同时省略，不强制新增协调任务。功能依赖版本改变、任务遗漏、旧报告或功能阶段未验，overall_complete 保持 false；汇总未同步不把已验功能重新标成待修，也不清除其原任务上的拒绝。没有 finalization 时仅展示局部进展，不能把全部选中任务 PASS 当总体完结。
+
+正常 `check` 的输出附 `tool_revision`，来自稳定 loader 固定的实际物理模块上下文；源码调用或未匹配上下文为 null。它不从 active 指针、请求字段或环境值补出执行版本，不增加输入必填。消费者不能用 active/document 代替本次实际 tool_revision，加载或入口失败仍保留具体缺口。
 
 ## Codex 云端执行环境
 

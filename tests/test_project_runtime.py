@@ -294,13 +294,92 @@ class ProjectRuntimeTests(fixtures.FixtureCase):
         self.assertEqual(producer.call_count,1);self.assertTrue(result['tasks']['allowed-work']['accepted'])
         self.assertFalse(result['overall_complete']);self.assertIn('missing-current',result['errors'])
 
-    def test_current_cross_line_request_and_tracking_bytes_are_required(self):
+    def test_current_cross_line_request_required_but_tracking_bytes_are_separate(self):
         ids,final,report=self.prepare_final_chain()
         original=(self.root/'final-regression.json').read_bytes()
         report['request_id']='old-archive';final['regression_report']=self.put_report('final-regression.json',report)
         self.assertFalse(self.coordinate(ids,finalization=final)['overall_complete'])
         (self.root/'final-regression.json').write_bytes(original);final['regression_report']['sha256']=task.digest(original)
-        (self.root/'tracking.txt').write_text('old ledger bytes');self.assertFalse(self.coordinate(ids,finalization=final)['overall_complete'])
+        (self.root/'tracking.txt').write_text('old ledger bytes')
+        result=self.coordinate(ids,finalization=final)
+        self.assertTrue(result['overall_complete']);self.assertFalse(result['finalization']['summary']['synchronized'])
+
+    def test_missing_or_rejected_summary_does_not_close_original_functional_work(self):
+        ids,final,_=self.prepare_final_chain()
+        store=task.Store(self.a.codex_home,'tracking')
+        self.change(store,'approval',step='a',decision='denied',source_ref='synthetic:exact-summary-denial')
+        result=self.coordinate(ids,finalization=final)
+        self.assertTrue(result['overall_complete'],result['finalization'])
+        self.assertFalse(result['finalization']['summary']['synchronized'])
+        self.assertEqual(store.read()['steps']['a']['wait']['kind'],'explicit_denial')
+        before=store.path.read_bytes();store.path.unlink()
+        result=self.coordinate(ids,finalization=final)
+        self.assertTrue(result['overall_complete'],result['finalization'])
+        self.assertEqual(result['finalization']['summary']['status'],'pending')
+        store.path.write_bytes(before)
+
+    def test_functional_finalization_does_not_require_a_separate_summary_task(self):
+        ids,final,_=self.prepare_final_chain()
+        final.pop('tracking');final.pop('tracking_file')
+        result=self.coordinate([i for i in ids if i!='tracking'],finalization=final)
+        self.assertTrue(result['overall_complete'],result['finalization'])
+        self.assertEqual(result['finalization']['summary']['status'],'not_requested')
+
+    def test_tracking_label_cannot_erase_required_project_review(self):
+        ids,final,_=self.prepare_final_chain()
+        store,_=self.create('required-new-review',project='core',role='final_regression')
+        before=store.path.read_bytes()
+        ordinary=self.coordinate(ids+['required-new-review'],finalization=final)
+        self.assertFalse(ordinary['overall_complete'])
+        final['tracking']='required-new-review'
+        result=self.coordinate(ids+['required-new-review'],finalization=final)
+        self.assertFalse(result['overall_complete'])
+        self.assertFalse(result['projects']['core']['complete'])
+        self.assertFalse(result['tasks']['required-new-review']['accepted'])
+        self.assertEqual(result['finalization']['summary']['status'],'functional_task')
+        self.assertTrue(any(g['kind']=='project_scope_incomplete' for g in result['finalization']['gaps']))
+        self.assertIn('required-new-review',next(g['task_ids'] for g in result['finalization']['gaps'] if g['kind']=='named_tasks_remaining'))
+        self.assertEqual(store.path.read_bytes(),before)
+
+    def test_coordination_role_cannot_erase_project_obligation(self):
+        ids,final,_=self.prepare_final_chain()
+        store,_=self.create('required-project-coordinator',project='core',role='coordination')
+        before=store.path.read_bytes();final['tracking']='required-project-coordinator'
+        result=self.coordinate(ids+['required-project-coordinator'],finalization=final)
+        self.assertFalse(result['overall_complete'])
+        self.assertFalse(result['projects']['core']['complete'])
+        self.assertIsNone(result['finalization']['summary']['non_gating_task_id'])
+        self.assertEqual(store.path.read_bytes(),before)
+
+    def test_named_work_and_required_inputs_remain_when_labeled_tracking(self):
+        ids,final,_=self.prepare_final_chain()
+        self.create('ordinary-work')
+        final['tracking']='ordinary-work'
+        result=self.coordinate(ids+['ordinary-work'],finalization=final)
+        self.assertFalse(result['overall_complete'])
+        self.assertIn('ordinary-work',next(g['task_ids'] for g in result['finalization']['gaps'] if g['kind']=='named_tasks_remaining'))
+        _,required=self.create('required-input',role='coordination')
+        self.create('consumer',role='coordination',requires=[self.edge(required)])
+        final['tracking']='required-input'
+        result=self.coordinate(ids+['required-input','consumer'],finalization=final)
+        self.assertFalse(result['overall_complete'])
+        self.assertIsNone(result['finalization']['summary']['non_gating_task_id'])
+        self.assertIn('required-input',next(g['task_ids'] for g in result['finalization']['gaps'] if g['kind']=='named_tasks_remaining'))
+
+    def test_summary_scope_preserves_unassigned_work_and_missing_required_members(self):
+        _,value=self.create('unassigned',assignment=None)
+        final={'components':['impl'],'integration':'integrate','regression':'regress','tracking':'unassigned'}
+        result=coord.summary_observation({'unassigned':value},final,{})
+        self.assertEqual(result['status'],'functional_task')
+        self.assertIsNone(result['non_gating_task_id'])
+        owner={'task_id':'owner','spec':self.spec('owner',project='core')}
+        owner['spec']['project']['obligations'][0]['task_ids'].append('missing-required')
+        final['tracking']='missing-required'
+        result=coord.summary_observation({'owner':owner},final,{})
+        self.assertEqual(result['status'],'functional_task')
+        self.assertIsNone(result['non_gating_task_id'])
+        final['tracking']='regress'
+        self.assertIsNone(coord.summary_observation({},final,{})['non_gating_task_id'])
 
     def test_isolated_installed_cli_current_request_and_physical_collection(self):
         fixtures.install_runtime(self.a)

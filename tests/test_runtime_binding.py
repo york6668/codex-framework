@@ -46,6 +46,35 @@ class RuntimeBindingTests(FixtureCase):
         return (runtime.pointer(self.a).read_bytes(), self.a.target(".codex/AGENTS.md").read_bytes(),
                 self.a.state_path.read_bytes())
 
+    def test_bound_check_success_reports_physical_loaded_tool_revision(self):
+        from test_execution_check import action_case
+        self.install()
+        result=self.cli('check',payload=action_case())
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertEqual(json.loads(result.stdout)['tool_revision'],self.p)
+
+    def test_source_check_never_uses_request_or_unbound_context_as_revision(self):
+        from test_execution_check import action_case
+        import execution_check as check
+        request=action_case();request['tool_revision']='e'*40
+        for context in [None,{'revision':'f'*40,'directory':str(self.repo)},[],{'revision':True,'directory':str(self.repo)}]:
+            with self.subTest(context=context),mock.patch.object(sys,'_codex_framework_runtime',context,create=True),mock.patch('sys.stdin',io.StringIO(json.dumps(request))),contextlib.redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(check.dispatch(),0)
+            self.assertIsNone(json.loads(out.getvalue())['tool_revision'])
+
+    def test_physical_p_check_context_does_not_read_new_active_q_identity(self):
+        from test_execution_check import action_case
+        self.install();previous=runtime.version_path(self.a,self.p)
+        q=self.publish();self.install(revision=q,expected_runtime=self.p)
+        script=("import sys,json;sys.path.insert(0,sys.argv[1]);"
+                "sys._codex_framework_runtime={'directory':sys.argv[2],'revision':sys.argv[3]};"
+                "import execution_check;sys.exit(execution_check.dispatch())")
+        process=subprocess.run([sys.executable,'-B','-c',script,str(previous/'scripts'),str(previous),self.p],
+                               input=json.dumps(action_case()),capture_output=True,text=True,env=self.env,timeout=10)
+        self.assertEqual(process.returncode,0,process.stderr)
+        self.assertEqual(json.loads(process.stdout)['tool_revision'],self.p)
+        self.assertEqual(json.loads(self.cli('check',payload=action_case()).stdout)['tool_revision'],q)
+
     def test_n1_development_dependency_edit_and_missing_checkout_do_not_drift_cli(self):
         self.install()
         before = self.cli("check", payload={})

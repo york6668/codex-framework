@@ -444,6 +444,213 @@ def artifact(value):
     need(covered==set(projects),'release part has no actual loaded file evidence')
     return {'sha256':declared['sha256'],'versions':declared['versions'],'loaded_files':len(files)}
 
+# Delivery views are derived from existing native tasks and scoped evidence.
+# They have no Store, scheduler, permission grant or persistent status of their own.
+DELIVERY_STAGES = ('source', 'build', 'install', 'load', 'adoption', 'verification')
+REUSE_AXES = ('requirements', 'code', 'input', 'environment', 'method')
+
+
+def native_task_projection(binding, snapshots):
+    """Observe the selected original turn, never infer a delivery from its end."""
+    found = {}
+    for snapshot in snapshots:
+        if not isinstance(snapshot, dict) or type(snapshot.get('schemaVersion')) is not int or snapshot['schemaVersion'] != 1:
+            continue
+        thread = snapshot.get('thread')
+        if not isinstance(thread, dict) or thread.get('id') != binding['thread_id']:
+            continue
+        turns = snapshot.get('turns')
+        if not isinstance(turns, list):
+            continue
+        for turn in turns:
+            if isinstance(turn, dict) and turn.get('id') == binding['turn_id']:
+                found[task().encoded(turn)] = turn
+    if not found:
+        return dict(binding, native_status='unknown', native_observation='selected_turn_not_observed')
+    if len(found) != 1:
+        return dict(binding, native_status='unknown', native_observation='conflicting_selected_turn_snapshots')
+    turn = next(iter(found.values()))
+    status = turn.get('status')
+    return dict(binding, native_status=status if isinstance(status, str) else 'unknown',
+                native_observation='supplied_selected_turn', completion_scope='native turn only')
+
+
+def delivery_view(request):
+    """Read-only current delivery relationships; no task registration or effects.
+
+    Original callers retain evidence/authorship and domain interpretation duties.
+    A source reference and fingerprint identify an observation, not its truth.
+    This operation checks the supplied current-baseline/version relationships.
+    """
+    baseline = request.get('baseline')
+    need(isinstance(baseline, dict) and set(baseline) == {'id', 'source_ref'}
+         and all(text(baseline[k]) for k in baseline), 'delivery view needs the current requirement baseline and source')
+    definitions = request.get('deliveries')
+    mainlines = request.get('mainlines')
+    bindings = request.get('tasks', [])
+    observations = request.get('observations', [])
+    snapshots = request.get('native_sources', [])
+    need(isinstance(definitions, list) and 0 < len(definitions) <= 64, 'delivery view needs1..64 existing deliverables')
+    need(isinstance(mainlines, list) and 0 < len(mainlines) <= 32, 'delivery view needs1..32 mainlines')
+    need(isinstance(bindings, list) and len(bindings) <= 128, 'invalid existing task bindings')
+    need(isinstance(observations, list) and len(observations) <= 256, 'invalid delivery observations')
+    need(isinstance(snapshots, list) and len(snapshots) <= 128, 'invalid native snapshots')
+    tasks = {}
+    for binding in bindings:
+        need(isinstance(binding, dict) and set(binding) == {'id', 'thread_id', 'turn_id', 'source_ref'}
+             and identifier(binding['id']) and all(text(binding[k]) for k in ('thread_id', 'turn_id', 'source_ref')),
+             'invalid original task identity')
+        need(binding['id'] not in tasks, 'duplicate original task binding')
+        tasks[binding['id']] = native_task_projection(binding, snapshots)
+    records = {}
+    for observation in observations:
+        need(isinstance(observation, dict) and text(observation.get('delivery_id')), 'observation needs a delivery identity')
+        records.setdefault(observation['delivery_id'], []).append(observation)
+    deliveries = {}
+    for declared in definitions:
+        need(isinstance(declared, dict) and identifier(declared.get('id')), 'invalid deliverable identity')
+        identity = declared['id']
+        need(identity not in deliveries, 'duplicate deliverable identity')
+        row = {'goal': declared.get('goal'), 'source_ref': declared.get('source_ref'), 'task_ids': declared.get('task_ids'),
+               'stages': {}, 'gaps': [], 'historical_observations': [], 'implementation_delivery': {'complete': False},
+               'verification_delivery': {'complete': False}, 'complete': False}
+        deliveries[identity] = row
+        row['declared_contract'] = copy.deepcopy(declared)
+        if isinstance(declared.get('stages'), dict):
+            row['stages'] = {name: {'required': name in declared['stages'], 'complete': False,
+                'status': 'pending' if name in declared['stages'] else 'not_required_by_this_contract',
+                'target': copy.deepcopy(declared['stages'].get(name)), 'observations': [], 'gaps': []}
+                for name in DELIVERY_STAGES}
+        try:
+            need(set(declared) == {'id', 'goal', 'source_ref', 'task_ids', 'stages'}
+                 and text(declared['goal']) and text(declared['source_ref']), 'invalid deliverable contract')
+            ids = declared['task_ids']
+            need(isinstance(ids, list) and len(ids) <= 128 and all(identifier(i) for i in ids)
+                 and len(set(ids)) == len(ids), 'invalid deliverable task membership')
+            stages = declared['stages']
+            need(isinstance(stages, dict) and stages and set(stages) <= set(DELIVERY_STAGES)
+                 and any(s != 'verification' for s in stages), 'deliverable needs an explicit implementation stage')
+            row['tasks'] = {i: tasks.get(i) for i in ids}
+            if not ids or set(ids) - set(tasks):
+                row['gaps'].append({'kind': 'original_task_binding_missing', 'task_ids': sorted(set(ids) - set(tasks))})
+            eligible = []
+            for record in records.get(identity, []):
+                fields = {'delivery_id', 'stage', 'case', 'task_id', 'baseline', 'version', 'inputs', 'result', 'source_ref', 'sha256', 'report'}
+                need(fields <= set(record) <= fields | {'reuse'} and record['stage'] in DELIVERY_STAGES
+                     and all(text(record[k]) for k in ('case', 'task_id', 'baseline', 'version', 'source_ref'))
+                     and hashes(record['sha256']) and isinstance(record['inputs'], dict)
+                     and all(text(k) and text(v) for k, v in record['inputs'].items())
+                     and record['result'] in ('PASS', 'FAIL', 'NOT_RUN', 'UNKNOWN'), 'invalid scoped delivery observation')
+                need(record['task_id'] in ids, 'delivery observation belongs to another task')
+                need(isinstance(record['report'], str) and task().digest(record['report'].encode()) == record['sha256'],
+                     'original report bytes do not match the evidence fingerprint')
+                def unique(pairs):
+                    out = {}
+                    for key, child in pairs:
+                        need(key not in out, 'duplicate original report field')
+                        out[key] = child
+                    return out
+                def constant(value):
+                    raise ValueError('non-JSON original report value')
+                reported = json.loads(record['report'], object_pairs_hook=unique, parse_constant=constant)
+                need(isinstance(reported, dict) and all(type(reported.get(k)) is type(record[k]) and reported[k] == record[k]
+                     for k in ('delivery_id', 'stage', 'case', 'task_id', 'baseline', 'version', 'inputs', 'result')),
+                     'observation does not bind its original report content')
+                current = record['baseline'] == baseline['id']
+                if not current:
+                    reuse = record.get('reuse')
+                    current = (isinstance(reuse, dict) and set(reuse) == {'baseline', 'source_ref', *REUSE_AXES}
+                               and reuse['baseline'] == baseline['id'] and text(reuse['source_ref'])
+                               and all(reuse[k] == 'unchanged' for k in REUSE_AXES))
+                    if not current:
+                        row['historical_observations'].append({k:copy.deepcopy(v) for k,v in record.items() if k!='report'})
+                        continue
+                eligible.append(record)
+            for stage in DELIVERY_STAGES:
+                expected = stages.get(stage)
+                state = {'required': stage in stages, 'complete': False, 'observations': [], 'gaps': []}
+                row['stages'][stage] = state
+                if stage not in stages:
+                    state['status'] = 'not_required_by_this_contract'
+                    continue
+                need(isinstance(expected, dict) and {'version', 'inputs'} <= set(expected) <= {'version', 'inputs', 'checks', 'independent'}
+                     and (expected['version'] is None or text(expected['version'])) and isinstance(expected['inputs'], dict)
+                     and all(text(k) and text(v) for k, v in expected['inputs'].items()), 'invalid stage target/version links')
+                checks = expected.get('checks', ['result'])
+                need(isinstance(checks, list) and checks and len(checks) <= 64 and all(text(x) for x in checks)
+                     and len(set(checks)) == len(checks) and type(expected.get('independent', False)) is bool,
+                     'invalid current acceptance cases')
+                for linked, version in expected['inputs'].items():
+                    if linked in DELIVERY_STAGES:
+                        need(linked != stage and linked in stages and isinstance(stages[linked], dict)
+                             and stages[linked].get('version') == version, 'stage input refers to a different current version')
+                prior = [name for name in DELIVERY_STAGES[:DELIVERY_STAGES.index(stage)] if name in stages and name != 'verification']
+                if prior:
+                    upstream = 'load' if stage == 'verification' and 'load' in prior else prior[-1]
+                    need(upstream in expected['inputs'] and expected['inputs'][upstream] == stages[upstream]['version'],
+                         'stage needs its actual upstream current-version link')
+                state['target'] = copy.deepcopy(expected)
+                if expected['version'] is None:
+                    state['gaps'].append({'kind': 'current_version_not_frozen'})
+                for case in checks:
+                    candidates = [r for r in eligible if r['stage'] == stage and r['case'] == case
+                                  and r['version'] == expected['version'] and r['inputs'] == expected['inputs']]
+                    if not candidates:
+                        state['gaps'].append({'kind': 'current_stage_evidence_missing', 'case': case})
+                        continue
+                    state['observations'].extend({k:copy.deepcopy(v) for k,v in record.items() if k!='report'} for record in candidates)
+                    identities = {}
+                    for record in candidates:
+                        original = tasks.get(record['task_id'], {})
+                        key = (original.get('thread_id'), original.get('turn_id'))
+                        identities.setdefault(key, set()).add((record['result'], record['sha256']))
+                    if any(len(results) > 1 for results in identities.values()):
+                        state['gaps'].append({'kind': 'conflicting_original_result', 'case': case})
+                    if any(r['result'] != 'PASS' for r in candidates):
+                        state['gaps'].append({'kind': 'stage_result_not_passed_or_conflicting', 'case': case})
+                    if any(tasks.get(r['task_id'], {}).get('native_observation') == 'conflicting_selected_turn_snapshots'
+                           for r in candidates):
+                        state['gaps'].append({'kind': 'conflicting_original_native_observation', 'case': case})
+                    if expected.get('independent'):
+                        producers = {tasks[r['task_id']]['thread_id'] for r in eligible
+                                     if r['stage'] != 'verification' and r['task_id'] in tasks and r['stage'] in stages
+                                     and r['version'] == stages[r['stage']].get('version')
+                                     and r['inputs'] == stages[r['stage']].get('inputs')}
+                        if any(r['task_id'] not in tasks or tasks[r['task_id']]['thread_id'] in producers for r in candidates):
+                            state['gaps'].append({'kind': 'independent_verification_not_bound', 'case': case})
+                state['complete'] = not state['gaps']
+                state['status'] = 'bound_current_observations' if state['complete'] else 'pending'
+                row['gaps'].extend(dict(gap, stage=stage) for gap in state['gaps'])
+            row['implementation_delivery'] = {'complete': all(s['complete'] for k, s in row['stages'].items()
+                if s['required'] and k != 'verification'), 'scope': 'declared implementation stages only'}
+            verify = row['stages']['verification']
+            row['verification_delivery'] = {'required': verify['required'], 'complete': verify['complete'] if verify['required'] else None,
+                                            'scope': 'current exact-version declared verification cases only'}
+            row['complete'] = not row['gaps']
+        except (task().TaskError, TypeError, ValueError, RecursionError) as exc:
+            row['gaps'].append({'kind': 'invalid_delivery_contract_or_observation', 'detail': str(exc)})
+    lines, linked, issues = {}, set(), []
+    for line in mainlines:
+        need(isinstance(line, dict) and set(line) == {'id', 'goal', 'source_ref', 'delivery_ids'}
+             and identifier(line['id']) and text(line['goal']) and text(line['source_ref']), 'invalid mainline')
+        need(line['id'] not in lines, 'duplicate mainline')
+        ids = line['delivery_ids']
+        need(isinstance(ids, list) and ids and len(ids) <= 64 and all(identifier(i) for i in ids)
+             and len(set(ids)) == len(ids), 'invalid mainline delivery membership')
+        linked.update(ids)
+        gaps = [{'delivery_id': i, 'kind': 'delivery_pending' if i in deliveries else 'delivery_missing'}
+                for i in ids if i not in deliveries or not deliveries[i]['complete']]
+        lines[line['id']] = dict(line, complete=not gaps, gaps=gaps)
+    if set(deliveries) - linked:
+        issues.append({'kind': 'unlinked_deliveries', 'delivery_ids': sorted(set(deliveries) - linked)})
+    if set(records) - set(deliveries):
+        issues.append({'kind': 'observation_for_unknown_delivery', 'delivery_ids': sorted(set(records) - set(deliveries))})
+    return {'baseline': baseline, 'mainlines': lines, 'deliveries': deliveries, 'tasks': tasks, 'issues': issues,
+            'complete': not issues and all(line['complete'] for line in lines.values()),
+            'scope': 'supplied current requirement/version/evidence bindings; no native authenticity or domain acceptance granted',
+            'effect': 'pure_projection_no_store_or_tool_calls', 'summary_is_execution_gate': False}
+
+
 def project_view(values,errors):
     projects={}
     for value in values.values():
@@ -465,6 +672,7 @@ def project_view(values,errors):
                 if not p or p['id']!=identity or name not in assignment.get('covers',[]):result['gaps'].append({'kind':'wrong_task_assignment','task_id':member,'obligation':name})
                 elif not current_accepted(value) or dependency_gaps(value) or any(task().assessment(value,n)['blocked'] for n in value['steps']):result['gaps'].append({'kind':'project_obligation_remaining','task_id':member,'obligation':name})
         result['complete']=not result['gaps']
+        result['completion_scope']='registered finite task obligations only; native task end and delivery-stage completion are separate'
     return projects
 
 def declared_link(value,identity,fingerprint):
@@ -523,22 +731,76 @@ def component_bindings(values,ids,integration,loaded):
             'adopted_commit':version['commit'],'adopted_tree':version['tree'],'reviewed_files':sorted(files,key=lambda f:f['path'])}
     return bindings
 
+def non_gating_summary(values, declared):
+    """A tracking label cannot remove existing functional responsibilities."""
+    identity = declared.get('tracking')
+    if identity is None or identity in declared['components'] + [declared['integration'], declared['regression']]:
+        return None
+    for value in values.values():
+        spec = value['spec']
+        if any(identity in obligation['task_ids'] for obligation in (spec.get('project') or {}).get('obligations', [])):
+            return None
+        if value['task_id'] != identity and any(edge['task_id'] == identity and edge['basis']['status'] == 'proven'
+                                               for edge in spec.get('requires', [])):
+            return None
+    value = values.get(identity)
+    if value is not None and (value['spec'].get('assignment') or {}).get('role') != 'coordination':
+        return None
+    return identity
+
+
+def summary_observation(values, declared, regression):
+    """Aggregate freshness is observable work, not delivery admission."""
+    result = {'synchronized': None, 'gaps': [], 'execution_gate': False}
+    identity = declared.get('tracking')
+    if identity is None:
+        result['status'] = 'not_requested'
+        return result
+    result.update(task_id=identity, synchronized=False, status='pending')
+    result['non_gating_task_id'] = non_gating_summary(values, declared)
+    if result['non_gating_task_id'] is None:
+        result['status'] = 'functional_task'
+        result['gaps'].append({'kind': 'summary_identity_has_functional_scope', 'task_id': identity})
+        return result
+    value = values.get(identity)
+    if value is None:
+        result['gaps'].append({'kind': 'summary_task_not_observed', 'task_id': identity})
+        return result
+    try:
+        need(current_accepted(value) and not dependency_gaps(value), 'summary task has not accepted its current input')
+        need(declared_link(value, regression['task_id'], regression['acceptance_sha256']), 'summary does not refer to the current regression')
+        ledger = declared['tracking_file']
+        need(isinstance(ledger, dict) and set(ledger) == {'path', 'sha256'}, 'invalid summary-file reference')
+        checks = [(step['id'], check) for step in value['spec']['steps'] for check in step['checks']
+                  if check['kind'] == 'file' and check['path'] == ledger['path'] and check['sha256'] == ledger['sha256']]
+        need(checks, 'summary update has no registered actual file observation')
+        need(task().checked_file(value, checks[0][0], dict(checks[0][1]))['passed'], 'summary bytes are stale or unavailable')
+        result.update(synchronized=True, status='current')
+    except (task().TaskError, OSError, ValueError) as exc:
+        result['gaps'].append({'kind': 'summary_not_current', 'detail': str(exc)})
+    return result
+
+
 def finalization(values,project_results,declared):
-    result={'complete':False,'gaps':[]}
+    result={'complete':False,'gaps':[],'summary':{'synchronized':None,'status':'not_observed','execution_gate':False}}
     if declared is None:result['gaps'].append({'kind':'cross_line_finalization_not_provided'});return result
-    need(isinstance(declared,dict) and set(declared)=={'components','integration','regression','tracking','regression_report','tracking_file'},'invalid finalization contract')
+    need(isinstance(declared,dict) and {'components','integration','regression','regression_report'}<=set(declared)<= {'components','integration','regression','regression_report','tracking','tracking_file'} and ('tracking' in declared)==('tracking_file' in declared),'invalid finalization contract')
     ids=declared['components'];need(isinstance(ids,list) and 0<len(ids)<=32 and all(identifier(x) for x in ids) and len(set(ids))==len(ids),'invalid final component set')
-    for name in ('integration','regression','tracking'):need(identifier(declared[name]),'invalid finalization task identity')
-    need(len(set(ids+[declared[n] for n in ('integration','regression','tracking')]))==len(ids)+3,'finalization responsibilities overlap')
-    needed=set(ids+[declared[n] for n in ('integration','regression','tracking')])
+    for name in ('integration','regression'):need(identifier(declared[name]),'invalid finalization task identity')
+    if 'tracking' in declared:need(identifier(declared['tracking']),'invalid summary task identity')
+    need(len(set(ids+[declared[n] for n in ('integration','regression')]))==len(ids)+2,'finalization responsibilities overlap')
+    needed=set(ids+[declared[n] for n in ('integration','regression')])
     if needed-set(values):result['gaps'].append({'kind':'finalization_tasks_missing','task_ids':sorted(needed-set(values))});return result
+    integration=values[declared['integration']];regression=values[declared['regression']]
+    result['summary']=summary_observation(values,declared,regression)
+    summary_id=result['summary'].get('non_gating_task_id')
     for identity,p in project_results.items():
-        if p['gaps']:result['gaps'].append({'kind':'project_scope_incomplete','project_id':identity,'gaps':p['gaps']})
+        gaps=[g for g in p['gaps'] if summary_id is None or g.get('task_id')!=summary_id]
+        if gaps:result['gaps'].append({'kind':'project_scope_incomplete','project_id':identity,'gaps':gaps})
         required={m for o in p['obligations'].values() for m in o['task_ids']}
         omitted=[m for m in required if values.get(m,{}).get('spec',{}).get('assignment',{}).get('role') in ('implementation','investigation') and m not in ids]
         if omitted:result['gaps'].append({'kind':'final_component_omitted','task_ids':sorted(omitted)})
-    integration=values[declared['integration']];regression=values[declared['regression']];tracking=values[declared['tracking']]
-    for value,role in [(integration,'integration'),(regression,'final_regression'),(tracking,'coordination')]:
+    for value,role in [(integration,'integration'),(regression,'final_regression')]:
         if value['spec'].get('assignment',{}).get('role')!=role or not current_accepted(value) or dependency_gaps(value):result['gaps'].append({'kind':'final_stage_not_accepted','role':role,'task_id':value['task_id']})
     for identity in ids:
         value=values[identity]
@@ -548,7 +810,6 @@ def finalization(values,project_results,declared):
         if not current_accepted(value) or not value.get('review') or value['review'].get('task_input_sha256')!=value['acceptance_sha256']:result['gaps'].append({'kind':'component_independent_verification_missing','task_id':identity})
         if not declared_link(integration,identity,value['acceptance_sha256']):result['gaps'].append({'kind':'integration_input_not_bound','task_id':identity})
     if not declared_link(regression,integration['task_id'],integration['acceptance_sha256']):result['gaps'].append({'kind':'regression_not_after_integration'})
-    if not declared_link(tracking,regression['task_id'],regression['acceptance_sha256']):result['gaps'].append({'kind':'tracking_not_after_final_regression'})
     try:
         loaded=artifact(integration);tested=artifact(regression)
         need(loaded is not None and loaded==tested,'final regression did not use the same actual merged/loaded release')
@@ -563,13 +824,11 @@ def finalization(values,project_results,declared):
         implementers={values[i]['spec'].get('assignment',{}).get('owner') for i in ids}|{integration['spec'].get('assignment',{}).get('owner')}
         need(text(report.get('reviewer_thread')) and report['reviewer_thread'] not in implementers,'final regression is not independent of implementation/integration')
         for item in [values[i] for i in ids]+[integration]:need(report['reviewer_thread'] not in {s.get('session_id') for s in item['steps'].values()},'worker self-test cannot sign cross-line final regression')
-        ledger=declared['tracking_file'];need(isinstance(ledger,dict) and set(ledger)=={'path','sha256'},'invalid unique tracking-file reference')
-        registered=[c for step in tracking['spec']['steps'] for c in step['checks'] if c['kind']=='file' and c['path']==ledger['path'] and c['sha256']==ledger['sha256']]
-        need(registered,'tracking update has no registered actual file acceptance')
-        need(task().checked_file(tracking,tracking['spec']['steps'][0]['id'],dict(registered[0]))['passed'],'unique tracking file update not observed')
         result['artifact']=loaded;result['independent_report_sha256']=reportref['sha256']
     except (task().TaskError,OSError,ValueError) as exc:result['gaps'].append({'kind':'final_acceptance_unproven','detail':str(exc)})
-    result['complete']=not result['gaps'];return result
+    result['complete']=not result['gaps']
+    result['completion_scope']='declared functional delivery and current loaded regression; aggregate synchronization is separate'
+    return result
 
 def workset(codex_home,request):
     ids=request.get('task_ids');need(isinstance(ids,list) and 0<len(ids)<=32 and all(identifier(v) for v in ids) and len(set(ids))==len(ids),'workset needs named existing task IDs')
@@ -635,10 +894,12 @@ def workset(codex_home,request):
             try:values[identity]=peer(root,identity)
             except (task().TaskError,OSError,ValueError) as exc:errors[identity]=str(exc)
         projects=project_view(values,errors);closed=finalization(values,projects,request.get('finalization'))
-        if errors:
-            closed['gaps'] += [{'kind':'named_task_not_observed','task_id':identity,'detail':detail} for identity,detail in sorted(errors.items())]
+        summary_id=closed['summary'].get('non_gating_task_id')
+        functional_errors={identity:detail for identity,detail in errors.items() if identity!=summary_id}
+        if functional_errors:
+            closed['gaps'] += [{'kind':'named_task_not_observed','task_id':identity,'detail':detail} for identity,detail in sorted(functional_errors.items())]
             closed['complete']=False
-        remaining=[identity for identity,current in projected.items() if not current['accepted']]
+        remaining=[identity for identity,current in projected.items() if not current['accepted'] and identity!=summary_id]
         if remaining:
             closed['gaps'].append({'kind':'named_tasks_remaining','task_ids':remaining})
             closed['complete']=False
