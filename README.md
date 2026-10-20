@@ -13,7 +13,7 @@ Mac mini 上的全局文档和 Skills 是部署副本，供 Codex 加载使用�
 
 本文的“GitHub 项目”指源码与规范来源，“Codex 云端执行环境”指任务运行位置。Mac mini 直接通过当前可用的仓库连接或 Git 访问 GitHub，读取规范不要求中转到另一个 Codex 任务。本仓为私有仓库，使用独立 Git 历史；旧 GitLab 配置仓与记忆仓仅保留历史用途，现行共享框架以本 GitHub 项目为准。
 
-历史记忆、任务记录、业务代码/数据、会话、认证、工具授权规则、插件包和运行缓存不在本框架同步范围内。业务源码与契约由各业务仓库维护；实际机器配置与数据留在执行节点。
+历史记忆、任务记录、业务代码/数据、会话、认证、工具授权规则、插件包和运行缓存不在本框架同步范围内。公司业务源码、契约与长期测试源码由公司 GitLab 维护，本地检出负责实现与测试，不迁入共享框架；运行材料、实际机器配置与数据留在执行节点。获准文档、页面运行资源和效果图按项目交付范围导出。
 
 ## 任务如何使用框架
 
@@ -30,6 +30,7 @@ Mac mini 上的全局文档和 Skills 是部署副本，供 Codex 加载使用�
 |---|---|
 | `.codex/AGENTS.md` | 稳定偏好、授权与拒绝、来源/数据/额度保护及方法发现指针。 |
 | [需求到交付](.agents/skills/york-task-alignment/SKILL.md) | 首次复杂工作、纵向切片、实际依赖、授权交接、结果回收及父目标接续；简单任务直接完成。模型执行方法，非自动调度程序。 |
+| [框架内业务系统方法](.agents/skills/york-engineering/references/business-workflow.md) | 承接核心编排，规定项目业务规范、执行要求、测试方法和交付标准，并检查实际成果；前后台效果交付包含文档说明、页面效果和统一入口。具体实现与事实由本地项目提供。 |
 | [通用工程](.agents/skills/york-engineering/SKILL.md) | 任意语言的需求理解、职责/接口设计、缺陷反馈、验证及两轴审查；[Java](.agents/skills/york-java-test/SKILL.md) 负责 JDK/Maven/JUnit 等执行适配。 |
 | [跨仓契约](.agents/skills/york-cross-repo-change/SKILL.md)、[资料](.agents/skills/york-provider-docs/SKILL.md) | 生产消费边界、语义与 mapping；不反向定义用户新目标。 |
 | [日志](.agents/skills/york-log-query/SKILL.md)、[本地数据](.agents/skills/york-local-data/SKILL.md)、[工作站](.agents/skills/york-workstation/SKILL.md) | 按疑点取证、隔离数据及节点资源方法；真实系统操作仍按原授权。 |
