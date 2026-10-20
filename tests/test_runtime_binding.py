@@ -1,11 +1,14 @@
 """Isolated N1–N9 runtime binding regressions; no live home, model or service."""
 
+import ast
 import contextlib
 import copy
+import fcntl
 import io
 import json
 import os
 from pathlib import Path
+import select
 import shlex
 import subprocess
 import sys
@@ -32,6 +35,249 @@ class RuntimeBindingTests(FixtureCase):
                                "--home", str(f.home), "--codex-home", str(f.codex_home), *arguments],
                               input=json.dumps(payload) if payload is not None else None,
                               capture_output=True, text=True, env=self.env, timeout=10)
+
+    def source_cli(self, *arguments, f=None):
+        f = f or self.a
+        return subprocess.run([sys.executable, str(self.repo / "scripts/codex_framework.py"),
+                               "--repo", str(self.repo), "--home", str(f.home),
+                               "--codex-home", str(f.codex_home), *arguments],
+                              capture_output=True, text=True, env=self.env, timeout=10)
+
+    def start_loader_reader(self):
+        # Observe the real flock on the supported launcher, pausing only after
+        # acquisition. No runtime import, pointer or validation is substituted.
+        probe = self.root / "lock-observer"
+        put(probe / "sitecustomize.py", '''import fcntl, json, os, sys
+original_flock = fcntl.flock
+def observe_flock(stream, operation):
+    result = original_flock(stream, operation)
+    if operation == fcntl.LOCK_SH | fcntl.LOCK_NB:
+        fd = stream if isinstance(stream, int) else stream.fileno()
+        info = os.fstat(fd)
+        print(json.dumps({"access_mode": fcntl.fcntl(fd, fcntl.F_GETFL) & os.O_ACCMODE,
+                          "device": info.st_dev, "inode": info.st_ino}), flush=True)
+        sys.stdin.readline()
+    return result
+fcntl.flock = observe_flock
+''')
+        process = subprocess.Popen([sys.executable, str(runtime.launcher_path(self.a)),
+                                    "--home", str(self.a.home), "--codex-home", str(self.a.codex_home),
+                                    "sync-status"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, text=True,
+                                   env=dict(self.env, PYTHONPATH=str(probe)))
+        def cleanup():
+            if process.poll() is None:
+                process.kill()
+                process.communicate(timeout=5)
+            for stream in (process.stdin, process.stdout, process.stderr):
+                stream.close()
+        self.addCleanup(cleanup)
+        self.assertTrue(select.select([process.stdout], [], [], 5)[0], "loader did not acquire its lock")
+        line = process.stdout.readline()
+        self.assertTrue(line, "loader exited before its lock observation")
+        return process, json.loads(line)
+
+    def test_loader_reads_existing_read_only_lock_without_changing_it(self):
+        installed = self.source_cli("install", "--revision", self.p)
+        self.assertEqual(installed.returncode, 0, installed.stderr)
+        lock = self.a.codex_home / "framework-sync/lock"
+        lock.chmod(0o444)
+        before = lock.stat()
+        result = self.cli("sync-status")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(json.loads(result.stdout)["runtime"]["tool_revision"], self.p)
+        after = lock.stat()
+        self.assertEqual((after.st_ino, after.st_size, after.st_mtime_ns, after.st_mode),
+                         (before.st_ino, before.st_size, before.st_mtime_ns, before.st_mode))
+
+    def test_loader_missing_lock_fails_without_creating_it_and_installer_can_create_it(self):
+        installed = self.source_cli("install", "--revision", self.p)
+        self.assertEqual(installed.returncode, 0, installed.stderr)
+        lock = self.a.codex_home / "framework-sync/lock"
+        lock.unlink()
+        for command in ("sync-status", "status", "check", "session-start"):
+            with self.subTest(command=command):
+                if lock.exists():
+                    lock.unlink()
+                result = self.cli(command, payload={} if command in ("check", "session-start") else None)
+                self.assertFalse(lock.exists(), result.stdout + result.stderr)
+                self.assertEqual(result.returncode, 0 if command == "session-start" else 1,
+                                 result.stdout + result.stderr)
+                data = json.loads(result.stdout)
+                if command == "session-start":
+                    self.assertIn("unknown", data["hookSpecificOutput"]["additionalContext"])
+                else:
+                    self.assertEqual(data["status"], "runtime-unavailable")
+                    self.assertIsNone(data["tool_revision"])
+                    self.assertEqual(data["active_revision"], self.p)
+                    self.assertIn("No such file", data["reason"])
+        repaired = self.source_cli("install", "--revision", self.p, "--expected-runtime", self.p)
+        self.assertEqual(repaired.returncode, 0, repaired.stdout + repaired.stderr)
+        self.assertTrue(lock.is_file())
+        self.assertEqual(self.cli("sync-status").returncode, 0)
+
+    def test_loader_read_only_readers_share_lock_and_exclude_installer_until_release(self):
+        installed = self.source_cli("install", "--revision", self.p)
+        self.assertEqual(installed.returncode, 0, installed.stderr)
+        readers = [self.start_loader_reader(), self.start_loader_reader()]
+        for _, observation in readers:
+            self.assertEqual(observation["access_mode"], os.O_RDONLY)
+        self.assertEqual(readers[0][1], readers[1][1])
+        before = self.installed_state()
+        blocked = self.source_cli("install", "--revision", self.p)
+        self.assertNotEqual(blocked.returncode, 0)
+        self.assertIn("本设备已有框架同步操作", blocked.stderr)
+        self.assertEqual(self.installed_state(), before)
+        for process, _ in readers:
+            stdout, stderr = process.communicate("release\n", timeout=5)
+            self.assertEqual(process.returncode, 0, stderr)
+            self.assertEqual(json.loads(stdout)["runtime"]["tool_revision"], self.p)
+        installed = self.source_cli("install", "--revision", self.p)
+        self.assertEqual(installed.returncode, 0, installed.stdout + installed.stderr)
+
+    def test_loader_exclusive_lock_refuses_reader_then_releases_normally(self):
+        installed = self.source_cli("install", "--revision", self.p)
+        self.assertEqual(installed.returncode, 0, installed.stderr)
+        before = self.installed_state()
+        with (self.a.codex_home / "framework-sync/lock").open("rb") as stream:
+            fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            blocked = self.cli("sync-status")
+            self.assertEqual(blocked.returncode, 1, blocked.stderr)
+            data = json.loads(blocked.stdout)
+            self.assertEqual(data["status"], "runtime-unavailable")
+            self.assertIn("Resource temporarily unavailable", data["reason"])
+            self.assertIsNone(data["tool_revision"])
+            self.assertEqual(self.installed_state(), before)
+        self.assertEqual(self.cli("sync-status").returncode, 0)
+
+    def test_loader_interrupted_reader_releases_shared_lock(self):
+        installed = self.source_cli("install", "--revision", self.p)
+        self.assertEqual(installed.returncode, 0, installed.stderr)
+        process, observation = self.start_loader_reader()
+        self.assertEqual(observation["access_mode"], os.O_RDONLY)
+        blocked = self.source_cli("install", "--revision", self.p)
+        self.assertNotEqual(blocked.returncode, 0)
+        process.terminate()
+        process.communicate(timeout=5)
+        self.assertLess(process.returncode, 0)
+        installed = self.source_cli("install", "--revision", self.p)
+        self.assertEqual(installed.returncode, 0, installed.stdout + installed.stderr)
+        self.assertEqual(self.cli("sync-status").returncode, 0)
+
+    def test_loader_lock_symlink_is_rejected_without_touching_target(self):
+        installed = self.source_cli("install", "--revision", self.p)
+        self.assertEqual(installed.returncode, 0, installed.stderr)
+        lock = self.a.codex_home / "framework-sync/lock"
+        target = self.root / "unrelated-lock-target"
+        put(target, "preserve")
+        lock.unlink()
+        lock.symlink_to(target)
+        result = self.cli("sync-status")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("symlink in runtime lock path", json.loads(result.stdout)["reason"])
+        self.assertEqual(target.read_text(), "preserve")
+
+    def test_loader_legacy_templates_upgrade_rollback_and_previous_installer_handoff(self):
+        path = self.repo / "scripts/framework_runtime.py"
+        current = path.read_text()
+        for count in (7, 9, 10):
+            with self.subTest(modules=count):
+                # Construct the supported old closure and append-mode loader;
+                # an old installer emits its own template during a handoff.
+                legacy = current.replace('with lock.open("rb")', 'with lock.open("a")')
+                legacy = legacy.replace('change("launcher", prior_loader_bytes(f, new_active))',
+                                        'change("launcher", loader_bytes(f))')
+                declaration = next(n for n in ast.parse(legacy).body if isinstance(n, ast.Assign)
+                                   and isinstance(n.targets[0], ast.Name) and n.targets[0].id == "MODULES")
+                lines = legacy.splitlines(keepends=True)
+                lines[declaration.lineno - 1:declaration.end_lineno] = ["MODULES = " + repr(runtime.MODULES[:count]) + "\n"]
+                path.write_text("".join(lines))
+                run_git(self.repo, "add", str(path))
+                run_git(self.repo, "commit", "-m", "synthetic legacy loader " + str(count))
+                previous = run_git(self.repo, "rev-parse", "HEAD")
+                f = cf.Framework(self.repo, self.root / ("legacy-device-" + str(count)))
+                installed = self.source_cli("install", "--revision", previous, f=f)
+                self.assertEqual(installed.returncode, 0, installed.stdout + installed.stderr)
+                old_launcher = runtime.launcher_path(f).read_bytes()
+                self.assertEqual(json.loads(self.cli("sync-status", f=f).stdout)["runtime"]["tool_revision"], previous)
+                path.write_text(current)
+                run_git(self.repo, "add", str(path))
+                run_git(self.repo, "commit", "-m", "new read-only loader " + str(count))
+                revision = run_git(self.repo, "rev-parse", "HEAD")
+                installed = self.source_cli("install", "--revision", revision, "--expected-runtime", previous, f=f)
+                self.assertEqual(installed.returncode, 0, installed.stdout + installed.stderr)
+                self.assertEqual(runtime.launcher_path(f).read_bytes(), runtime.loader_bytes(f))
+                self.assertEqual(json.loads(self.cli("sync-status", f=f).stdout)["runtime"]["tool_revision"], revision)
+                rollback = self.cli("runtime-rollback", "--revision", previous, "--expected-runtime", revision, f=f)
+                self.assertEqual(rollback.returncode, 0, rollback.stdout + rollback.stderr)
+                self.assertEqual(runtime.launcher_path(f).read_bytes(), old_launcher)
+                self.assertEqual(json.loads(self.cli("sync-status", f=f).stdout)["runtime"]["tool_revision"], previous)
+                hook = self.source_cli("install-hook", f=f)
+                self.assertEqual(hook.returncode, 0, hook.stdout + hook.stderr)
+                if count != len(runtime.MODULES):
+                    # An old smaller closure cannot approve a future closure;
+                    # migration uses the supported new-source installer.
+                    installed = self.source_cli("install", "--revision", revision,
+                                                "--expected-runtime", previous, f=f)
+                    self.assertEqual(installed.returncode, 0, installed.stdout + installed.stderr)
+                    self.assertEqual(runtime.launcher_path(f).read_bytes(), runtime.loader_bytes(f))
+                    self.assertEqual(json.loads(self.cli("sync-status", f=f).stdout)["runtime"]["tool_revision"], revision)
+                    continue
+                handoff = self.cli("install", "--revision", revision, "--expected-runtime", previous, f=f)
+                self.assertEqual(handoff.returncode, 0, handoff.stdout + handoff.stderr)
+                self.assertEqual(runtime.launcher_path(f).read_bytes(), old_launcher)
+                hook = self.source_cli("install-hook", f=f)
+                self.assertEqual(hook.returncode, 0, hook.stdout + hook.stderr)
+                unknown = old_launcher + b"\n# unrecognized local launcher change\n"
+                runtime.launcher_path(f).write_bytes(unknown)
+                rejected = self.source_cli("install", "--revision", revision, f=f)
+                self.assertNotEqual(rejected.returncode, 0)
+                self.assertEqual(runtime.launcher_path(f).read_bytes(), unknown)
+                runtime.launcher_path(f).write_bytes(old_launcher)
+                repaired = self.cli("install", "--revision", revision, "--expected-runtime", revision, f=f)
+                self.assertEqual(repaired.returncode, 0, repaired.stdout + repaired.stderr)
+                self.assertEqual(runtime.launcher_path(f).read_bytes(), runtime.loader_bytes(f))
+                self.assertEqual(json.loads(self.cli("sync-status", f=f).stdout)["runtime"]["tool_revision"], revision)
+
+    def test_loader_template_upgrade_interruption_recovers_old_entry_through_cli(self):
+        path = self.repo / "scripts/framework_runtime.py"
+        current = path.read_text()
+        path.write_text(current.replace('with lock.open("rb")', 'with lock.open("a")'))
+        run_git(self.repo, "add", str(path))
+        run_git(self.repo, "commit", "-m", "synthetic append-mode loader")
+        previous = run_git(self.repo, "rev-parse", "HEAD")
+        installed = self.source_cli("install", "--revision", previous)
+        self.assertEqual(installed.returncode, 0, installed.stdout + installed.stderr)
+        before = self.installed_state()
+        old_launcher = runtime.launcher_path(self.a).read_bytes()
+        # Inject the existing checkpoint seam into this fixture's candidate
+        # source, so installation and recovery still use supported CLI entries.
+        interrupted = current.replace('def checkpoint(name):',
+                                      'def checkpoint(name):\n    if name == "launcher":\n'
+                                      '        raise RuntimeError("isolated template switch interruption")')
+        path.write_text(interrupted)
+        run_git(self.repo, "add", str(path))
+        run_git(self.repo, "commit", "-m", "synthetic interrupted template switch")
+        revision = run_git(self.repo, "rev-parse", "HEAD")
+        failed = self.source_cli("install", "--revision", revision, "--expected-runtime", previous)
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertIn("isolated template switch interruption", failed.stderr)
+        self.assertEqual(runtime.launcher_path(self.a).read_bytes(), runtime.loader_bytes(self.a))
+        status = self.cli("sync-status")
+        self.assertEqual(json.loads(status.stdout)["runtime"]["status"], "update-incomplete")
+        recovered = self.cli("runtime-recover")
+        self.assertEqual(recovered.returncode, 0, recovered.stdout + recovered.stderr)
+        self.assertEqual(json.loads(recovered.stdout)["status"], "recovered")
+        self.assertEqual(self.installed_state(), before)
+        self.assertEqual(runtime.launcher_path(self.a).read_bytes(), old_launcher)
+        self.assertFalse(runtime.journal(self.a).exists())
+        path.write_text(current)
+        run_git(self.repo, "add", str(path))
+        run_git(self.repo, "commit", "-m", "read-only loader after recovery")
+        revision = run_git(self.repo, "rev-parse", "HEAD")
+        installed = self.source_cli("install", "--revision", revision, "--expected-runtime", previous)
+        self.assertEqual(installed.returncode, 0, installed.stdout + installed.stderr)
+        self.assertEqual(json.loads(self.cli("sync-status").stdout)["runtime"]["tool_revision"], revision)
 
     def publish(self, mutate=None):
         path = self.repo / ".codex/AGENTS.md"

@@ -302,7 +302,7 @@ def main():
     for path in (lock, *lock.parents):
         if path.is_symlink():
             raise ValueError("symlink in runtime lock path")
-    with lock.open("a") as stream:
+    with lock.open("rb") as stream:
         fcntl.flock(stream, fcntl.LOCK_SH | fcntl.LOCK_NB)
         runtime = ROOT / "framework-sync/runtime"
         p = runtime / "active.json"
@@ -386,7 +386,7 @@ def loader_bytes(f):
 
 
 def prior_loader_bytes(f, prior):
-    """Recognize the exact prior managed template without executing old source."""
+    """Read an approved package's exact loader without executing its source."""
     if prior is None:
         return None
     fingerprint = approved_packages(f).get(prior["revision"])
@@ -411,6 +411,21 @@ def prior_loader_bytes(f, prior):
         raise cf.SyncError("旧运行入口模板无法静态核对") from exc
 
 
+def managed_loader_matches(f, raw, prior):
+    if raw == loader_bytes(f):
+        return True
+    if prior is None:
+        return False
+    if raw == prior_loader_bytes(f, prior):
+        return True
+    # A previous installer can switch the active package while leaving its own
+    # launcher. Accept only that exact, still-approved predecessor template.
+    revision = prior.get("previous_revision")
+    fingerprint = approved_packages(f).get(revision)
+    return fingerprint is not None and raw == prior_loader_bytes(
+        f, {"revision": revision, "manifest_sha256": fingerprint})
+
+
 def launcher_path(f):
     cf.safe_path(f.home, ".local/bin")
     return f.home / ".local/bin/codex-framework"
@@ -418,7 +433,7 @@ def launcher_path(f):
 
 def stable_command(f):
     a = active(f)
-    if not a or cf.read_file(launcher_path(f)) != loader_bytes(f):
+    if not a or not managed_loader_matches(f, cf.read_file(launcher_path(f)), a):
         raise cf.SyncError("先安装受管理运行包，再配置稳定 Hook 入口")
     validate(version_path(f, a["revision"]), a["manifest_sha256"])
     return shlex.join([sys.executable, str(launcher_path(f)), "--home", str(f.home),
@@ -739,9 +754,9 @@ def install(f, revision=None, expected_runtime=None, rollback=False):
         existing = capture(launcher)
         if "link" in existing and Path(existing["link"]).absolute() != f.repo / "scripts/codex_framework.py":
             raise cf.SyncError("launcher 指向未知位置；保留原入口")
-        if "data" in existing and existing["data"] is not None and existing != file_value(loader_bytes(f)):
-            if existing != file_value(prior_loader_bytes(f, old)):
-                raise cf.SyncError("launcher 为未知内容；未覆盖")
+        if ("data" in existing and existing["data"] is not None
+                and not managed_loader_matches(f, base64.b64decode(existing["data"], validate=True), old)):
+            raise cf.SyncError("launcher 为未知内容；未覆盖")
         new_active = {"version": FORMAT, "revision": revision, "manifest_sha256": digest(encoded(manifest)),
                       "source_repo": str(f.repo), "previous_revision": (old or {}).get("revision")}
         changes = {}
@@ -766,7 +781,7 @@ def install(f, revision=None, expected_runtime=None, rollback=False):
                          "applied_revision": revision, "conflicts": [], "local_overrides": overrides}
         change("cache", encoded(snapshot))
         change("state", encoded(state))
-        change("launcher", loader_bytes(f))
+        change("launcher", prior_loader_bytes(f, new_active))
         hook = hook_update(f)
         if hook is not None:
             change("hook", hook)
