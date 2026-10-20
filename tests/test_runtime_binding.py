@@ -180,7 +180,7 @@ fcntl.flock = observe_flock
     def test_loader_legacy_templates_upgrade_rollback_and_previous_installer_handoff(self):
         path = self.repo / "scripts/framework_runtime.py"
         current = path.read_text()
-        for count in (7, 9, 10):
+        for count in (7, 9, 10, 12):
             with self.subTest(modules=count):
                 # Construct the supported old closure and append-mode loader;
                 # an old installer emits its own template during a handoff.
@@ -631,6 +631,70 @@ fcntl.flock = observe_flock
         result = self.cli("check", payload={})
         self.assertEqual(result.returncode, 1)
         self.assertNotIn("Traceback", result.stderr)
+
+        # Both moved responsibilities must execute from the installed package,
+        # even when the checkout's versions are unusable. The pure view must
+        # still leave the task store absent.
+        from test_delivery_view import DeliveryViewTests
+        for name in ("task_results.py", "delivery_relations.py"):
+            (self.repo / "scripts" / name).write_text("raise AssertionError('unmanaged checkout import')\n")
+        result = self.cli("task", payload=DeliveryViewTests().request())
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        projected = json.loads(result.stdout)
+        self.assertTrue(projected["complete"])
+        self.assertFalse(projected["summary_is_execution_gate"])
+        self.assertEqual(projected["effect"], "pure_projection_no_store_or_tool_calls")
+        self.assertFalse((self.a.codex_home / "task-runtime").exists())
+
+    def test_result_modules_reject_bad_source_and_managed_payloads(self):
+        installed = self.source_cli("install", "--revision", self.p)
+        self.assertEqual(installed.returncode, 0, installed.stdout + installed.stderr)
+        before = self.installed_state(), runtime.launcher_path(self.a).read_bytes()
+        marker = self.root / "unapproved-result-code-executed"
+        for name in ("task_results.py", "delivery_relations.py"):
+            for problem in ("missing", "mode", "symlink"):
+                with self.subTest(module=name, source=problem):
+                    run_git(self.repo, "reset", "--hard", self.p)
+                    path = self.repo / "scripts" / name
+                    if problem == "mode":
+                        path.chmod(0o755)
+                    else:
+                        path.unlink()
+                        if problem == "symlink":
+                            path.symlink_to(marker)
+                    run_git(self.repo, "add", "-A")
+                    run_git(self.repo, "commit", "-m", "isolated invalid result module")
+                    revision = run_git(self.repo, "rev-parse", "HEAD")
+                    rejected = self.source_cli("install", "--revision", revision,
+                                               "--expected-runtime", self.p)
+                    self.assertEqual(rejected.returncode, 1, rejected.stdout + rejected.stderr)
+                    self.assertIn("运行模块缺失、链接或模式无效", rejected.stderr)
+                    self.assertEqual((self.installed_state(), runtime.launcher_path(self.a).read_bytes()), before)
+            run_git(self.repo, "reset", "--hard", self.p)
+            path = runtime.version_path(self.a, self.p) / "scripts" / name
+            original = path.read_bytes()
+            for problem in ("missing", "hash", "mode", "symlink"):
+                with self.subTest(module=name, managed=problem):
+                    if problem == "hash":
+                        path.write_bytes(original + ("\nopen(" + repr(str(marker)) + ",'w').write('bad')\n").encode())
+                    elif problem == "mode":
+                        path.chmod(0o755)
+                    else:
+                        path.unlink()
+                        if problem == "symlink":
+                            path.symlink_to(marker)
+                    rejected = self.cli("task", payload={"operation": "delivery-view"})
+                    self.assertEqual(rejected.returncode, 1, rejected.stdout + rejected.stderr)
+                    unavailable = json.loads(rejected.stdout)
+                    self.assertEqual(unavailable["status"], "runtime-unavailable")
+                    self.assertIsNone(unavailable["tool_revision"])
+                    self.assertEqual(unavailable["active_revision"], self.p)
+                    self.assertFalse(marker.exists())
+                    if path.is_symlink():
+                        path.unlink()
+                    path.write_bytes(original)
+                    path.chmod(0o644)
+            self.assertEqual((self.installed_state(), runtime.launcher_path(self.a).read_bytes()), before)
 
     def test_n3_missing_runtime_reports_document_and_attempted_active_identity(self):
         self.install()

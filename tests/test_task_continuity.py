@@ -12,6 +12,7 @@ from unittest import mock
 import test_framework as fixtures
 import task_runtime as task
 import task_coordination as coord
+from task_results import TaskResults
 import framework_runtime as runtime
 
 
@@ -250,13 +251,14 @@ class ContinuityTests(fixtures.FixtureCase):
 
     def test_json_actual_read_rechecks_refusal_after_preliminary_file_check(self):
         store,_=self.create();ref=self.result(store);original=coord.evidence_reference;injected=[]
-        def checked(value,reference):
+        def checked(owner,value,reference):
             result=original(value,reference)
             if not injected:
                 injected.append(True);self.deny_peer_read(store,ref['path'])
             return result
-        with mock.patch.object(coord,'evidence_reference',side_effect=checked):
+        with mock.patch.object(TaskResults,'evidence_reference',autospec=True,side_effect=checked):
             with self.assertRaises(task.TaskError):self.change(store,'collect-result',**ref)
+        self.assertTrue(injected)
         self.assertIsNone(store.read()['result_state']['result'])
 
     def test_legal_accumulated_33_and64_obligations_have_current_acceptance_route(self):
@@ -326,6 +328,26 @@ class ContinuityTests(fixtures.FixtureCase):
         self.assertEqual(r.returncode,0);self.assertEqual(reply['result_dimensions']['business_outcome'],'pending')
         self.assertEqual(reply['work_partition']['ready'],['independent']);self.assertEqual(reply['steps']['a']['runs'],0)
         self.assertEqual(reply['steps']['a']['continuation']['origin'],self.origin)
+
+        # Intake/review through the managed CLI covers independent B while
+        # preserving A's original UNKNOWN and the complete original goal.
+        original=copy.deepcopy(reply['steps']['a']['continuation'])
+        result=self.result(store,ids=('later',))
+        r,reply=invoke({'operation':'collect-result','task_id':'current',
+                        'expected_revision':reply['revision'],**result})
+        self.assertEqual(r.returncode,0)
+        review=self.review(store,result,ids=('later',))
+        r,reply=invoke({'operation':'review-result','task_id':'current',
+                        'expected_revision':reply['revision'],**review})
+        self.assertEqual(r.returncode,0)
+        self.assertEqual(reply['result_dimensions']['pending_obligations'],['analysis'])
+        self.assertEqual(reply['steps']['a']['continuation'],original)
+        before=store.path.read_bytes()
+        r,reply=invoke({'operation':'review-result','task_id':'current',
+                        'expected_revision':reply['revision'],**review})
+        self.assertEqual(r.returncode,0)
+        self.assertEqual(store.path.read_bytes(),before)
+        self.assertFalse(reply['accepted'])
 
 
 import test_review_handoff as reviewfixtures

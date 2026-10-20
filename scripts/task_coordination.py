@@ -17,6 +17,9 @@ import stat
 import subprocess
 import time
 
+import task_results
+import delivery_relations
+
 ROOT=ContextVar('task_coordination_root',default=None)
 LOCKED=ContextVar('task_effect_index_locked',default=False)
 WORKSET=ContextVar('task_coordination_workset',default=())
@@ -384,13 +387,6 @@ def prompt(value):
     identity={'request_id':spec['request_id'],'task_id':value['task_id'],'input_revision':value['input_revision'],'acceptance_sha256':value['acceptance_sha256'],'native_request':spec.get('request_identity')}
     return '\nCurrent request identity: '+json.dumps(identity,ensure_ascii=False)+'\nProject goal/responsibility: '+json.dumps(project,ensure_ascii=False)+'\nThis assignment: '+json.dumps(spec.get('assignment'),ensure_ascii=False)+'\nDeclared input relationships: '+json.dumps(spec.get('requires',[]),ensure_ascii=False)+'\nOriginal result scope: '+json.dumps(spec.get('result_scope'),ensure_ascii=False)+'\nThese facts do not grant permissions. Answer this current request and assigned deliverables; an older PASS or another project result is not its acceptance.'
 
-def bound_report(value,report):
-    need(isinstance(report,dict),'report must be an object')
-    expected={'request_id':value['spec']['request_id'],'task_id':value['task_id'],'input_revision':value['input_revision'],'task_input_sha256':value['acceptance_sha256']}
-    if value['spec'].get('project'):expected['project_id']=value['spec']['project']['id']
-    if value['spec'].get('request_identity'):expected['request_identity']=value['spec']['request_identity']
-    need(all(type(report.get(k)) is type(v) and report[k]==v for k,v in expected.items()),'report does not answer current project/task/native request/input')
-    return expected
 
 def read_json(workspace,path,fingerprint,value=None,unique=False):
     relative(path,'evidence path');need(hashes(fingerprint),'invalid evidence fingerprint')
@@ -421,6 +417,72 @@ def read_json(workspace,path,fingerprint,value=None,unique=False):
         finally:os.close(fd)
     return task().isolated_io('project_evidence',read,3)[0]
 
+class _ResultContext:
+    """Stateless access to the existing checks, encoding and scoped reader."""
+    @property
+    def error_type(self):
+        return task().TaskError
+
+    def encoded(self, value):
+        return task().encoded(value)
+
+    def digest(self, value):
+        return task().digest(value)
+
+    def checked_file(self, value, step_id, check):
+        return task().checked_file(value, step_id, check)
+
+    def need(self, ok, reason):
+        return need(ok, reason)
+
+    def identifier(self, value):
+        return identifier(value)
+
+    def hashes(self, value):
+        return hashes(value)
+
+    def text(self, value):
+        return text(value)
+
+    def relative(self, value, label):
+        return relative(value, label)
+
+    def read_json(self, workspace, path, fingerprint, value=None, unique=False):
+        return read_json(workspace, path, fingerprint, value=value, unique=unique)
+
+
+_result_context = _ResultContext()
+_results = task_results.TaskResults(_result_context)
+_delivery = delivery_relations.DeliveryRelations(_result_context)
+
+# Compatibility entry points; each responsibility has one implementation.
+bound_report = _results.bound_report
+validate_result_scope = _results.validate_result_scope
+result_state = _results.result_state
+initialize_result = _results.initialize_result
+evidence_reference = _results.evidence_reference
+origin = _results.origin
+checkpoint = _results.checkpoint
+continue_original = _results.continue_original
+result_receipts = _results.result_receipts
+review_content = _results.review_content
+native_identity = _results.native_identity
+retained_native_identity = _results.retained_native_identity
+pending_result_actions = _results.pending_result_actions
+receipt_coverage = _results.receipt_coverage
+collect_result = _results.collect_result
+_result_content = _results._result_content
+result_projection = _results.result_projection
+result_observation = _results.result_observation
+validate_current_result = _results.validate_current_result
+current_accepted = _results.current_accepted
+validate_result_state = _results.validate_result_state
+
+DELIVERY_STAGES = delivery_relations.DELIVERY_STAGES
+REUSE_AXES = delivery_relations.REUSE_AXES
+native_task_projection = _delivery.native_task_projection
+delivery_view = _delivery.delivery_view
+
 def artifact(value):
     declared=value['spec'].get('artifact')
     if declared is None:return None
@@ -443,212 +505,6 @@ def artifact(value):
         need(checked['passed'],'actual loaded file differs from merged source')
     need(covered==set(projects),'release part has no actual loaded file evidence')
     return {'sha256':declared['sha256'],'versions':declared['versions'],'loaded_files':len(files)}
-
-# Delivery views are derived from existing native tasks and scoped evidence.
-# They have no Store, scheduler, permission grant or persistent status of their own.
-DELIVERY_STAGES = ('source', 'build', 'install', 'load', 'adoption', 'verification')
-REUSE_AXES = ('requirements', 'code', 'input', 'environment', 'method')
-
-
-def native_task_projection(binding, snapshots):
-    """Observe the selected original turn, never infer a delivery from its end."""
-    found = {}
-    for snapshot in snapshots:
-        if not isinstance(snapshot, dict) or type(snapshot.get('schemaVersion')) is not int or snapshot['schemaVersion'] != 1:
-            continue
-        thread = snapshot.get('thread')
-        if not isinstance(thread, dict) or thread.get('id') != binding['thread_id']:
-            continue
-        turns = snapshot.get('turns')
-        if not isinstance(turns, list):
-            continue
-        for turn in turns:
-            if isinstance(turn, dict) and turn.get('id') == binding['turn_id']:
-                found[task().encoded(turn)] = turn
-    if not found:
-        return dict(binding, native_status='unknown', native_observation='selected_turn_not_observed')
-    if len(found) != 1:
-        return dict(binding, native_status='unknown', native_observation='conflicting_selected_turn_snapshots')
-    turn = next(iter(found.values()))
-    status = turn.get('status')
-    return dict(binding, native_status=status if isinstance(status, str) else 'unknown',
-                native_observation='supplied_selected_turn', completion_scope='native turn only')
-
-
-def delivery_view(request):
-    """Read-only current delivery relationships; no task registration or effects.
-
-    Original callers retain evidence/authorship and domain interpretation duties.
-    A source reference and fingerprint identify an observation, not its truth.
-    This operation checks the supplied current-baseline/version relationships.
-    """
-    baseline = request.get('baseline')
-    need(isinstance(baseline, dict) and set(baseline) == {'id', 'source_ref'}
-         and all(text(baseline[k]) for k in baseline), 'delivery view needs the current requirement baseline and source')
-    definitions = request.get('deliveries')
-    mainlines = request.get('mainlines')
-    bindings = request.get('tasks', [])
-    observations = request.get('observations', [])
-    snapshots = request.get('native_sources', [])
-    need(isinstance(definitions, list) and 0 < len(definitions) <= 64, 'delivery view needs1..64 existing deliverables')
-    need(isinstance(mainlines, list) and 0 < len(mainlines) <= 32, 'delivery view needs1..32 mainlines')
-    need(isinstance(bindings, list) and len(bindings) <= 128, 'invalid existing task bindings')
-    need(isinstance(observations, list) and len(observations) <= 256, 'invalid delivery observations')
-    need(isinstance(snapshots, list) and len(snapshots) <= 128, 'invalid native snapshots')
-    tasks = {}
-    for binding in bindings:
-        need(isinstance(binding, dict) and set(binding) == {'id', 'thread_id', 'turn_id', 'source_ref'}
-             and identifier(binding['id']) and all(text(binding[k]) for k in ('thread_id', 'turn_id', 'source_ref')),
-             'invalid original task identity')
-        need(binding['id'] not in tasks, 'duplicate original task binding')
-        tasks[binding['id']] = native_task_projection(binding, snapshots)
-    records = {}
-    for observation in observations:
-        need(isinstance(observation, dict) and text(observation.get('delivery_id')), 'observation needs a delivery identity')
-        records.setdefault(observation['delivery_id'], []).append(observation)
-    deliveries = {}
-    for declared in definitions:
-        need(isinstance(declared, dict) and identifier(declared.get('id')), 'invalid deliverable identity')
-        identity = declared['id']
-        need(identity not in deliveries, 'duplicate deliverable identity')
-        row = {'goal': declared.get('goal'), 'source_ref': declared.get('source_ref'), 'task_ids': declared.get('task_ids'),
-               'stages': {}, 'gaps': [], 'historical_observations': [], 'implementation_delivery': {'complete': False},
-               'verification_delivery': {'complete': False}, 'complete': False}
-        deliveries[identity] = row
-        row['declared_contract'] = copy.deepcopy(declared)
-        if isinstance(declared.get('stages'), dict):
-            row['stages'] = {name: {'required': name in declared['stages'], 'complete': False,
-                'status': 'pending' if name in declared['stages'] else 'not_required_by_this_contract',
-                'target': copy.deepcopy(declared['stages'].get(name)), 'observations': [], 'gaps': []}
-                for name in DELIVERY_STAGES}
-        try:
-            need(set(declared) == {'id', 'goal', 'source_ref', 'task_ids', 'stages'}
-                 and text(declared['goal']) and text(declared['source_ref']), 'invalid deliverable contract')
-            ids = declared['task_ids']
-            need(isinstance(ids, list) and len(ids) <= 128 and all(identifier(i) for i in ids)
-                 and len(set(ids)) == len(ids), 'invalid deliverable task membership')
-            stages = declared['stages']
-            need(isinstance(stages, dict) and stages and set(stages) <= set(DELIVERY_STAGES)
-                 and any(s != 'verification' for s in stages), 'deliverable needs an explicit implementation stage')
-            row['tasks'] = {i: tasks.get(i) for i in ids}
-            if not ids or set(ids) - set(tasks):
-                row['gaps'].append({'kind': 'original_task_binding_missing', 'task_ids': sorted(set(ids) - set(tasks))})
-            eligible = []
-            for record in records.get(identity, []):
-                fields = {'delivery_id', 'stage', 'case', 'task_id', 'baseline', 'version', 'inputs', 'result', 'source_ref', 'sha256', 'report'}
-                need(fields <= set(record) <= fields | {'reuse'} and record['stage'] in DELIVERY_STAGES
-                     and all(text(record[k]) for k in ('case', 'task_id', 'baseline', 'version', 'source_ref'))
-                     and hashes(record['sha256']) and isinstance(record['inputs'], dict)
-                     and all(text(k) and text(v) for k, v in record['inputs'].items())
-                     and record['result'] in ('PASS', 'FAIL', 'NOT_RUN', 'UNKNOWN'), 'invalid scoped delivery observation')
-                need(record['task_id'] in ids, 'delivery observation belongs to another task')
-                need(isinstance(record['report'], str) and task().digest(record['report'].encode()) == record['sha256'],
-                     'original report bytes do not match the evidence fingerprint')
-                def unique(pairs):
-                    out = {}
-                    for key, child in pairs:
-                        need(key not in out, 'duplicate original report field')
-                        out[key] = child
-                    return out
-                def constant(value):
-                    raise ValueError('non-JSON original report value')
-                reported = json.loads(record['report'], object_pairs_hook=unique, parse_constant=constant)
-                need(isinstance(reported, dict) and all(type(reported.get(k)) is type(record[k]) and reported[k] == record[k]
-                     for k in ('delivery_id', 'stage', 'case', 'task_id', 'baseline', 'version', 'inputs', 'result')),
-                     'observation does not bind its original report content')
-                current = record['baseline'] == baseline['id']
-                if not current:
-                    reuse = record.get('reuse')
-                    current = (isinstance(reuse, dict) and set(reuse) == {'baseline', 'source_ref', *REUSE_AXES}
-                               and reuse['baseline'] == baseline['id'] and text(reuse['source_ref'])
-                               and all(reuse[k] == 'unchanged' for k in REUSE_AXES))
-                    if not current:
-                        row['historical_observations'].append({k:copy.deepcopy(v) for k,v in record.items() if k!='report'})
-                        continue
-                eligible.append(record)
-            for stage in DELIVERY_STAGES:
-                expected = stages.get(stage)
-                state = {'required': stage in stages, 'complete': False, 'observations': [], 'gaps': []}
-                row['stages'][stage] = state
-                if stage not in stages:
-                    state['status'] = 'not_required_by_this_contract'
-                    continue
-                need(isinstance(expected, dict) and {'version', 'inputs'} <= set(expected) <= {'version', 'inputs', 'checks', 'independent'}
-                     and (expected['version'] is None or text(expected['version'])) and isinstance(expected['inputs'], dict)
-                     and all(text(k) and text(v) for k, v in expected['inputs'].items()), 'invalid stage target/version links')
-                checks = expected.get('checks', ['result'])
-                need(isinstance(checks, list) and checks and len(checks) <= 64 and all(text(x) for x in checks)
-                     and len(set(checks)) == len(checks) and type(expected.get('independent', False)) is bool,
-                     'invalid current acceptance cases')
-                for linked, version in expected['inputs'].items():
-                    if linked in DELIVERY_STAGES:
-                        need(linked != stage and linked in stages and isinstance(stages[linked], dict)
-                             and stages[linked].get('version') == version, 'stage input refers to a different current version')
-                prior = [name for name in DELIVERY_STAGES[:DELIVERY_STAGES.index(stage)] if name in stages and name != 'verification']
-                if prior:
-                    upstream = 'load' if stage == 'verification' and 'load' in prior else prior[-1]
-                    need(upstream in expected['inputs'] and expected['inputs'][upstream] == stages[upstream]['version'],
-                         'stage needs its actual upstream current-version link')
-                state['target'] = copy.deepcopy(expected)
-                if expected['version'] is None:
-                    state['gaps'].append({'kind': 'current_version_not_frozen'})
-                for case in checks:
-                    candidates = [r for r in eligible if r['stage'] == stage and r['case'] == case
-                                  and r['version'] == expected['version'] and r['inputs'] == expected['inputs']]
-                    if not candidates:
-                        state['gaps'].append({'kind': 'current_stage_evidence_missing', 'case': case})
-                        continue
-                    state['observations'].extend({k:copy.deepcopy(v) for k,v in record.items() if k!='report'} for record in candidates)
-                    identities = {}
-                    for record in candidates:
-                        original = tasks.get(record['task_id'], {})
-                        key = (original.get('thread_id'), original.get('turn_id'))
-                        identities.setdefault(key, set()).add((record['result'], record['sha256']))
-                    if any(len(results) > 1 for results in identities.values()):
-                        state['gaps'].append({'kind': 'conflicting_original_result', 'case': case})
-                    if any(r['result'] != 'PASS' for r in candidates):
-                        state['gaps'].append({'kind': 'stage_result_not_passed_or_conflicting', 'case': case})
-                    if any(tasks.get(r['task_id'], {}).get('native_observation') == 'conflicting_selected_turn_snapshots'
-                           for r in candidates):
-                        state['gaps'].append({'kind': 'conflicting_original_native_observation', 'case': case})
-                    if expected.get('independent'):
-                        producers = {tasks[r['task_id']]['thread_id'] for r in eligible
-                                     if r['stage'] != 'verification' and r['task_id'] in tasks and r['stage'] in stages
-                                     and r['version'] == stages[r['stage']].get('version')
-                                     and r['inputs'] == stages[r['stage']].get('inputs')}
-                        if any(r['task_id'] not in tasks or tasks[r['task_id']]['thread_id'] in producers for r in candidates):
-                            state['gaps'].append({'kind': 'independent_verification_not_bound', 'case': case})
-                state['complete'] = not state['gaps']
-                state['status'] = 'bound_current_observations' if state['complete'] else 'pending'
-                row['gaps'].extend(dict(gap, stage=stage) for gap in state['gaps'])
-            row['implementation_delivery'] = {'complete': all(s['complete'] for k, s in row['stages'].items()
-                if s['required'] and k != 'verification'), 'scope': 'declared implementation stages only'}
-            verify = row['stages']['verification']
-            row['verification_delivery'] = {'required': verify['required'], 'complete': verify['complete'] if verify['required'] else None,
-                                            'scope': 'current exact-version declared verification cases only'}
-            row['complete'] = not row['gaps']
-        except (task().TaskError, TypeError, ValueError, RecursionError) as exc:
-            row['gaps'].append({'kind': 'invalid_delivery_contract_or_observation', 'detail': str(exc)})
-    lines, linked, issues = {}, set(), []
-    for line in mainlines:
-        need(isinstance(line, dict) and set(line) == {'id', 'goal', 'source_ref', 'delivery_ids'}
-             and identifier(line['id']) and text(line['goal']) and text(line['source_ref']), 'invalid mainline')
-        need(line['id'] not in lines, 'duplicate mainline')
-        ids = line['delivery_ids']
-        need(isinstance(ids, list) and ids and len(ids) <= 64 and all(identifier(i) for i in ids)
-             and len(set(ids)) == len(ids), 'invalid mainline delivery membership')
-        linked.update(ids)
-        gaps = [{'delivery_id': i, 'kind': 'delivery_pending' if i in deliveries else 'delivery_missing'}
-                for i in ids if i not in deliveries or not deliveries[i]['complete']]
-        lines[line['id']] = dict(line, complete=not gaps, gaps=gaps)
-    if set(deliveries) - linked:
-        issues.append({'kind': 'unlinked_deliveries', 'delivery_ids': sorted(set(deliveries) - linked)})
-    if set(records) - set(deliveries):
-        issues.append({'kind': 'observation_for_unknown_delivery', 'delivery_ids': sorted(set(records) - set(deliveries))})
-    return {'baseline': baseline, 'mainlines': lines, 'deliveries': deliveries, 'tasks': tasks, 'issues': issues,
-            'complete': not issues and all(line['complete'] for line in lines.values()),
-            'scope': 'supplied current requirement/version/evidence bindings; no native authenticity or domain acceptance granted',
-            'effect': 'pure_projection_no_store_or_tool_calls', 'summary_is_execution_gate': False}
 
 
 def project_view(values,errors):
@@ -907,241 +763,6 @@ def workset(codex_home,request):
 
 # Optional original-result scope, held in the existing task record. These
 # relationships do not authenticate a native source or grade domain reasoning.
-def validate_result_scope(scope):
-    need(isinstance(scope,dict) and set(scope)=={'object_ref','goal','source_ref','obligations'},'invalid original result scope')
-    need(all(text(scope[k]) for k in ('object_ref','goal','source_ref')),'original object/goal/source missing')
-    rows=scope['obligations'];need(isinstance(rows,list) and 0<len(rows)<=32,'invalid original obligations')
-    seen=set()
-    for row in rows:
-        need(isinstance(row,dict) and set(row)=={'id','acceptance'} and identifier(row.get('id')) and text(row.get('acceptance')) and row['id'] not in seen,'invalid original obligation')
-        seen.add(row['id'])
-
-def result_state(value):
-    return value.get('result_state')
-
-def initialize_result(value,prior=None):
-    scope=value['spec'].get('result_scope')
-    if scope is None:
-        need(prior is None,'original result obligations cannot be removed by amendment');return
-    if prior:
-        need(scope['object_ref']==prior['object_ref'],'amendment cannot substitute original business object')
-    state=copy.deepcopy(prior) if prior else {'object_ref':scope['object_ref'],'original_goal':scope['goal'],'obligations':{},'pending':[]}
-    for row in scope['obligations']:
-        old=state['obligations'].get(row['id'])
-        need(old is None or old==row['acceptance'],'amendment cannot silently change original acceptance')
-        if old is None:state['pending'].append(row['id'])
-        state['obligations'][row['id']]=row['acceptance']
-    # Current-request acceptance always requires a current result/review. Old
-    # finite results stay in history, not as an answer to the amended input.
-    state['pending']=list(state['obligations']);state['result']=None;state['review']=None;state['receipts']=[]
-    need(len(state['obligations'])<=64,'retained original obligation bound')
-    value['result_state']=state
-
-def evidence_reference(value,ref):
-    need(isinstance(ref,dict) and set(ref)=={'path','sha256'},'invalid passive evidence reference')
-    relative(ref.get('path'),'passive evidence path');need(hashes(ref.get('sha256')),'invalid passive evidence hash')
-    check={'kind':'file',**ref}
-    # This is a passive evidence read, not execution of an arbitrary first
-    # registered step. Exact local/peer path and FD guards remain mandatory;
-    # original step/dependency constraints still govern execution/acceptance.
-    need(task().checked_file(value,None,check)['passed'],'passive evidence bytes unavailable, changed or blocked')
-
-def origin(value):
-    need(isinstance(value,dict) and set(value)=={'operation_id','attempt_id','session_id','turn_id'},'invalid original operation/attempt/native mapping')
-    need(text(value['operation_id']) and text(value['attempt_id']),'original operation/attempt missing')
-    need(all(value[k] is None or text(value[k]) for k in ('session_id','turn_id')),'invalid original native identity')
-    need(value['turn_id'] is None or value['session_id'] is not None,'native turn requires original session')
-
-def checkpoint(value,request):
-    need(result_state(value) is not None,'continuation checkpoint needs original result scope')
-    key=request.get('step');need(key in value['steps'],'unknown checkpoint step')
-    current=value['steps'][key];mapping=request.get('origin');origin(mapping)
-    prior=current.get('continuation');active=value.get('execution')
-    if prior:need(prior['origin']==mapping,'continuation must retain original operation/attempt/native turn')
-    if active and active['step']==key:
-        need(active['id']==mapping['attempt_id'] and active.get('session_id')==mapping['session_id'],'checkpoint is not the original native execution')
-        known=next((e.get('native_turn_id') for e in reversed(current['evidence']) if e.get('execution_id')==active['id'] and e.get('native_turn_id')),None)
-        need(known is None or known==mapping['turn_id'],'checkpoint substituted native turn')
-    refs=request.get('effects');need(isinstance(refs,list) and len(refs)<=16,'invalid original durable effects')
-    saved=copy.deepcopy(prior) if prior else {'origin':copy.deepcopy(mapping),'effects':[],'terminal':'unknown','terminal_ref':None,'resolved':False}
-    for ref in refs:
-        need(isinstance(ref,dict) and set(ref)=={'kind','path','sha256'} and ref.get('kind') in ('input','freeze','commit','delivery'),'invalid durable effect kind')
-        old=next((e for e in saved['effects'] if e['kind']==ref['kind'] and e['path']==ref['path']),None)
-        need(old is None or old==ref,'original input/freeze/effect cannot be overwritten')
-        evidence_reference(value,{k:ref[k] for k in ('path','sha256')})
-        if old is None:saved['effects'].append(copy.deepcopy(ref))
-    need(len(saved['effects'])<=16,'durable effect reference bound')
-    if prior:
-        for ref in prior['effects']:evidence_reference(value,{k:ref[k] for k in ('path','sha256')})
-    saved['resolved']=False;current['continuation']=saved
-    value['accepted']=False
-    if active and active['step']==key:
-        current['unresolved_execution']=active;current['state']='reconcile'
-        current['wait']={'kind':'original_continuation_unknown','next':'read_original_terminal_and_effects_without_replay'}
-        value['execution']=None
-    return saved
-
-def continue_original(value,request):
-    key=request.get('step');need(key in value['steps'],'unknown continuation step')
-    saved=value['steps'][key].get('continuation');need(saved is not None,'no original continuation checkpoint')
-    for ref in saved['effects']:evidence_reference(value,{k:ref[k] for k in ('path','sha256')})
-    ref=request.get('terminal_ref')
-    if ref is not None:
-        need(isinstance(ref,dict) and set(ref)=={'path','sha256'},'invalid original terminal reference')
-        evidence_reference(value,ref)
-        report=read_json(value['spec']['workspace'],ref['path'],ref['sha256'],value=value)
-        need(isinstance(report,dict) and set(report)=={'origin','status','source_ref'},'invalid original terminal readback')
-        origin(report['origin']);need(report['origin']==saved['origin'] and text(report['source_ref']),'terminal readback belongs to another original operation/attempt/turn')
-        need(report['status'] in ('unknown','running','completed','not_executed','failed'),'invalid original terminal status')
-        need(saved['terminal'] not in ('completed','not_executed','failed') or saved['terminal']==report['status'],'terminal observation cannot rewrite a known original outcome')
-        if report['status']=='not_executed':need(not any(e['kind'] in ('commit','delivery') for e in saved['effects']),'NOT_EXECUTED conflicts with already durable effects')
-        saved['terminal']=report['status'];saved['terminal_ref']=copy.deepcopy(ref)
-    saved['next_action']={'completed':'consume_original_result','not_executed':'decide_original_authorized_step_with_remaining_budget','failed':'inspect_original_failure_without_replay'}.get(saved['terminal'],'inspect_original_native_and_durable_effects')
-    saved['may_launch']=saved['may_commit']=saved['may_send']=False
-    saved['source_authentication']='caller must verify permitted original native read; JSON labels are not authentication'
-    return saved
-
-def result_receipts(state):
-    if 'receipts' in state:
-        return state['receipts']
-    # Read old records without inventing a native source. A later mutation
-    # persists the same original references; old input history is untouched.
-    if state.get('result') is None:
-        return []
-    return [{'result':state['result'], 'native_sha256':None,
-             'reviews':[state['review']] if state.get('review') else []}]
-
-
-def review_content(value,state,result,reference,report):
-    bound_report(value,report)
-    need(report.get('object_ref')==state['object_ref'],'result belongs to another original business object')
-    need(report.get('result_sha256')==reference['sha256'],'substantive review is not for current actual result')
-    reviewer=report.get('reviewer_thread')
-    need(text(reviewer) and reviewer not in (value['spec'].get('assignment',{}).get('owner'),
-         value['spec'].get('request_identity',{}).get('thread_id')),'independent substantive reviewer missing')
-    rows=report.get('assessments');need(isinstance(rows,list) and len(rows)<=64,'invalid substantive assessments')
-    seen=set()
-    for row in rows:
-        need(isinstance(row,dict) and set(row)=={'id','verdict','reason'} and
-             isinstance(row.get('id'),str) and row['id'] in state['obligations'] and row['id'] not in seen and
-             row['verdict'] in ('PASS','FAIL','NOT_RUN','UNKNOWN') and text(row['reason']),'invalid substantive assessment')
-        seen.add(row['id']);answer=next((a for a in result['answers'] if a['id']==row['id']),None)
-        if row['verdict']=='PASS':
-            need(answer is not None and answer['status']=='answered' and answer['method_fit']=='applicable',
-                 'partial/unknown/inapplicable result cannot satisfy original obligation')
-    return {row['id']:row['verdict'] for row in rows}
-
-
-def native_identity(report):
-    native=report.get('native_result')
-    need(isinstance(native,dict) and set(native)=={'thread_id','turn_id','final_ref','final_sha256'} and
-         all(text(native.get(k)) for k in ('thread_id','turn_id','final_ref')) and hashes(native.get('final_sha256')),
-         'actual current native result identity missing')
-    # Thread/turn identify the returned execution. Its source reference and
-    # content fingerprint cannot manufacture another native execution.
-    return {key:native[key] for key in ('thread_id','turn_id')}
-
-
-def retained_native_identity(value,receipt):
-    if receipt.get('native_identity') is not None:
-        return receipt['native_identity']
-    # Old records did not retain the stable identity. Derive it only from
-    # the original bounded report; an unavailable old read stays unverified.
-    try:
-        ref=receipt['result']
-        report=read_json(value['spec']['workspace'],ref['path'],ref['sha256'],value=value)
-        bound_report(value,report)
-        return native_identity(report)
-    except (task().TaskError,OSError,ValueError):
-        return None
-
-
-def pending_result_actions(value,pending):
-    state=result_state(value);ready=[];followup=[];errors=[]
-    for receipt in result_receipts(state):
-        ref=receipt['result']
-        if receipt['reviews'] and not pending:continue
-        try:
-            report=read_json(value['spec']['workspace'],ref['path'],ref['sha256'],value=value)
-            bound_report(value,report);_result_content(value,state,report)
-            if not receipt['reviews']:
-                ready.append(copy.deepcopy(ref))
-            else:
-                unresolved=[row['id'] for row in report['answers'] if row['id'] in pending]
-                if unresolved:followup.append({'kind':'continue_original_result','result':copy.deepcopy(ref),'obligations':unresolved})
-        except (task().TaskError,OSError,ValueError) as exc:
-            errors.append({'result_sha256':ref['sha256'],'detail':str(exc)})
-    return ready,followup,errors
-
-
-def receipt_coverage(value):
-    state=result_state(value);assessed={};errors=[];identities={}
-    for receipt in result_receipts(state):
-        if not receipt['reviews']:
-            continue
-        try:
-            actual=receipt['result'];evidence_reference(value,actual)
-            result=read_json(value['spec']['workspace'],actual['path'],actual['sha256'],value=value)
-            bound_report(value,result);_result_content(value,state,result)
-            identity=native_identity(result);key=tuple(identity.values())
-            need(receipt.get('native_identity') in (None,identity),'retained native identity differs from original report')
-            need(key not in identities or identities[key]==actual['sha256'],
-                 'same original native return has conflicting result bytes')
-            identities[key]=actual['sha256']
-            current={}
-            for ref in receipt['reviews']:
-                evidence_reference(value,ref)
-                report=read_json(value['spec']['workspace'],ref['path'],ref['sha256'],value=value)
-                current.update(review_content(value,state,result,actual,report))
-            for key,verdict in current.items():assessed.setdefault(key,set()).add(verdict)
-        except (task().TaskError,OSError,ValueError) as exc:
-            # One held/stale original cannot stop intake of an independent
-            # return. It contributes no current coverage until proved again.
-            errors.append({'result_sha256':receipt['result']['sha256'],'detail':str(exc)})
-    return [key for key in state['obligations'] if 'PASS' not in assessed.get(key,set()) or assessed[key]&{'FAIL','UNKNOWN'}],errors
-
-
-def collect_result(value,reference,review=False):
-    state=result_state(value);need(state is not None,'original result scope missing')
-    evidence_reference(value,reference)
-    report=read_json(value['spec']['workspace'],reference['path'],reference['sha256'],value=value);bound_report(value,report)
-    need(report.get('object_ref')==state['object_ref'],'result belongs to another original business object')
-    receipts=copy.deepcopy(result_receipts(state))
-    changed='receipts' not in state
-    if review:
-        receipt=next((r for r in receipts if r['result']['sha256']==report.get('result_sha256')),None)
-        need(receipt is not None,'current actual result missing')
-        actual=receipt['result'];evidence_reference(value,actual)
-        result=read_json(value['spec']['workspace'],actual['path'],actual['sha256'],value=value)
-        bound_report(value,result);_result_content(value,state,result)
-        review_content(value,state,result,actual,report)
-        if not any(r['sha256']==reference['sha256'] for r in receipt['reviews']):
-            receipt['reviews'].append(copy.deepcopy(reference));changed=True
-        if changed:
-            state['review']=copy.deepcopy(reference)
-        for step in value['steps'].values():
-            cp=step.get('continuation')
-            if cp and cp['terminal']=='completed' and cp['origin'] in result['origins'] and not cp['resolved']:
-                cp['resolved']=True;changed=True
-    else:
-        _result_content(value,state,report)
-        native_sha=task().digest(task().encoded(report['native_result']));identity=native_identity(report)
-        receipt=next((r for r in receipts if r['result']['sha256']==reference['sha256']),None)
-        need(not any(r['result']['sha256']!=reference['sha256'] and
-                     retained_native_identity(value,r)==identity for r in receipts),
-             'same original native return has conflicting result bytes')
-        if receipt is None:
-            receipts.append({'result':copy.deepcopy(reference),'native_sha256':native_sha,'native_identity':identity,'reviews':[]});changed=True
-            state['result']=copy.deepcopy(reference);state['review']=None
-        elif receipt['native_sha256'] is None:
-            receipt['native_sha256']=native_sha;receipt['native_identity']=identity;changed=True
-    need(len(receipts)<=64 and sum(len(r['reviews']) for r in receipts)<=64,'current result receipt bound')
-    if not changed:
-        return False
-    state['receipts']=receipts
-    state['pending']=receipt_coverage(value)[0]
-    value['accepted']=False
-    return True
 
 
 def continuation_projection(projected,closed):
@@ -1170,99 +791,6 @@ def continuation_projection(projected,closed):
             'next_actions':actions,'scoped_waits':waiting,'host_execution_required':True,'background_active':False,
             'scope':'bounded existing-task decision; caller needs an actual authorised original host opportunity, not a new scheduler or delivery claim'}
 
-
-def _result_content(value,state,report):
-    need(report.get('object_ref')==state['object_ref'],'original object mismatch')
-    evidence_reference(value,report.get('answer'))
-    native_identity(report)
-    rows=report.get('answers');need(isinstance(rows,list) and len(rows)<=64,'invalid current result answers')
-    seen=set();checked=set()
-    for row in rows:
-        need(isinstance(row,dict) and set(row)=={'id','status','method_fit','evidence'} and isinstance(row.get('id'),str) and row['id'] in state['obligations'] and row['id'] not in seen,'unrequested/duplicate original obligation')
-        seen.add(row['id']);need(row['status'] in ('answered','partial','unanswered','unknown') and row['method_fit'] in ('applicable','limited','not_applicable','unknown'),'invalid actual result dimensions')
-        refs=row['evidence'];need(isinstance(refs,list) and len(refs)<=16 and (row['status']!='answered' or refs),'actual answered result needs execution evidence')
-        for ref in refs:
-            need(isinstance(ref,dict) and set(ref)=={'path','sha256'} and isinstance(ref.get('path'),str) and hashes(ref.get('sha256')),'invalid execution evidence')
-            identity=(ref['path'],ref['sha256'])
-            if identity not in checked:
-                need(len(checked)<64,'distinct execution evidence bound');evidence_reference(value,ref);checked.add(identity)
-    origins=report.get('origins');need(isinstance(origins,list) and len(origins)<=32,'invalid original result operation mappings')
-    for mapping in origins:origin(mapping)
-    for step in value['steps'].values():
-        cp=step.get('continuation')
-        if cp and cp['origin'] in origins:
-            need(cp['terminal']=='completed','UNKNOWN/running/failed original outcome cannot be consumed as complete')
-            for ref in cp['effects']:evidence_reference(value,{k:ref[k] for k in ('path','sha256')})
-
-def result_projection(value):
-    state=result_state(value)
-    if state is None:return None
-    pending,errors=receipt_coverage(value)
-    reviewable,followup,unavailable=pending_result_actions(value,pending);errors+=unavailable
-    unreviewed=[r['result'] for r in result_receipts(state) if not r['reviews']]
-    original_unknown=any(s.get('continuation') and not s['continuation']['resolved'] for s in value['steps'].values())
-    return {'object_ref':state['object_ref'],'original_goal':state['original_goal'],'pending_obligations':pending,
-        'program_checks_passed':all(s['state']=='verified' for s in value['steps'].values()),
-        'model_turn_terminal':[{'origin':s['continuation']['origin'],'status':s['continuation']['terminal']} for s in value['steps'].values() if s.get('continuation')],
-        'current_result':state.get('result'),'substantive_review':state.get('review'),
-        'result_receipts':copy.deepcopy(result_receipts(state)),'unreviewed_results':unreviewed,
-        'reviewable_results':reviewable,'continuable_results':followup,
-        'receipt_errors':errors,
-        'business_outcome':'pending' if pending or original_unknown or unreviewed or errors else 'reviewed_declared_scope',
-        'native_authenticity':'not established by file labels; original caller must verify actual native records',
-        'wake_source':'not provided by this task runtime; each continuation requires an actual host execution opportunity',
-        'original_operations':[s['continuation'] for s in value['steps'].values() if s.get('continuation')]}
-
-
-def validate_current_result(value):
-    state=result_state(value)
-    if state is None:return
-    pending,errors=receipt_coverage(value)
-    need(not pending and state.get('result') and result_receipts(state) and
-         all(r['reviews'] for r in result_receipts(state)),'original user result is still pending')
-    need(not errors,'current original result evidence is stale or unavailable')
-
-
-def current_accepted(value):
-    if not value['accepted']:return False
-    try:validate_current_result(value)
-    except (task().TaskError,OSError,ValueError):return False
-    return True
-
-
-def validate_result_state(value):
-    state=result_state(value)
-    need(('result_scope' in value['spec'])==(state is not None),'original result state/scope mismatch')
-    if state is None:return
-    need(isinstance(state,dict) and {'object_ref','original_goal','obligations','pending','result','review'}<=set(state)<= {'object_ref','original_goal','obligations','pending','result','review','receipts'},'invalid original result state')
-    need(state['object_ref']==value['spec']['result_scope']['object_ref'] and text(state['original_goal']),'original goal/object changed')
-    obligations=state['obligations'];pending=state['pending']
-    need(isinstance(obligations,dict) and 0<len(obligations)<=64 and all(identifier(k) and text(v) for k,v in obligations.items()),'invalid retained original obligations')
-    need(isinstance(pending,list) and all(isinstance(k,str) and k in obligations for k in pending) and len(set(pending))==len(pending),'invalid pending original obligations')
-    for key in ('result','review'):
-        ref=state[key]
-        if ref is not None:
-            need(isinstance(ref,dict) and set(ref)=={'path','sha256'} and hashes(ref.get('sha256')),'invalid retained result reference')
-            relative(ref['path'],'retained result path')
-
-
-    receipts=state.get('receipts',[])
-    need(isinstance(receipts,list) and len(receipts)<=64,'invalid current result receipts')
-    seen=set();reviews=0
-    for receipt in receipts:
-        need(isinstance(receipt,dict) and {'result','native_sha256','reviews'}<=set(receipt)<= {'result','native_sha256','reviews','native_identity'} and
-             (receipt['native_sha256'] is None or hashes(receipt['native_sha256'])),'invalid retained result receipt')
-        identity=receipt.get('native_identity')
-        need(identity is None or (isinstance(identity,dict) and set(identity)=={'thread_id','turn_id'} and
-             all(text(identity[k]) for k in identity)),'invalid retained native identity')
-        need(isinstance(receipt['result'],dict) and set(receipt['result'])=={'path','sha256'} and hashes(receipt['result'].get('sha256')),'invalid result receipt reference')
-        relative(receipt['result'].get('path'),'retained result path')
-        need(receipt['result']['sha256'] not in seen,'duplicate current result receipt');seen.add(receipt['result']['sha256'])
-        need(isinstance(receipt['reviews'],list),'invalid retained review references');reviews+=len(receipt['reviews'])
-        for ref in receipt['reviews']:
-            need(isinstance(ref,dict) and set(ref)=={'path','sha256'} and hashes(ref.get('sha256')),'invalid retained review reference')
-            relative(ref.get('path'),'retained review path')
-    need(reviews<=64,'current substantive review bound')
 
 def check_passive_object(value,path,device,inode,step_id=None):
     """Check the actual opened read object, including peer READ refusals.

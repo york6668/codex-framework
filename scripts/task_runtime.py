@@ -528,13 +528,11 @@ def view(value):
         result["accepted"] = False
     result["work_partition"] = partition(value, observations)
     if coordination.result_state(value) is not None:
-        result["result_dimensions"] = coordination.result_projection(value)
-        if result["accepted"]:
-            try:coordination.validate_current_result(value)
-            except (TaskError,OSError,ValueError) as exc:
-                result["accepted"]=False
-                result["result_dimensions"]["current_result_error"]=str(exc)
-                result["result_dimensions"]["business_outcome"]="unverified"
+        result["result_dimensions"], result_error = coordination.result_observation(value)
+        if result["accepted"] and result_error is not None:
+            result["accepted"]=False
+            result["result_dimensions"]["current_result_error"]=result_error
+            result["result_dimensions"]["business_outcome"]="unverified"
     result["completion_scope"] = "this task only; not project or all-project completion"
     if value["spec"].get("project"):
         result["project_context"] = copy.deepcopy(value["spec"]["project"])
