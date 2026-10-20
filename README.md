@@ -30,7 +30,7 @@ Mac mini 上的全局文档和 Skills 是部署副本，供 Codex 加载使用�
 |---|---|
 | `.codex/AGENTS.md` | 稳定偏好、授权与拒绝、来源/数据/额度保护及方法发现指针。 |
 | [需求到交付](.agents/skills/york-task-alignment/SKILL.md) | 首次复杂工作、纵向切片、实际依赖、授权交接、结果回收及父目标接续；简单任务直接完成。模型执行方法，非自动调度程序。 |
-| [框架内业务系统方法](.agents/skills/york-engineering/references/business-workflow.md) | 承接核心编排，规定项目业务规范、执行要求、测试方法和交付标准，并检查实际成果；前后台效果交付包含文档说明、页面效果和统一入口。具体实现与事实由本地项目提供。 |
+| [业务需求承接与项目复测](.agents/skills/york-engineering/references/business-workflow.md) | 业务系统持有需求、规范/执行要求、验收方法、交付标准和实际效果，承接核心能力并核项目落实；本方法只供工程复测建议。本地项目自持源码/tests/工程原件，反馈对应需求结果。明确要求前后台远端效果时，完整说明、两端效果和统一入口仍适用。 |
 | [通用工程](.agents/skills/york-engineering/SKILL.md) | 任意语言的需求理解、职责/接口设计、缺陷反馈、验证及两轴审查；[Java](.agents/skills/york-java-test/SKILL.md) 负责 JDK/Maven/JUnit 等执行适配。 |
 | [跨仓契约](.agents/skills/york-cross-repo-change/SKILL.md)、[资料](.agents/skills/york-provider-docs/SKILL.md) | 生产消费边界、语义与 mapping；不反向定义用户新目标。 |
 | [日志](.agents/skills/york-log-query/SKILL.md)、[本地数据](.agents/skills/york-local-data/SKILL.md)、[工作站](.agents/skills/york-workstation/SKILL.md) | 按疑点取证、隔离数据及节点资源方法；真实系统操作仍按原授权。 |
@@ -53,7 +53,7 @@ python3 scripts/obligation_projection.py /path/to/existing.json \
 
 支持本文件 JSON pointer/fragment 及唯一精确 `workstreams[id=...]` 选择；普通字段名优先，重复 ID、错误转义、空/坏引用分别报具体位置。输出保留所引对象的完整 `value` 和文档 hash，逐条区分存储状态、原目标、回合、发送/接收、结果和验收字段；不自动查询原生状态或推断可执行。新回合完成不能代替旧义务验收。拒绝或错误仅留在该行，其他合法引用继续展开；退出 0 表示引用解析无误，2 表示部分引用有误，1 表示文档/入口输入无效，均不是业务验收结果。
 
-原生完成/失败通知处理先核收实际结果，再计算并启动获准后继；既有 App 每小时计划只作漏通知和过期状态兜底。两条路径可复用这个纯读入口，引用去重不等于原生通知去重、效果恰好执行一次或后继已启动，成功读取/轮询也不是推进证据。模型/原消费者结合实际原生收件与完成记录、当前授权及依赖判断后继，并沿原任务执行和回收。此投影不成为第二执行队列；当前稳定运行包不含该维护脚本，采用须核确切发布脚本版本。不会沿引用打开其他文件、发送消息或更改原文档。
+原任务在真实通知或既有小时机会核收当前需求成果并实际推进本端合法后继；通知可用时及时处理，小时继续集中核收、发现缺口和推进，不只轮询旧示例/索引。可选复用纯读引用入口，但引用去重不等于事件去重、远端恰好一次或后继已执行。父和总表不作每步前置；跨设备不靠父直接读/发会话，各端只在自身范围消费获准共享内容。此脚本不是队列/调度，未进当前运行包不冒已采用；不沿引用打开别的文件、发消息或改原文档。
 
 ## 在另一台电脑安装
 
@@ -72,7 +72,7 @@ python3 "$HOME/work/codex-framework/scripts/codex_framework.py" install
 
 ## 固定版本运行与恢复
 
-`install` 部署六个原有 CLI 模块及 `framework_runtime`、`task_runtime`、`task_worker`，共九个模块；从旧受管入口升级时，先按原活动指针、已批准包指纹及完整包校验，静态还原原入口模板并逐字匹配，随后由标准安装事务更新；未知或已改入口保持阻塞；`acceptance_capture` 是独立工具，不在运行闭包。每个完整提交在 Codex home 的 `framework-sync/runtime/versions/<commit>/` 保存模块、正文快照和 hash/模式/输入契约 manifest。`active.json` 指向一个已校验版本，`approved.json` 保存已校验版本的 manifest hash。正常 `$HOME/.local/bin/codex-framework` 是无仓库导入的稳定 loader，每次先固定物理目录、核对整个包，再导入；旧进程继续使用原目录。
+`install` 部署六个原有 CLI 模块及 `framework_runtime`、`task_runtime`、`task_worker`、`task_coordination`，共十个模块；从旧受管入口升级时，先按原活动指针、已批准包指纹及完整包校验，静态还原原入口模板并逐字匹配，随后由标准安装事务更新；未知或已改入口保持阻塞；`acceptance_capture` 是独立工具，不在运行闭包。每个完整提交在 Codex home 的 `framework-sync/runtime/versions/<commit>/` 保存模块、正文快照和 hash/模式/输入契约 manifest。`active.json` 指向一个已校验版本，`approved.json` 保存已校验版本的 manifest hash。正常 `$HOME/.local/bin/codex-framework` 是无仓库导入的稳定 loader，每次先固定物理目录、核对整个包，再导入；旧进程继续使用原目录。
 
 ```sh
 # 已核对且存在于本地 Git 的发布分支头；首次 expected-runtime 使用 none。
@@ -146,7 +146,7 @@ python3 /path/to/codex-framework/scripts/codex_framework.py install \
 
 ### 主线与交付的只读关系
 
-`task` 的 `delivery-view` 操作直接投影现有主线、交付、多个原生任务和当前阶段证据，在构造任何 TaskStore 之前返回；不登记副本、不写状态、不查询或调用原生工具。父聊天提供沟通和主动发起，原实施、独验与依赖方直接交接；现有每小时汇总可集中查漏，不是持续推进的许可或必经中转。
+task 的 delivery-view 是可选纯读视图，在构造 Store 前返回给定关系，不登记副本、不写状态、不取远端文件或查询原生任务。它的输入合同只约束选用该 API 的调用，不把用户示例固化成三层架构、固定顺序或每条聊天必填格式。原任务围绕真实需求成果接续；核心方法、业务规范承接和本地工程各守职责，业务侧不管理工程版本/原件。各端用已有获准载体交换必要内容；小时任务只负责其实际范围，文件共享不等于远端唤醒。
 
 请求给当前 `baseline={id,source_ref}`、`mainlines=[{id,goal,source_ref,delivery_ids}]`、`deliveries=[{id,goal,source_ref,task_ids,stages}]`、`tasks=[{id,thread_id,turn_id,source_ref}]`，可带已取得的 `native_sources` 和 `observations`。`stages` 按具体交付声明适用的 source/build/install/load/adoption/verification，不适用项不凭空补流程；每项为 `{version,inputs,checks?,independent?}`。version=null 显示尚无冻结目标；inputs 精确关联已声明的上游阶段版本。实施交付与验证交付分开返回，原生 completed 只表示选定回合结束。
 
