@@ -1,6 +1,9 @@
 import contextlib
 import io
 import json
+import os
+import re
+import shlex
 import subprocess
 import sys
 from unittest import mock
@@ -197,6 +200,29 @@ class RefreshTests(FixtureCase):
                 self.assertEqual(output, {})
         # The hook runs no refresh; its execution does not change the installed version.
         self.assertEqual(rf.sync_status(self.a)["applied_revision"], "a" * 40)
+
+    def test_startup_command_works_without_path_and_keeps_explicit_target(self):
+        home = self.root / "home space $quoted"
+        target = home / "chosen codex"
+        framework = cf.Framework(self.repo, home, target)
+        install_runtime(framework)
+        context = rf.session_start(framework, {
+            "hook_event_name": "SessionStart", "source": "startup"
+        })["hookSpecificOutput"]["additionalContext"]
+        prefix = re.search(r"框架命令使用绝对前缀 (.*?)，其后接子命令", context).group(1)
+        args = shlex.split(prefix)
+        self.assertEqual(args, [sys.executable, str(home / ".local/bin/codex-framework"),
+                                "--home", str(home), "--codex-home", str(target)])
+        state = target / "framework-sync/state.json"
+        before = state.read_bytes() if state.exists() else None
+        run = subprocess.run(prefix + " sync-status", shell=True, cwd=self.root,
+                             env={**os.environ, "PATH": "", "CODEX_HOME": str(self.b.codex_home)},
+                             capture_output=True, text=True, timeout=3)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        observed = json.loads(run.stdout)
+        self.assertEqual(observed["runtime"]["status"], "matched")
+        self.assertTrue(observed["runtime"]["tool_directory"].startswith(str(target)))
+        self.assertEqual(state.read_bytes() if state.exists() else None, before)
 
 
 class LocalFallbackTests(GitFixtureCase):

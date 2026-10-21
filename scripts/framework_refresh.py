@@ -221,19 +221,25 @@ def session_start(framework, event):
     if event.get("hook_event_name") != "SessionStart" or event.get("source") not in ("startup", "resume", "clear"):
         return {}
     # This hook never performs network I/O, runs another model, or decides permissions.
+    import framework_runtime as runtime
+    command = shlex.join([sys.executable, str(runtime.launcher_path(framework)),
+                          "--home", str(framework.home),
+                          "--codex-home", str(framework.codex_home)])
     context = ("Codex 共享框架启动检查：遵循当前用户指令和更高优先级约束。"
-               "前置工作站摘要若为异常或未知，先报告具体状态、归属限制和可执行的原任务核对；"
-               "已收到摘要无需重复调用观察入口。摘要缺席时只读运行 codex-framework workstation-entry，"
-               "未知保留未知，不递归枚举工作站；原任务记录从原生入口读取，节点原件仅按清单路径有界读取。"
-               "本机已安装规范可继续使用。新建、恢复或清空任务核对 GitHub 发布版本："
-               "先直接运行 codex-framework sync-status，再用当前可用的 Codex 仓库或 GitHub 原生入口读取 "
-               "york6668/codex-framework 的 " + cf.BRANCH + " 分支。"
-               "需要刷新、入口故障或版本不明时再读 " + str(framework.home / REFERENCE) +
-               " 按其处理；常规启动不解析同步器源码。版本未变不重复安装，"
-               "有更新才按基线保护本机修改并重新读取更新后的全局及已使用 Skill。"
-               "同步失败标明待处理，继续无依赖工作；普通追加消息不联网。"
-               "复杂或结果不明时可用 codex-framework check 的 resume/feedback/close_issue，"
-               "其 ready 不代表实际完成；缺陷修正后先手动从本地正常入口复测。")
+               "框架命令使用绝对前缀 " + command + "，其后接子命令，不依赖 PATH。"
+               "摘要异常或未知时先报告具体状态、归属限制和可执行的原任务核对；"
+               "已收到摘要无需重复调用观察入口。"
+               "摘要缺席用该前缀执行 workstation-entry；未知保留未知，不递归枚举工作站。"
+               "原任务记录从原生入口读，节点原件按清单有界读取。"
+               "新建、恢复或清空任务先执行 sync-status，再从当前可用 GitHub 原生入口核对 "
+               "york6668/codex-framework 的 " + cf.BRANCH + " 发布分支。"
+               "current 仅说明已观察状态；分别核发布、部署正文、运行程序与本轮实际读取。"
+               "需要刷新、入口故障或版本不明时读 " + str(framework.home / REFERENCE) +
+               "；常规启动不解析同步器源码。版本未变且部署完整不重复安装；"
+               "有更新保护本机修改，更新后重读全局及已使用 Skill。"
+               "同步失败保留现用版本并继续无依赖工作；普通追加和压缩不联网。"
+               "复杂或结果不明可执行 check 的 resume/feedback/close_issue；ready 不代表完成。"
+               "缺陷修正后先手动从本地正常入口复测。")
     try:
         import workstation_entry
         observation = workstation_entry.summary(framework.codex_home)
