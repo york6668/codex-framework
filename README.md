@@ -36,7 +36,7 @@ Mac mini 上的全局文档和 Skills 是部署副本，供 Codex 加载使用�
 | [日志](.agents/skills/york-log-query/SKILL.md)、[本地数据](.agents/skills/york-local-data/SKILL.md)、[工作站](.agents/skills/york-workstation/SKILL.md) | 按疑点取证、隔离数据及节点资源方法；真实系统操作仍按原授权。 |
 | [交付](.agents/skills/york-safe-delivery/SKILL.md)、[框架维护](.agents/skills/york-codex-policy-maintenance/SKILL.md) | 工作区/Git 交付及共同规则/分发；正式独立验收不由实施自签。 |
 | `check` → `execution_check` → `source_evidence` | 对给定输入关系和来源形状做确定性检查；不自主发现遗漏任务、不认证原件，不证明语义规划或真实完成。 |
-| `install/refresh` → 分发正文；`SessionStart` → 启动提示/节点摘要 | 白名单及三方更新保护未发布修改；Hook 不在空闲时唤醒模型。`install` 将明确 Git 版本部署为受管理运行包，稳定 loader 固定物理目录后导入；`sync-status.runtime` 核对实际工具、正文和输入契约。普通正文 `refresh` 不获得代码执行权限。 |
+| `install/refresh` → 分发正文；`SessionStart` → 版本核对/更新正文/节点摘要 | 白名单及三方更新保护未发布修改；Hook 不在空闲时唤醒模型。`install` 将明确 Git 版本部署为受管理运行包，稳定 loader 固定物理目录后导入；`sync-status.runtime` 核对实际工具、正文和输入契约。普通正文 `refresh` 不获得代码执行权限。 |
 
 通用验证正文由工程方法持有，Java 与交付入口引用；生命周期正文由任务方法持有，跨仓只补契约共存顺序与组合边界。规则索引见 [正文归属](.agents/skills/york-codex-policy-maintenance/references/policy-owners.yaml)。方法存在及可安装只证明静态/分发能力；真实模型发现、规划和执行须由正常获授权交互独立判断。
 
@@ -92,13 +92,15 @@ python3 /path/to/codex-framework/scripts/codex_framework.py install \
 
 更新与恢复沿用原同步锁。新调用遇到写锁会返回未就绪，SessionStart 则输出有界未知提示且退出 0；不会为 Hook 等待更新。跨文档、状态、入口和指针的写入前先持久化 `transaction.json`，中断后报告 `update-incomplete`。指针、包 manifest、恢复记录和错误诊断读取均先校验对象及字段形状；坏状态由 CLI 报结构化未就绪，Hook 输出有界未知并退出 0。恢复只还原仍等于本次写入值的内容；中断后的其他成果保留为具体冲突。首次安装若指针尚未切换，稳定 loader 仅允许从已准备包进入 `sync-status`/`runtime-recover`，不以开发源码作日常后备入口。
 
-已识别的旧源码 launcher 会原位迁移；未知入口保持不动。已有本框架 SessionStart 命令在运行安装中迁到稳定入口，匹配同时核对有效 home/Codex home，保留原解释器、参数和属性；异目标、缺少明确目标或无法解析的命令不改写。显式 `install-hook` 也按同一身份判断，仅合并同一匹配器内执行参数和属性相同的重复项；缺少当前处理器时才添加默认项。首次启用仍用 `install-hook`。命令定义变化仍须原生 Hook 审阅，工具不修改信任库或安全设置，手动 Hook 合成验证不证明真实冷启动已信任或注入。
+已识别的旧源码 launcher 会原位迁移；未知入口保持不动。已有本框架 SessionStart 命令在运行安装中迁到稳定入口，匹配同时核对有效 home/Codex home，保留原解释器、参数和属性；异目标、缺少明确目标或无法解析的命令不改写。显式 `install-hook` 也按同一身份判断，仅合并同一匹配器内执行参数和属性相同的重复项；缺少当前处理器时才添加默认项。配置 `--native-cli` 时，为实际原生读取和有界更新正文调整本框架处理器的超时及上下文额度，保留更大的已有额度；定义变化仍须重新原生审阅。首次启用仍用 `install-hook`。命令定义变化仍须原生 Hook 审阅，工具不修改信任库或安全设置，手动 Hook 合成验证不证明真实冷启动已信任或注入。
 
 回退一起恢复相容的正文、工具和契约，保留已知远端版本与明确的 `rolled-back` 状态；本地有效修订继续保护。运行中、冻结复现或未决恢复可能引用的旧目录和失败准备内容不自动删除，退出引用后再按明确范围清理；它们不是另一套活动实现。失败入口诊断保留在运行目录的 `failures/`，不进入源码仓库。
 
 ## 任务启动与变更刷新
 
-完成首次兼容迁移后运行 `"$HOME/.local/bin/codex-framework" install-hook`，将 SessionStart 提示合并到实际 Codex home 的 `hooks.json`，保留其他 Hook。首次启用及定义变化通过 Codex 原生 `/hooks` 审阅并信任；安装器不会修改信任记录或启用绕过选项。Hook 只提示当前任务执行检查，不直接联网或运行其他模型。修改启动提示后，手动调用 handler 仅验证脚本；还须从正常 Codex CLI 启动并观察自动注入的专属上下文或受支持的 Hook 事件。若当前平台不提供可观察证据，明确保留未验证，不以配置存在或未来任务代替。
+完成首次兼容迁移后，核对本机正常 Codex CLI，运行 `"$HOME/.local/bin/codex-framework" install-hook --native-cli <Codex绝对路径>`。处理器在启动、恢复及清空时直接读取发布版本、核对部署与运行版本，并复用现有同步器兼容刷新规则。它通过原生 `app-server` 的临时工具上下文读取已有 GitHub 连接，不启动模型回合、不保存聊天、不建立后台调度。无配置时发布结果为 UNKNOWN。全局已由原生指令链装入且未变化时不重复注入；本次更新正文有界进入当前上下文，超过范围仍明确未注入。程序检查完成、模型取得正文与实际采用分别验证。
+
+首次启用及定义变化通过 Codex 原生 `/hooks` 审阅并信任；安装器不改信任记录或绕过选项。手动调用 handler 只证明脚本行为；还须从正常启动、恢复及清空观察 Hook、版本结果、原生规则上下文及实际需求行为。普通状态输入也须由入口完成版本检查，不能以模型未调用工具视为已检查；反之，入口已完成的检查不要求模型重复做。若当前平台不提供可观察证据，明确保留未验证，不以配置存在或未来任务代替。
 
 先复用当前任务可用的 Codex 仓库能力或 GitHub 原生连接，当前入口不可用时回退到本机已有 Git 配置；两边失败标记待用户处理并保留现用规范。不同入口访问的是同一 GitHub 项目，Codex 云端执行环境不是必经中转。具体命令、快照格式、冲突处理与当前任务重读动作见 [同步方法](.agents/skills/york-codex-policy-maintenance/references/framework-sync.md)。普通追加消息和上下文压缩不联网；后续仅明确已发布的规范变化、当前任务完成长期规范发布或用户要求时刷新，不注册每轮 Hook、后台轮询或跨任务通知。
 

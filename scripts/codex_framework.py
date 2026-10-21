@@ -293,9 +293,12 @@ def main(argv=None):
     parser.add_argument("--cloud-error", help="云端入口不可用的简短原因；随后使用本机 Git")
     parser.add_argument("--expected-revision", help="访问远端前 sync-status 的 observed_revision；无版本用 none")
     parser.add_argument("--expected-runtime", help="安装或回退前观察到的运行版本；首次为 none")
+    parser.add_argument("--native-cli", type=Path, help="install-hook 使用的已核对原生 Codex CLI 绝对路径")
     args = parser.parse_args(argv)
     if args.apply and args.command != "pull":
         parser.error("--apply 仅用于 pull")
+    if args.native_cli is not None and args.command != "install-hook":
+        parser.error("--native-cli 仅用于 install-hook")
     if args.command == "check":
         from execution_check import dispatch
         return dispatch()

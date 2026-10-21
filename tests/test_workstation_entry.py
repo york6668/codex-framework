@@ -67,7 +67,7 @@ class WorkstationEntryTests(unittest.TestCase):
             self.assertIn("FAIL_STOPPED", context)
             self.assertIn("异常", context)
             self.assertIn("原任务", context)
-            self.assertLessEqual(len(context.encode()), 1800)
+            self.assertLessEqual(len(context.encode()), refresh.CONTEXT_BYTES)
 
     def test_fresh_health_and_stale_health_are_distinct(self):
         self.write_manifest()
@@ -156,21 +156,18 @@ class WorkstationEntryTests(unittest.TestCase):
         with mock.patch.object(workstation_entry, "summary", side_effect=OSError("ENOSPC")):
             context = self.context()
         self.assertIn("未知(观察入口失败)", context)
-        self.assertIn("Codex 共享框架启动检查", context)
+        self.assertIn("Codex 共享框架启动实测", context)
 
-    def test_hook_carries_fixed_fallback_without_losing_failure(self):
+    def test_hook_preserves_observation_when_version_check_is_unavailable(self):
         self.source.pop("identity")
         self.write_manifest()
         self.state.write_text(json.dumps({"status": "STOPPED_ON_FAILURE"}))
         context = self.context()
         self.assertIn("STOPPED_ON_FAILURE", context)
-        self.assertIn("先报告具体状态、归属限制和可执行的原任务核对", context)
-        self.assertIn("已收到摘要无需重复调用观察入口", context)
-        self.assertIn("workstation-entry", context)
-        self.assertIn("sync-status", context)
-        self.assertIn("常规启动不解析同步器源码", context)
-        self.assertIn("不递归枚举工作站", context)
-        self.assertLessEqual(len(context.encode()), 1800)
+        self.assertIn('"publication":{"status":"unknown"', context)
+        self.assertIn("原任务记录从原生入口读", context)
+        self.assertIn("异常不阻断无依赖工作", context)
+        self.assertLessEqual(len(context.encode()), refresh.CONTEXT_BYTES)
 
 
 if __name__ == "__main__":

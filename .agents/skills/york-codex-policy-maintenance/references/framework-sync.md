@@ -8,7 +8,7 @@ GitHub 项目是内容来源，Codex 云端执行环境是可选运行位置。�
 
 ## 读取来源与应用
 
-命令入口为 `$HOME/.local/bin/codex-framework`，启动提示使用安装时确定的绝对入口及目标参数，不依赖终端 PATH；显式安装到其他 Codex home 时沿用 `--codex-home <安装目录>`。普通启动直接按下列命令与已支持的远端入口核对；只有入口异常或确需修改同步器时才检查实现源码，不先读取或解析整套工具代码。已收到的工作站异常摘要可先用于首报，版本核对不阻断其可执行处置。先执行 `sync-status`，保存返回的 `expected_revision`，作为本次读取远端前的版本。它只用于防止并发同步覆盖较新的内容，不提供任务独占权。
+命令入口为 `$HOME/.local/bin/codex-framework`，启动提示使用安装时确定的绝对入口及目标参数，不依赖终端 PATH；显式安装到其他 Codex home 时沿用 `--codex-home <安装目录>`。普通启动先消费 Hook 已完成的实测结果，不重复联网或安装；结果缺席、未知或明确仍有待办时，按下列命令与已支持的远端入口补核；只有入口异常或确需修改同步器时才检查实现源码，不先读取或解析整套工具代码。已收到的工作站异常摘要可先用于首报，版本核对不阻断其可执行处置。先执行 `sync-status`，保存返回的 `expected_revision`，作为本次读取远端前的版本。它只用于防止并发同步覆盖较新的内容，不提供任务独占权。
 
 优先使用当前任务可调用的 Codex 仓库能力或 GitHub 原生连接，直接读取 GitHub 发布分支。当前 GitHub 连接可通过 `github_fetch` 读取 `https://api.github.com/repos/york6668/codex-framework/branches`，从中选取上述精确分支；避免把含 `/` 的分支名整个编码后当作单段 URL。工具可用性按当前任务发现，不要求固定工具前缀。
 
@@ -67,7 +67,13 @@ GitHub 项目是内容来源，Codex 云端执行环境是可选运行位置。�
 
 ## 启动 Hook
 
-`install-hook` 在实际 Codex home 的 `hooks.json` 合并一个 `SessionStart` handler，匹配 `startup|resume|clear`，保留其他 Hook。它只输出本方法的发现提示，不联网、不调用模型、不装规则、不阻断任务；不注册 `UserPromptSubmit`，也不匹配 `compact`。
+`install-hook --native-cli <已核对的 Codex 可执行文件绝对路径>` 在实际 Codex home 的 `hooks.json` 合并一个 `SessionStart` handler，匹配 `startup|resume|clear`，保留其他 Hook。CLI 路径保存在该节点 `framework-sync/native-client.json`，不进入 Git。先从当前宿主正常 CLI 及其 `app-server` 协议核实工具直调、临时上下文和退出行为；不能假定其他宿主或版本也支持。未配置入口时只返回本地核对及发布 UNKNOWN，不声称启动同步已完成。
+
+入口直接调用现有 `sync-status` 逻辑和原生 GitHub 读取工具，再复用 `refresh` 的完整快照、共同基线、并发保护及冲突处理。原生读取通过一个短时 `ephemeral` 工具上下文完成：没有用户提示、模型回合、会话持久化、递归 Hook 或独立 worker，不读写业务数据、不复制凭据。读取既有连接的 `structuredContent`，不能把普通文本 `Action completed.` 当成版本。原生失败再用已有本机 Git；两边失败保留现用规则，发布状态为 UNKNOWN，不阻断无依赖工作。
+
+版本未变时复用完整已校验缓存，不拉全套正文或重装；仍实际比较部署文件。版本变化时从同一个 SHA 取完整发布树，只复用 blob 一致的缓存，其余读取后整体校验。Hook 只刷新白名单正文，不从文档快照执行代码；运行版本不同或更新未完成会明确出现在实测结果中，由维护任务沿原安装能力处理。
+
+全局 `AGENTS.md` 通常已经由 Codex 原生指令链装入；无变化时不重复注入整份规则。入口比较读取远端前后的实际部署正文；即使另一启动先完成刷新，本轮也交付发生变化的 Markdown，保留用户规则原有优先级。输出最多 64 KiB，超出部分明确列为未注入，不能冒称已采用；模型仍按当前需求读取适用 Skill。原生记录中的指令链、Hook 正文与实际文件比对，才能证明本轮取得哪一版；程序读文件本身不证明模型采用。原生读取有限时，临时进程使用独立进程组，正常或异常退出均清理所属工具子进程；不注册 `UserPromptSubmit`、`Stop` 或轮询，也不匹配 `compact`。
 
 首次启用或定义变化须通过 [Codex 原生 Hook 信任界面](https://learn.chatgpt.com/docs/hooks#review-and-trust-hooks) 审阅。CLI 使用 `/hooks`；没有完成原生信任和真实启动验证时，分别报告这两个缺口，不能仅凭手动运行脚本宣称自动触发成功。安装器不改写信任库或开启绕过选项。框架工具升级后，从已核对的发布 Git 提交运行明确的 `install --revision <SHA> --expected-runtime <已观察值或none>`；稳定 loader 与现有本框架 Hook 迁到受管理版本入口，再核对原生信任。共享文档刷新不完成程序升级。
 

@@ -6,6 +6,7 @@ import re
 import shlex
 import subprocess
 import sys
+import time
 from unittest import mock
 
 from test_framework import FixtureCase, GitFixtureCase, put, run_git, install_runtime
@@ -193,12 +194,12 @@ class RefreshTests(FixtureCase):
                 self.assertEqual(output["hookSpecificOutput"]["hookEventName"], "SessionStart")
                 self.assertIn(str(self.a.home / rf.REFERENCE), output["hookSpecificOutput"]["additionalContext"])
                 self.assertIn("原任务记录", output["hookSpecificOutput"]["additionalContext"])
-                self.assertIn("resume/feedback/close_issue", output["hookSpecificOutput"]["additionalContext"])
-                self.assertIn("先手动从本地正常入口复测", output["hookSpecificOutput"]["additionalContext"])
+                self.assertIn('"publication":{"status":"unknown"', output["hookSpecificOutput"]["additionalContext"])
+                self.assertIn('"deployment":{"status":"checked"', output["hookSpecificOutput"]["additionalContext"])
                 self.assertNotIn("continue", output)
             else:
                 self.assertEqual(output, {})
-        # The hook runs no refresh; its execution does not change the installed version.
+        # An unconfigured native client is explicit UNKNOWN, without implicit network attempts.
         self.assertEqual(rf.sync_status(self.a)["applied_revision"], "a" * 40)
 
     def test_startup_command_works_without_path_and_keeps_explicit_target(self):
@@ -223,6 +224,195 @@ class RefreshTests(FixtureCase):
         self.assertEqual(observed["runtime"]["status"], "matched")
         self.assertTrue(observed["runtime"]["tool_directory"].startswith(str(target)))
         self.assertEqual(state.read_bytes() if state.exists() else None, before)
+
+    def configured_repository(self, revision):
+        put(self.a.codex_home / rf.NATIVE_CLIENT, json.dumps({"cli": sys.executable}))
+        repository = mock.MagicMock()
+        repository.__enter__.return_value = repository
+        repository.publication.return_value = revision
+        return repository
+
+    def test_startup_performs_version_and_deployment_checks_without_model_action(self):
+        self.install_snapshot()
+        repository = self.configured_repository("a" * 40)
+        with mock.patch.object(rf, "NativeRepository", return_value=repository), \
+                mock.patch.object(rf, "local_snapshot", side_effect=AssertionError("no fallback")):
+            for source in ("startup", "resume", "clear"):
+                context = rf.session_start(self.a, {"hook_event_name": "SessionStart", "source": source})["hookSpecificOutput"]["additionalContext"]
+                self.assertIn('"publication":{"status":"checked","revision":"' + "a" * 40, context)
+                self.assertIn('"differences":{}', context)
+                self.assertIn('"status":"read","sha256":', context)
+                self.assertNotIn("本次更新正文", context)
+            self.assertEqual(repository.publication.call_count, 3)
+            repository.snapshot.assert_not_called()
+
+    def test_new_global_rule_is_applied_and_enters_hook_context(self):
+        self.install_snapshot()
+        body = "# Updated global rule\nVerify real rows before dependent decisions.\n"
+        put(self.repo / ".codex/AGENTS.md", body)
+        repository = self.configured_repository("b" * 40)
+        repository.snapshot.return_value = snapshot(self.a, "b" * 40)
+        with mock.patch.object(rf, "NativeRepository", return_value=repository):
+            context = rf.session_start(self.a, {"hook_event_name": "SessionStart", "source": "resume"})["hookSpecificOutput"]["additionalContext"]
+        self.assertEqual(self.a.target(".codex/AGENTS.md").read_text(), body)
+        self.assertIn("本次更新正文 " + str(self.a.target(".codex/AGENTS.md")) + "\n" + body, context)
+        self.assertIn('"revision":"' + "b" * 40, context)
+
+    def test_sync_failure_retains_rules_and_does_not_claim_fresh_publication(self):
+        self.install_snapshot()
+        self.configured_repository("b" * 40)
+        before = self.a.collect(local=True)
+        with mock.patch.object(rf, "NativeRepository", side_effect=cf.SyncError("原生连接超时")), \
+                mock.patch.object(rf, "local_snapshot", side_effect=cf.SyncError("Git 认证不可用")):
+            result, updated = rf.startup_check(self.a)
+        self.assertEqual(result["publication"]["status"], "unknown")
+        self.assertEqual(result["documents"]["revision"], "a" * 40)
+        self.assertEqual(self.a.collect(local=True), before)
+        self.assertEqual(updated, {})
+
+    def test_concurrent_refresh_delivers_changed_rules_after_supersession(self):
+        self.install_snapshot()
+        repository = self.configured_repository("a" * 40)
+        body = "Rule refreshed by the other startup.\n"
+        def concurrent_publication():
+            put(self.repo / ".codex/AGENTS.md", body)
+            self.install_snapshot("b" * 40)
+            return "a" * 40
+        repository.publication.side_effect = concurrent_publication
+        with mock.patch.object(rf, "NativeRepository", return_value=repository):
+            result, updated = rf.startup_check(self.a)
+        self.assertEqual(result["publication"]["revision"], "a" * 40)
+        self.assertEqual(result["documents"]["revision"], "b" * 40)
+        self.assertIn(".codex/AGENTS.md", result["changed"])
+        self.assertEqual(updated[str(self.a.target(".codex/AGENTS.md"))], body)
+
+    def test_startup_preserves_local_conflict_and_applies_independent_update(self):
+        self.install_snapshot()
+        put(self.a.target(".codex/AGENTS.md"), "unpublished local rule\n")
+        put(self.repo / ".codex/AGENTS.md", "remote changed rule\n")
+        put(self.repo / ".codex/memory-framework.md", "independent update\n")
+        repository = self.configured_repository("b" * 40)
+        repository.snapshot.return_value = snapshot(self.a, "b" * 40)
+        with mock.patch.object(rf, "NativeRepository", return_value=repository):
+            result, updated = rf.startup_check(self.a)
+        self.assertEqual(result["documents"]["status"], "conflicts")
+        self.assertEqual(result["deployment"]["differences"][".codex/AGENTS.md"], "conflict")
+        self.assertNotIn(str(self.a.target(".codex/AGENTS.md")), updated)
+        self.assertEqual(self.a.target(".codex/AGENTS.md").read_text(), "unpublished local rule\n")
+        self.assertEqual(updated[str(self.a.target(".codex/memory-framework.md"))], "independent update\n")
+
+    def test_missing_deployment_is_reported_even_when_version_is_unchanged(self):
+        self.install_snapshot()
+        self.a.target(".codex/AGENTS.md").unlink()
+        repository = self.configured_repository("a" * 40)
+        with mock.patch.object(rf, "NativeRepository", return_value=repository):
+            result, updated = rf.startup_check(self.a)
+        self.assertEqual(result["rules"][str(self.a.target(".codex/AGENTS.md"))]["status"], "missing")
+        self.assertIn(".codex/AGENTS.md", result["deployment"]["differences"])
+        self.assertEqual(updated, {})
+
+    def test_ordinary_and_compact_do_not_read_or_connect(self):
+        with mock.patch.object(rf, "startup_check", side_effect=AssertionError("no startup I/O")):
+            for source in ("ordinary-message", "compact", "fork"):
+                self.assertEqual(rf.session_start(self.a, {"hook_event_name": "SessionStart", "source": source}), {})
+
+    def test_oversized_update_is_explicitly_not_adopted_and_output_is_bounded(self):
+        self.install_snapshot()
+        put(self.repo / ".codex/AGENTS.md", "oversized\n" * rf.CONTEXT_BYTES)
+        repository = self.configured_repository("b" * 40)
+        repository.snapshot.return_value = snapshot(self.a, "b" * 40)
+        with mock.patch.object(rf, "NativeRepository", return_value=repository):
+            context = rf.session_start(self.a, {"hook_event_name": "SessionStart", "source": "startup"})["hookSpecificOutput"]["additionalContext"]
+        self.assertLessEqual(len(context.encode()), rf.CONTEXT_BYTES)
+        self.assertIn("未注入正文", context)
+
+    def test_native_hook_install_preserves_trust_and_other_handlers(self):
+        install_runtime(self.a)
+        rf.install_hook(self.a)
+        trust = self.a.codex_home / "config.toml"
+        put(trust, "old native trust record\n")
+        old = trust.read_bytes()
+        rf.install_hook(self.a, sys.executable)
+        config = json.loads((self.a.codex_home / "hooks.json").read_text())
+        handler = config["hooks"]["SessionStart"][0]["hooks"][0]
+        self.assertEqual(handler["timeout"], rf.HOOK_TIMEOUT)
+        self.assertGreaterEqual(handler["additionalContextLimit"], rf.CONTEXT_BYTES)
+        self.assertEqual(trust.read_bytes(), old)
+        self.assertNotIn("UserPromptSubmit", config["hooks"])
+
+
+class NativeRepositoryTests(FixtureCase):
+    def test_non_object_protocol_preserves_unknown_summary_and_reaps_children(self):
+        # A failed native process must not erase the startup report or leave
+        # the temporary process group alive. No real connector is substituted.
+        peer = self.root / "bad-codex"
+        child_pid = self.root / "child.pid"
+        put(peer, "#!" + sys.executable + "\n" + '''
+import json,signal,subprocess,sys,time
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+child=subprocess.Popen([sys.executable,'-c','import signal,time; signal.signal(signal.SIGTERM,signal.SIG_IGN); time.sleep(60)'], stdout=subprocess.DEVNULL)
+with open(''' + repr(str(child_pid)) + ''','w') as f: f.write(str(child.pid))
+sys.stdin.readline()
+print('[]',flush=True)
+time.sleep(60)
+''')
+        peer.chmod(0o755)
+        self.a.home.mkdir(exist_ok=True)
+        put(self.a.codex_home / rf.NATIVE_CLIENT, json.dumps({"cli": str(peer)}))
+        with mock.patch.object(rf, "local_snapshot", side_effect=cf.SyncError("offline")):
+            context = rf.session_start(self.a, {"hook_event_name": "SessionStart", "source": "startup"})["hookSpecificOutput"]["additionalContext"]
+        self.assertIn('"publication":{"status":"unknown"', context)
+        self.assertIn("工作站观察", context)
+        self.assertIn("协议消息不是对象", context)
+        pid = int(child_pid.read_text())
+        for _ in range(30):
+            status = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True).stdout.strip()
+            if not status or status.startswith("Z"):
+                break
+            time.sleep(0.05)
+        self.assertTrue(not status or status.startswith("Z"), status)
+
+    def test_native_protocol_uses_structured_content_and_never_starts_a_turn(self):
+        # A generated local protocol peer checks requests, not model behavior.
+        peer = self.root / "codex"
+        put(peer, "#!" + sys.executable + "\n" + '''
+import json,sys
+for line in sys.stdin:
+    m=json.loads(line); method=m['method']; p=m.get('params',{})
+    if method=='initialized': continue
+    if method=='initialize': result={}
+    elif method=='thread/start':
+        assert p['ephemeral'] is True
+        result={'thread':{'id':'ephemeral-fixture','path':None}}
+    elif method=='mcpServerStatus/list':
+        result={'data':[{'name':'codex_apps','tools':{'github.fetch':{},'github.fetch_file':{}}}]}
+    elif method=='mcpServer/tool/call':
+        assert p['tool']=='github.fetch'
+        result={'content':[{'type':'text','text':'Action completed.'}], 'structuredContent':{
+            'content':json.dumps([{'name':'york-worktree/Codex框架共享','commit':{'sha':'a'*40}}])}}
+    else: raise AssertionError(method)
+    print(json.dumps({'id':m['id'],'result':result}),flush=True)
+''')
+        peer.chmod(0o755)
+        self.a.home.mkdir(exist_ok=True)
+        put(self.a.codex_home / rf.NATIVE_CLIENT, json.dumps({"cli": str(peer)}))
+        with rf.NativeRepository(self.a) as repository:
+            self.assertEqual(repository.publication(), "a" * 40)
+            process = repository.proc
+        self.assertEqual(process.returncode, 0)
+
+    def test_native_snapshot_reuses_only_blob_matching_cached_content(self):
+        original = snapshot(self.a)
+        previous = rf.validate_snapshot(original)
+        put(self.repo / ".codex/AGENTS.md", "updated entry\n")
+        incoming = snapshot(self.a, "b" * 40)
+        repository = object.__new__(rf.NativeRepository)
+        repository.fetch = mock.Mock(return_value={"truncated": False, "tree": incoming["tree"]})
+        repository.call = mock.Mock(return_value={"encoding": "utf-8", "content": "updated entry\n"})
+        result = repository.snapshot("b" * 40, previous)
+        self.assertEqual(rf.validate_snapshot(result), self.a.collect())
+        self.assertEqual(repository.call.call_count, 1)
+        self.assertEqual(repository.call.call_args.args[1]["ref"], "b" * 40)
 
 
 class LocalFallbackTests(GitFixtureCase):

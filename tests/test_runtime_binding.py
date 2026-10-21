@@ -574,7 +574,7 @@ fcntl.flock = observe_flock
         hook = subprocess.run(own["command"], shell=True, input=json.dumps({"hook_event_name":"SessionStart","source":"startup"}),
                               text=True, capture_output=True, env=self.env, timeout=5)
         self.assertEqual(hook.returncode, 0, hook.stderr)
-        self.assertLess(len(json.loads(hook.stdout)["hookSpecificOutput"]["additionalContext"].encode()), 1800)
+        self.assertLessEqual(len(json.loads(hook.stdout)["hookSpecificOutput"]["additionalContext"].encode()), refresh.CONTEXT_BYTES)
         self.assertFalse(any("trust" in p.name for p in custom.home.rglob("*")))
 
     def test_n7_unknown_launcher_and_unapproved_origin_are_not_changed(self):
