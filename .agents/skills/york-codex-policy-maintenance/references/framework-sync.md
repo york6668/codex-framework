@@ -79,11 +79,11 @@ GitHub 项目是内容来源，Codex 云端执行环境是可选运行位置。�
 
 ## 正文版本与实际运行版本
 
-核心产品从 `0.1.0` 开始编号，唯一声明在受管源码 `codex_framework.RELEASE_VERSION`；此前发布保持未编号。规划、加载与更新先按产品版本，完整提交 hash、树与文件 hash 仅作内容及并发校验。`codex-framework version` 读取实际运行版本，`sync-status` 的 runtime 同时区分 tool/active/document 的产品版本；null 保留未编号、未绑定或未验证状态，不能套用另一对象的版本。产品版本不等于包格式或输入契约编号，也不证明模型或业务能力。
+核心产品从 `0.1.0` 开始编号，唯一声明在受管源码 `codex_framework.RELEASE_VERSION`；此前发布保持未编号。规划、加载与更新先按产品版本，完整提交 hash、树与文件 hash 仅作内容及并发校验。先使用 Hook 或现有 `sync-status` 的实际运行结果：含 `tool_version` 的已编号入口支持 `codex-framework version`；旧入口没有这个字段时保留未编号或未知，不能从新正文、发布版本或活动指针推定旧程序支持新命令。不要为查询产品版本向旧入口试发 `version`，也不必因此分析同步器源码。已编号入口的 runtime 分别给出 tool/active/document 产品版本；null 保留未编号、未绑定或未验证状态，不能套用另一对象的版本。产品版本不等于包格式或输入契约编号，也不证明模型或业务能力。
 
 安装目标可用 `install --release-version <产品版本>`，原 `--revision` 和 `--expected-runtime` 继续约束准确内容与当前状态；产品版本不符时不准备或激活。旧调用兼容。首次升级未编号程序时使用已核对发布提交的源码入口，不让旧程序试探不支持的新参数；不借版本号扩大原仓库、分支、安装或平台权限。
 
-`sync-status` 保留 v1 同步状态与 `expected_revision`，另返回 `document_status` 和 `runtime`：实际进程的 `tool_revision`/物理目录、指针的 `active_revision`、正文已应用版本、输入契约及本机 override。正文同步 `current` 不能单独证明工具采用；运行未绑定、缺件/坏 hash、契约不兼容、源码 bootstrap 调用、仍运行旧版本或更新未完成分别报告。稳定入口启动校验失败时也报告正文与尝试的活动版本，且不导入损坏代码。
+`sync-status` 保留 v1 同步状态与 `expected_revision`，另返回 `document_status` 和 `runtime`：实际进程的 `tool_revision`/物理目录、指针的 `active_revision`、正文已应用版本、输入契约及本机 override。正文与运行程序版本不同是 `revision-mismatch`；已发布正文的正常更新不属于未发布本机 override，后者按当前部署共同基线和实际文件判断。正文同步 `current` 不能单独证明工具采用；运行未绑定、缺件/坏 hash、契约不兼容、源码 bootstrap 调用、仍运行旧版本或更新未完成分别报告。稳定入口启动校验失败时也报告正文与尝试的活动版本，且不导入损坏代码；`version` 读取状态失败时返回未知及原错误原因，不输出猜测的版本。
 
 代码安装只从明确的本地 Git 发布分支头及规定模块集合取对象，并校验普通文件模式、完整性、输入契约和隔离烟测；普通 `refresh` 快照仍只承载原白名单正文，不能加入脚本获得执行权。源码未提交差异不被打包或重置；若其中有应发布成果，先按当前目标整合并独立验证，而不是把它们当作已发布输入。
 

@@ -15,7 +15,7 @@ import tempfile
 
 REMOTE = "https://github.com/york6668/codex-framework.git"
 BRANCH = "york-worktree/Codex框架共享"
-RELEASE_VERSION = "0.1.0"
+RELEASE_VERSION = "0.1.1"
 SKILLS = (
     "york-codex-policy-maintenance", "york-cross-repo-change", "york-engineering", "york-java-test",
     "york-local-data", "york-log-query", "york-provider-docs", "york-safe-delivery",
@@ -323,10 +323,10 @@ def main(argv=None):
         import framework_refresh as refresh
         if args.command == "version":
             status = refresh.sync_status(framework)
-            print(json.dumps({"product": "codex-framework", "version": status["runtime"]["tool_version"],
+            print(json.dumps({"product": "codex-framework", "version": status["runtime"].get("tool_version"),
                               "source_version": RELEASE_VERSION, "runtime": status["runtime"]},
                              ensure_ascii=False, indent=2))
-            return 0
+            return 1 if status["status"] == "runtime-unavailable" else 0
         if args.command in ("install", "runtime-rollback", "runtime-recover"):
             if args.command == "runtime-recover":
                 output = runtime.recover(framework)

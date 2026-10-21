@@ -234,6 +234,7 @@ def sync_status(framework):
                 "runtime": {"status": "unknown", "reason": str(exc)}}
     result = dict(state, source=cf.REMOTE, branch=cf.BRANCH,
                   expected_revision=state.get("observed_revision") or "none", runtime=binding,
+                  local_overrides=binding["local_overrides"],
                   document_status=state.get("status", "unknown"))
     if binding["status"] not in ("matched", "unmanaged"):
         result["status"] = "runtime-" + binding["status"]

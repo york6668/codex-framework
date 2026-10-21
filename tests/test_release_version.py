@@ -15,6 +15,9 @@ import framework_runtime as runtime
 class ReleaseVersionTests(FixtureCase):
     def setUp(self):
         super().setUp()
+        path = self.repo / 'scripts/codex_framework.py'
+        path.write_text(path.read_text().replace(
+            'RELEASE_VERSION = "' + cf.RELEASE_VERSION + '"', 'RELEASE_VERSION = "0.1.0"', 1))
         self.revision = seed_runtime(self.repo)
 
     def cli(self, command, *, source=False, payload=None):
@@ -59,6 +62,19 @@ class ReleaseVersionTests(FixtureCase):
         self.assertEqual(value['runtime']['active_version'], '0.1.0')
         self.assertIsNone(value['runtime']['tool_version'])
         self.assertIsNone(check.loaded_tool_version())
+
+    def test_unreadable_state_reports_unknown_version_without_traceback(self):
+        state = self.a.codex_home / 'framework-sync/state.json'
+        state.parent.mkdir(parents=True)
+        state.write_text('{')
+        response = self.cli('version', source=True)
+        self.assertEqual(response.returncode, 1, response.stdout + response.stderr)
+        self.assertEqual(response.stderr, '')
+        value = json.loads(response.stdout)
+        self.assertIsNone(value['version'])
+        self.assertEqual(value['runtime']['status'], 'unknown')
+        self.assertIn('同步基线', value['runtime']['reason'])
+        self.assertEqual(state.read_text(), '{')
 
     def test_legacy_has_no_invented_version_and_declaration_is_literal(self):
         self.assertIsNone(runtime.declared_release_version('FORMAT = 1\n'))

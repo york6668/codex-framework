@@ -4,7 +4,7 @@
 
 核心从 **0.1.0** 开始以产品版本号规划、选择安装目标和报告实际加载；此前未编号的发布保持未编号，不把历史提交追认为某个产品版本。版本号的唯一源码声明为 `scripts/codex_framework.py` 的 `RELEASE_VERSION`，使用无前导零的 `major.minor.patch`。后续按功能、兼容性和修复范围更新此声明；格式编号 `FORMAT`、输入契约编号和 Git hash 各自保留原用途。
 
-正常入口 `codex-framework version` 显示实际运行的 `version`、源码声明及 runtime 的 `tool_version` / `active_version` / `document_version`。源码调用的实际运行版本为 null，旧未编号包也为 null，不能从活动指针或请求字段补成已加载版本。`check` 的 `tool_version` 同样绑定实际物理模块；版本名不证明业务、模型或专家能力。
+从 `0.1.0` 起，正常入口 `codex-framework version` 显示实际运行的 `version`、源码声明及 runtime 的 `tool_version` / `active_version` / `document_version`。旧未编号程序不支持该子命令；先复用 Hook 或 `sync-status` 的实际运行结果，缺少 `tool_version` 时保留未编号或未知，不从新版正文推定旧命令能力。源码调用的实际运行版本为 null，不能从活动指针或请求字段补成已加载版本。`check` 的 `tool_version` 同样绑定实际物理模块；版本名不证明业务、模型或专家能力。
 
 安装或更新先选择产品版本，例如 `install --release-version 0.1.0`，并继续以原机制核对发布分支、完整 `--revision` 和 `--expected-runtime`。版本名不匹配时不准备或切换包；Git hash 只绑定与验证这份版本内容，不充当主线名称。旧调用保持兼容，不新增所有调用方的必填字段、标签服务或第二发布台账。首次从未编号入口升级时，从已核对发布提交的源码入口执行带版本目标的安装；旧入口不具备新参数，不先试错。
 

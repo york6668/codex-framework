@@ -127,6 +127,9 @@ def declared_release_version(source):
         raise cf.SyncError("核心产品版本声明无法解析") from exc
     values = [n.value for n in tree.body if isinstance(n, ast.Assign)
               and any(isinstance(t, ast.Name) and t.id == "RELEASE_VERSION" for t in n.targets)]
+    # The installed macOS runner can be Python 3.9, before match AST nodes.
+    match_names = tuple(getattr(ast, name) for name in ("MatchAs", "MatchStar") if hasattr(ast, name))
+    match_mappings = (ast.MatchMapping,) if hasattr(ast, "MatchMapping") else ()
     # Include explicit deletion and Python's non-Name binding syntax. A
     # declaration removed/rebound later is not a persistent product version.
     writes = [n for n in ast.walk(tree) if
@@ -136,8 +139,8 @@ def declared_release_version(source):
                   and n.name == "RELEASE_VERSION")
               or (isinstance(n, ast.alias) and (n.asname or n.name.split(".")[0]) == "RELEASE_VERSION")
               or (isinstance(n, ast.ExceptHandler) and n.name == "RELEASE_VERSION")
-              or (isinstance(n, (ast.MatchAs, ast.MatchStar)) and n.name == "RELEASE_VERSION")
-              or (isinstance(n, ast.MatchMapping) and n.rest == "RELEASE_VERSION")]
+              or (isinstance(n, match_names) and n.name == "RELEASE_VERSION")
+              or (isinstance(n, match_mappings) and n.rest == "RELEASE_VERSION")]
     if not values and not writes:
         return None  # Existing unnumbered releases are not relabelled.
     if len(values) != 1 or len(writes) != 1 or not isinstance(values[0], ast.Constant):
@@ -228,12 +231,14 @@ def describe(f, state=None):
     a = active(f)
     state = sync_state(f) if state is None else state
     context = executing()
+    overrides = {name for name, value in f.load_state().items()
+                 if cf.read_file(f.target(name)) != value}
     from execution_check import loaded_tool_version
     result = {"active_revision": a["revision"] if a else None,
               "tool_revision": context.get("revision"), "tool_directory": context.get("directory"),
               "tool_version": loaded_tool_version(), "active_version": None, "document_version": None,
               "document_revision": state.get("applied_revision"), "input_contract": INPUT_CONTRACT,
-              "local_overrides": list(state.get("local_overrides", [])), "status": "unmanaged"}
+              "local_overrides": sorted(overrides), "status": "unmanaged"}
     if not a:
         if journal(f).exists():
             result["status"] = "update-incomplete"
@@ -247,13 +252,13 @@ def describe(f, state=None):
     except (cf.SyncError, OSError, ValueError, KeyError) as exc:
         result.update(status="invalid-package", reason=str(exc))
         return result
-    overrides = set(result["local_overrides"])
-    for name, value in f.load_state().items():
-        if cf.read_file(f.target(name)) != value:
-            overrides.add(name)
-    for name, value in snapshot["files"].items():
-        if cf.read_file(f.target(name)) != value.encode():
-            overrides.add(name)
+    # A document-only refresh legitimately moves beyond the active code package.
+    # Its current deployment baseline identifies local edits; the older package
+    # is only a document authority while both revisions still match.
+    if result["document_revision"] == a["revision"]:
+        for name, value in snapshot["files"].items():
+            if cf.read_file(f.target(name)) != value.encode():
+                overrides.add(name)
     result["local_overrides"] = sorted(overrides)
     if result["document_revision"] == a["revision"] and not overrides:
         result["document_version"] = result["active_version"]
