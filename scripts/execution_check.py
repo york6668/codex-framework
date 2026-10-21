@@ -2228,13 +2228,31 @@ def loaded_tool_revision():
     return revision
 
 
+def loaded_tool_version():
+    """Name only the physically bound running product, never a request/pointer."""
+    if loaded_tool_revision() is None:
+        return None
+    import codex_framework as framework
+    import framework_runtime as runtime
+    try:
+        directory = Path(sys._codex_framework_runtime["directory"])
+        if Path(framework.__file__).resolve(strict=True) != (directory / "scripts/codex_framework.py").resolve(strict=True):
+            return None
+        value = getattr(framework, "RELEASE_VERSION", None)
+        return runtime.validate_release_version(value) if value is not None else None
+    except (OSError, ValueError, RuntimeError, framework.SyncError):
+        return None
+
+
 def dispatch():
     try:
         result = evaluate(json.load(sys.stdin))
     except (CheckError, ValueError, TypeError) as exc:
-        print(json.dumps({"status": "invalid", "error": str(exc), "tool_revision": loaded_tool_revision()}, ensure_ascii=False))
+        print(json.dumps({"status": "invalid", "error": str(exc), "tool_revision": loaded_tool_revision(),
+                          "tool_version": loaded_tool_version()}, ensure_ascii=False))
         return 1
     result["tool_revision"] = loaded_tool_revision()
+    result["tool_version"] = loaded_tool_version()
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0 if result["status"] == "ready" else 2
 

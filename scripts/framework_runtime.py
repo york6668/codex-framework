@@ -112,9 +112,42 @@ def sync_state(f):
     return state
 
 
+def validate_release_version(value):
+    """Product versions are names; FORMAT and Git hashes serve other contracts."""
+    if not isinstance(value, str) or re.fullmatch(r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)", value) is None:
+        raise cf.SyncError("核心产品版本号须为无前导零的 major.minor.patch")
+    return value
+
+
+def declared_release_version(source):
+    """Read the single literal product declaration without executing its code."""
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError, TypeError) as exc:
+        raise cf.SyncError("核心产品版本声明无法解析") from exc
+    values = [n.value for n in tree.body if isinstance(n, ast.Assign)
+              and any(isinstance(t, ast.Name) and t.id == "RELEASE_VERSION" for t in n.targets)]
+    # Include explicit deletion and Python's non-Name binding syntax. A
+    # declaration removed/rebound later is not a persistent product version.
+    writes = [n for n in ast.walk(tree) if
+              (isinstance(n, ast.Name) and n.id == "RELEASE_VERSION"
+               and isinstance(n.ctx, (ast.Store, ast.Del)))
+              or (isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+                  and n.name == "RELEASE_VERSION")
+              or (isinstance(n, ast.alias) and (n.asname or n.name.split(".")[0]) == "RELEASE_VERSION")
+              or (isinstance(n, ast.ExceptHandler) and n.name == "RELEASE_VERSION")
+              or (isinstance(n, (ast.MatchAs, ast.MatchStar)) and n.name == "RELEASE_VERSION")
+              or (isinstance(n, ast.MatchMapping) and n.rest == "RELEASE_VERSION")]
+    if not values and not writes:
+        return None  # Existing unnumbered releases are not relabelled.
+    if len(values) != 1 or len(writes) != 1 or not isinstance(values[0], ast.Constant):
+        raise cf.SyncError("核心产品版本须为唯一字符串常量")
+    return validate_release_version(values[0].value)
+
+
 def version_path(f, revision):
     if not isinstance(revision, str) or not SHA.fullmatch(revision):
-        raise cf.SyncError("运行版本必须是完整 Git commit SHA")
+        raise cf.SyncError("运行包 revision 须为完整 Git commit SHA；产品版本另行选择")
     return cf.safe_path(root(f), "versions/" + revision)
 
 
@@ -195,8 +228,10 @@ def describe(f, state=None):
     a = active(f)
     state = sync_state(f) if state is None else state
     context = executing()
+    from execution_check import loaded_tool_version
     result = {"active_revision": a["revision"] if a else None,
               "tool_revision": context.get("revision"), "tool_directory": context.get("directory"),
+              "tool_version": loaded_tool_version(), "active_version": None, "document_version": None,
               "document_revision": state.get("applied_revision"), "input_contract": INPUT_CONTRACT,
               "local_overrides": list(state.get("local_overrides", [])), "status": "unmanaged"}
     if not a:
@@ -207,6 +242,8 @@ def describe(f, state=None):
         m, snapshot = validate(version_path(f, a["revision"]), a["manifest_sha256"])
         result["package_manifest_sha256"] = a["manifest_sha256"]
         result["package_input_contract"] = m["input_contract"]
+        result["active_version"] = declared_release_version(
+            cf.read_file(version_path(f, a["revision"]) / "scripts/codex_framework.py"))
     except (cf.SyncError, OSError, ValueError, KeyError) as exc:
         result.update(status="invalid-package", reason=str(exc))
         return result
@@ -218,6 +255,8 @@ def describe(f, state=None):
         if cf.read_file(f.target(name)) != value.encode():
             overrides.add(name)
     result["local_overrides"] = sorted(overrides)
+    if result["document_revision"] == a["revision"] and not overrides:
+        result["document_version"] = result["active_version"]
     result["status"] = ("update-incomplete" if journal(f).exists() else
                         "revision-mismatch" if result["document_revision"] != a["revision"] else
                         "source-invocation" if not result["tool_revision"] else
@@ -548,6 +587,7 @@ def prepare(f, revision):
     manifest = {"version": FORMAT, "source": cf.REMOTE, "branch": cf.BRANCH,
                 "revision": revision, "input_contract": INPUT_CONTRACT,
                 "files": {n: {"sha256": digest(b), "mode": mode} for n, (b, mode) in values.items()}}
+    declared_release_version(values["scripts/codex_framework.py"][0])
     directory = version_path(f, revision)
     if directory.exists():
         validate(directory, digest(encoded(manifest)))
@@ -727,8 +767,16 @@ def checkpoint(name):
     """Fault-injection seam for isolated tests; no environment-triggered production faults."""
 
 
-def install(f, revision=None, expected_runtime=None, rollback=False):
+def install(f, revision=None, expected_runtime=None, rollback=False, release_version=None):
     revision = revision or cf.git(f.repo, "rev-parse", "HEAD")
+    if release_version is not None:
+        expected_version = validate_release_version(release_version)
+        if rollback:
+            declared = declared_release_version(cf.read_file(version_path(f, revision) / "scripts/codex_framework.py"))
+        else:
+            declared = declared_release_version(cf.git(f.repo, "show", revision + ":scripts/codex_framework.py"))
+        if declared != expected_version:
+            raise cf.SyncError("目标核心产品版本不符；未准备或切换运行包")
     before_active = active(f)
     expected = expected_runtime if expected_runtime is not None else (before_active or {}).get("revision", "none")
     with f.lock():
@@ -801,6 +849,7 @@ def install(f, revision=None, expected_runtime=None, rollback=False):
         journal(f).unlink()
         source_overrides = cf.git(f.repo, "diff", "--name-only", revision, optional=True) if f.repo.exists() else None
         return {"status": "rolled-back" if rollback else "installed", "revision": revision,
+                "release_version": declared_release_version(cf.read_file(directory / "scripts/codex_framework.py")),
                 "source_overrides": [n for n in (source_overrides or "").splitlines()
                                      if cf.allowed(n) or n in {"scripts/" + v for v in MODULES}],
                 "directory": str(directory), "changed": list(changes), "local_overrides": overrides,

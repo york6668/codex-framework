@@ -15,6 +15,7 @@ import tempfile
 
 REMOTE = "https://github.com/york6668/codex-framework.git"
 BRANCH = "york-worktree/Codex框架共享"
+RELEASE_VERSION = "0.1.0"
 SKILLS = (
     "york-codex-policy-maintenance", "york-cross-repo-change", "york-engineering", "york-java-test",
     "york-local-data", "york-log-query", "york-provider-docs", "york-safe-delivery",
@@ -284,7 +285,7 @@ def main(argv=None):
     parser.add_argument("--repo", type=Path)
     parser.add_argument("--home", type=Path, help="目标用户目录；显式指定时不使用环境中的 CODEX_HOME")
     parser.add_argument("--codex-home", type=Path, help="显式指定目标 Codex home")
-    parser.add_argument("command", choices=("status", "install", "apply", "pull", "export",
+    parser.add_argument("command", choices=("version", "status", "install", "apply", "pull", "export",
                         "sync-status", "refresh", "install-hook", "session-start", "check",
                         "workstation-check", "workstation-entry", "runtime-recover", "runtime-rollback", "task"))
     parser.add_argument("--apply", action="store_true", help="pull 后应用；否则仅预览差异")
@@ -292,13 +293,16 @@ def main(argv=None):
     parser.add_argument("--revision", help="原生连接刚读取的发布提交 SHA")
     parser.add_argument("--cloud-error", help="云端入口不可用的简短原因；随后使用本机 Git")
     parser.add_argument("--expected-revision", help="访问远端前 sync-status 的 observed_revision；无版本用 none")
-    parser.add_argument("--expected-runtime", help="安装或回退前观察到的运行版本；首次为 none")
+    parser.add_argument("--expected-runtime", help="已观察运行包的完整 revision 校验值；首次为 none")
+    parser.add_argument("--release-version", help="安装或回退的核心产品版本号；Git revision 仍作完整性核验")
     parser.add_argument("--native-cli", type=Path, help="install-hook 使用的已核对原生 Codex CLI 绝对路径")
     args = parser.parse_args(argv)
     if args.apply and args.command != "pull":
         parser.error("--apply 仅用于 pull")
     if args.native_cli is not None and args.command != "install-hook":
         parser.error("--native-cli 仅用于 install-hook")
+    if args.release_version is not None and args.command not in ("install", "runtime-rollback"):
+        parser.error("--release-version 仅用于 install/runtime-rollback")
     if args.command == "check":
         from execution_check import dispatch
         return dispatch()
@@ -317,6 +321,12 @@ def main(argv=None):
         framework = Framework(args.repo or runtime.default_repo(),
                               args.home or Path.home(), codex_home)
         import framework_refresh as refresh
+        if args.command == "version":
+            status = refresh.sync_status(framework)
+            print(json.dumps({"product": "codex-framework", "version": status["runtime"]["tool_version"],
+                              "source_version": RELEASE_VERSION, "runtime": status["runtime"]},
+                             ensure_ascii=False, indent=2))
+            return 0
         if args.command in ("install", "runtime-rollback", "runtime-recover"):
             if args.command == "runtime-recover":
                 output = runtime.recover(framework)
@@ -324,7 +334,8 @@ def main(argv=None):
                 if args.command == "runtime-rollback" and not args.revision:
                     raise SyncError("runtime-rollback 要求 --revision 指定已保留版本")
                 output = runtime.install(framework, args.revision, args.expected_runtime,
-                                         rollback=args.command == "runtime-rollback")
+                                         rollback=args.command == "runtime-rollback",
+                                         release_version=args.release_version)
             print(json.dumps(output, ensure_ascii=False, indent=2))
             return 2 if output.get("conflicts") else 0
         if args.command in ("sync-status", "refresh", "install-hook", "session-start"):
