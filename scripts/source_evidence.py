@@ -14,6 +14,65 @@ from pathlib import Path, PureWindowsPath
 import stat
 
 
+def resource_identity(value):
+    """Existing logical resource identity, independent of transport labels."""
+    if not isinstance(value, dict):
+        raise ValueError("resource must be an object")
+    for key in ("kind", "id"):
+        if not isinstance(value.get(key), str) or not value[key].strip():
+            raise ValueError("resource." + key + " must be a nonempty string")
+    path = value.get("path", "")
+    if not isinstance(path, str) or path.startswith("/") or any(
+            part in ("", ".", "..") for part in path.split("/") if path):
+        raise ValueError("resource.path must be a relative canonical path")
+    return value["kind"], value["id"], path.rstrip("/")
+
+
+def _unique_statement(pairs):
+    value = {}
+    for key, child in pairs:
+        if key in value:
+            raise ValueError("duplicate evidence field")
+        value[key] = child
+    return value
+
+
+def _reject_constant(value):
+    raise ValueError("non-JSON evidence constant")
+
+
+def parse_statement(body):
+    """Read original JSON without silently replacing any declared field."""
+    return json.loads(body, object_pairs_hook=_unique_statement,
+                      parse_constant=_reject_constant)
+
+
+def resource_scope_matches(original, claimed):
+    """Compare supplied scopes without certifying their truth or applicability."""
+    if not isinstance(original, dict) or not isinstance(claimed, dict):
+        return False
+    try:
+        original, claimed = dict(original), dict(claimed)
+        if resource_identity(original) != resource_identity(claimed):
+            return False
+        # Object identity is not the whole scope. Do not discard a report's
+        # declared conditions, or guess a fixed list of relevant dimensions.
+        # Only normalize the existing absent/empty path representation.
+        original.setdefault("path", "")
+        claimed.setdefault("path", "")
+        return json.dumps(original, sort_keys=True, allow_nan=False) == json.dumps(
+            claimed, sort_keys=True, allow_nan=False)
+    except (ValueError, TypeError, RecursionError):
+        return False
+
+
+def _declared_resource_matches(statement, record):
+    if (not isinstance(statement, dict) or "resource" not in statement
+            or record.get("resource") is None):
+        return True
+    return resource_scope_matches(statement["resource"], record["resource"])
+
+
 @contextmanager
 def _node_root(base):
     """Anchor the canonical root before inspecting its evidence paths.
@@ -228,6 +287,18 @@ def verify(context, project, record):
             # tested, adopted or observed version.
             if record.get("version") and record["version"] not in (item.get("command", "") + body):
                 return False
+            if record.get("resource") is not None and body.lstrip().startswith("{"):
+                try:
+                    statement = parse_statement(body)
+                except json.JSONDecodeError:
+                    # Raw command output remains source-only evidence; it is
+                    # not forced into a new structured report format.
+                    pass
+                except (ValueError, UnicodeError, RecursionError):
+                    return False
+                else:
+                    if not _declared_resource_matches(statement, record):
+                        return False
         elif result == "failed":
             exit_code = item.get("exitCode")
             if (item.get("type") != "commandExecution"
@@ -259,22 +330,17 @@ def verify(context, project, record):
         if hashlib.sha256(current).hexdigest() != digest:
             return False
         if record.get("result") in ("passed", "verified", "applied", "observed", "used_correction"):
-            def unique(pairs):
-                value = {}
-                for key, child in pairs:
-                    if key in value:
-                        raise ValueError("duplicate evidence field")
-                    value[key] = child
-                return value
-
-            def reject_constant(value):
-                raise ValueError("non-JSON evidence constant")
-
             try:
                 # Parse the bytes whose digest was checked, not a second read
                 # that could describe another result after replacement.
-                statement = json.loads(current, object_pairs_hook=unique, parse_constant=reject_constant)
+                statement = parse_statement(current)
             except (ValueError, UnicodeError, RecursionError):
+                return False
+            # A matching hash proves these bytes, not the scope in a caller's
+            # wrapper. Preserve a source result rather than relabel its object.
+            # Reports without an explicit scope keep their legacy source-only
+            # meaning; this does not make scope fields mandatory everywhere.
+            if not _declared_resource_matches(statement, record):
                 return False
             return (isinstance(statement, dict)
                     and statement.get("result") == record["result"]

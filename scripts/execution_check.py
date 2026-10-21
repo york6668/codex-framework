@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 
 from source_evidence import native_item, native_precedes, source_body, source_text, verify as verify_source
 from source_evidence import direct_user_message as source_direct_user_message
+from source_evidence import resource_identity, resource_scope_matches, parse_statement
 
 
 class CheckError(ValueError):
@@ -107,14 +108,10 @@ def task_report_identity(body):
 
 
 def resource(value):
-    value = obj(value, "resource")
-    kind = identifier(value.get("kind"), "resource.kind")
-    name = identifier(value.get("id"), "resource.id")
-    path = value.get("path", "")
-    if not isinstance(path, str) or path.startswith("/") or any(
-            part in ("", ".", "..") for part in path.split("/") if path):
-        raise CheckError("resource.path must be a relative canonical path")
-    return kind, name, path.rstrip("/")
+    try:
+        return resource_identity(value)
+    except ValueError as exc:
+        raise CheckError(str(exc)) from exc
 
 
 def dependency_statement(body, producer, consumer, reason):
@@ -854,15 +851,24 @@ def evaluate(payload):
                 "superseding_refs": sorted(superseding),
                 "meaning": "supplied_source_relations_only; semantic_entailment_not_verified"}
 
-    def check_outcome_scope(record, target, label):
-        """A successful result for another resource cannot accept this target."""
+    def check_outcome_scope(record, target, label, target_declaration, statement=None):
+        """Do not expand a result beyond the scope it actually declares."""
         if record is None:
             return
-        declared = record.get("resource")
-        if declared is None:
-            need(label + "_scope")
-        elif resource(declared) != target:
-            block(label + "_resource_mismatch")
+        declarations = [record.get("resource")]
+        # Structured consumers already parse their original source. Its scope
+        # remains binding even when it is a contract without a success result.
+        if isinstance(statement, dict) and "resource" in statement:
+            declarations.append(statement["resource"])
+        for declared in declarations:
+            if declared is None:
+                need(label + "_scope")
+            elif resource(declared) != target:
+                block(label + "_resource_mismatch")
+            elif not resource_scope_matches(declared, target_declaration):
+                # The original result may remain valid. This target needs
+                # applicability evidence, not a new permission or refusal.
+                need(label + "_applicability")
 
     def check_local_verification(validation, target, version):
         """Check fixed expectations against manually observed local outputs."""
@@ -1023,7 +1029,7 @@ def evaluate(payload):
                 or not any(covers(s, target, False) for s in task_scopes)):
             block("business_verification_outside_scope")
         for record, label in ((expected_record, "business_expectation"), (observed_record, "business_run")):
-            check_outcome_scope(record, target, label)
+            check_outcome_scope(record, target, label, envelope.get("resource"))
         if expected_record and observed_record:
             check_current_goal(expected_record.get("related_ref"), required=True)
             if observed_record.get("related_ref") != expected_record["ref"]:
@@ -1037,10 +1043,13 @@ def evaluate(payload):
             if not native_precedes(context, expected_record, observed_record):
                 need("business_expectation_not_before_observation")
             try:
-                expected_body = json.loads(source_body(context, expected_record) or "null")
-                observed_body = json.loads(source_body(context, observed_record) or "null")
+                expected_body = parse_statement(source_body(context, expected_record) or "null")
+                observed_body = parse_statement(source_body(context, observed_record) or "null")
             except ValueError:
                 raise CheckError("business source must contain complete JSON")
+            for record, label, statement in ((expected_record, "business_expectation", expected_body),
+                                             (observed_record, "business_run", observed_body)):
+                check_outcome_scope(record, target, label, envelope.get("resource"), statement)
             failures, gaps = business_observation(expected_body, observed_body)
             if (expected_record.get("version") != expected_body["run"]["testVersion"]
                     or observed_record.get("version") != expected_body["run"]["testVersion"]):
@@ -1211,7 +1220,7 @@ def evaluate(payload):
                 need("verification_resource")
             else:
                 completed_target = resource(target)
-                check_outcome_scope(acceptance, completed_target, "goal_acceptance")
+                check_outcome_scope(acceptance, completed_target, "goal_acceptance", target)
                 if (not any(covers(scope, completed_target, False) for scope in project_scopes)
                         or not any(covers(scope, completed_target, False) for scope in task_scopes)):
                     block("progress_outside_scope")
@@ -1962,7 +1971,6 @@ def evaluate(payload):
                 if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
                     need(fact_kind + "_digest")
                     return None
-                check_outcome_scope(record, target, fact_kind)
                 item = native_item(context, record)
                 body = source_body(context, record)
                 command = (item is not None and item.get("type") == "commandExecution"
@@ -1970,23 +1978,15 @@ def evaluate(payload):
                 if not command and (command_only or not direct_user_message(item, body)):
                     need("native_" + fact_kind + "_source")
                     return None
-                def unique(pairs):
-                    result = {}
-                    for key, value in pairs:
-                        if key in result:
-                            raise CheckError("duplicate resource fact field")
-                        result[key] = value
-                    return result
                 try:
-                    value = json.loads(body, object_pairs_hook=unique) if body else None
+                    value = parse_statement(body) if body else None
                 except (ValueError, RecursionError):
                     need("structured_" + fact_kind)
                     return None
                 value = obj(value, fact_kind + " body")
                 if set(value) != set(fields) | {"resource"}:
                     raise CheckError(fact_kind + " body fields are invalid")
-                if resource(value["resource"]) != target:
-                    block(fact_kind + "_resource_mismatch")
+                check_outcome_scope(record, target, fact_kind, action.get("resource"), value)
                 return value
 
             contract = resource_fact(maintenance.get("contract_ref"), "resource_contract",
@@ -2078,7 +2078,7 @@ def evaluate(payload):
                     or test.get("version") != release.get("version")
                     or test.get("result") != "passed"):
                 need("tested_release_version")
-            check_outcome_scope(test, target, "release_test")
+            check_outcome_scope(test, target, "release_test", action.get("resource"))
             if test is not None:
                 if not test.get("related_ref") or release_goal is None:
                     need("release_test_goal_reference")
@@ -2171,7 +2171,7 @@ def evaluate(payload):
             for record, label in ((original, "regression_original"), (affected, "regression_affected"),
                                   (applied, "adoption"), (observed, "effect"),
                                   (acceptance, "goal_acceptance"), (continuation, "followup")):
-                check_outcome_scope(record, target, label)
+                check_outcome_scope(record, target, label, issue.get("resource"))
         verification = issue.get("independent_verification")
         attempts = verification.get("attempts", []) if isinstance(verification, dict) else []
         verifier = attempts[-1].get("task_ref") if attempts and isinstance(attempts[-1], dict) else None
