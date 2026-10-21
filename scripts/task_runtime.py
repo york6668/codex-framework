@@ -546,7 +546,10 @@ def view(value):
     elif result.get("result_dimensions",{}).get("continuable_results"):
         result["next_action"] = {**result["result_dimensions"]["continuable_results"][0],"bounded":True}
     elif result.get("result_dimensions",{}).get("pending_obligations") and not result["work_partition"]["waiting"]:
-        result["next_action"] = {"kind":"continue_original_obligations","obligations":result["result_dimensions"]["pending_obligations"],"bounded":True}
+        pending=result["result_dimensions"]["pending_obligations"]
+        result["next_action"] = {"kind":"continue_original_obligations","obligations":pending,
+            "requirements":[copy.deepcopy(row) for row in result["result_dimensions"]["requirements"]["obligations"] if row["id"] in pending],
+            "bounded":True}
     elif len(result["work_partition"]["verified"]) == len(value["steps"]):
         result["next_action"] = {"kind": "completed" if result["accepted"] else "review_load_or_accept", "bounded": True}
     else:

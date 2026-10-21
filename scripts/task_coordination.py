@@ -385,7 +385,14 @@ def prompt(value):
     spec=value['spec'];project=spec.get('project')
     if project is None and not spec.get('assignment') and not spec.get('request_identity') and not spec.get('result_scope'):return ''
     identity={'request_id':spec['request_id'],'task_id':value['task_id'],'input_revision':value['input_revision'],'acceptance_sha256':value['acceptance_sha256'],'native_request':spec.get('request_identity')}
-    return '\nCurrent request identity: '+json.dumps(identity,ensure_ascii=False)+'\nProject goal/responsibility: '+json.dumps(project,ensure_ascii=False)+'\nThis assignment: '+json.dumps(spec.get('assignment'),ensure_ascii=False)+'\nDeclared input relationships: '+json.dumps(spec.get('requires',[]),ensure_ascii=False)+'\nOriginal result scope: '+json.dumps(spec.get('result_scope'),ensure_ascii=False)+'\nThese facts do not grant permissions. Answer this current request and assigned deliverables; an older PASS or another project result is not its acceptance.'
+    retained=_results.requirement_context(value)
+    return ('\nCurrent request identity: '+json.dumps(identity,ensure_ascii=False)+
+        '\nProject goal/responsibility: '+json.dumps(project,ensure_ascii=False)+
+        '\nThis assignment: '+json.dumps(spec.get('assignment'),ensure_ascii=False)+
+        '\nDeclared input relationships: '+json.dumps(spec.get('requires',[]),ensure_ascii=False)+
+        '\nOriginal result scope: '+json.dumps(spec.get('result_scope'),ensure_ascii=False)+
+        ('\nRetained original requirements: '+json.dumps(retained,ensure_ascii=False) if retained is not None else '')+
+        '\nThese facts do not grant permissions. Answer this current request and assigned deliverables; an older PASS or another project result is not its acceptance.')
 
 
 def read_json(workspace,path,fingerprint,value=None,unique=False):

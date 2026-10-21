@@ -78,7 +78,8 @@ class DeliveryRelations:
             self.context.need(identity not in deliveries, 'duplicate deliverable identity')
             row = {'goal': declared.get('goal'), 'source_ref': declared.get('source_ref'), 'task_ids': declared.get('task_ids'),
                    'stages': {}, 'gaps': [], 'historical_observations': [], 'implementation_delivery': {'complete': False},
-                   'verification_delivery': {'complete': False}, 'complete': False}
+                   'verification_delivery': {'complete': False}, 'complete': False,
+                   'reported_observations': [], 'next_actions': []}
             deliveries[identity] = row
             row['declared_contract'] = copy.deepcopy(declared)
             if isinstance(declared.get('stages'), dict):
@@ -121,6 +122,10 @@ class DeliveryRelations:
                     self.context.need(isinstance(reported, dict) and all(type(reported.get(k)) is type(record[k]) and reported[k] == record[k]
                          for k in ('delivery_id', 'stage', 'case', 'task_id', 'baseline', 'version', 'inputs', 'result')),
                          'observation does not bind its original report content')
+                    # Keep the verified original body, including its limitations
+                    # and nonselected cases. Labels/version links cannot replace
+                    # what the actual report says or authenticate its semantics.
+                    row['reported_observations'].append(copy.deepcopy(record))
                     current = record['baseline'] == baseline['id']
                     if not current:
                         reuse = record.get('reuse')
@@ -186,6 +191,11 @@ class DeliveryRelations:
                     state['complete'] = not state['gaps']
                     state['status'] = 'bound_current_observations' if state['complete'] else 'pending'
                     row['gaps'].extend(dict(gap, stage=stage) for gap in state['gaps'])
+                    if not state['complete']:
+                        affected={g['case'] for g in state['gaps'] if 'case' in g}
+                        row['next_actions'].append({'kind':'inspect_current_stage_gap','stage':stage,
+                            'version':expected['version'],'checks':[c for c in checks if not affected or c in affected],
+                            'gaps':copy.deepcopy(state['gaps']),'execution_authorized':False})
                 row['implementation_delivery'] = {'complete': all(s['complete'] for k, s in row['stages'].items()
                     if s['required'] and k != 'verification'), 'scope': 'declared implementation stages only'}
                 verify = row['stages']['verification']

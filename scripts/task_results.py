@@ -33,6 +33,39 @@ class TaskResults:
         return value.get('result_state')
 
 
+    def requirement_context(self,value):
+        """Carry retained obligations from existing inputs, without new authority.
+
+        An amendment can declare only its new slice. The existing result state
+        retains earlier obligations; neither a prompt nor a status projection
+        may silently reduce them to that latest slice. Historical stage prose
+        is deliberately not replayed as an active instruction or permission.
+        """
+        state=self.result_state(value)
+        if state is None:return None
+        inputs=[]
+        for entry in value.get('history',[]):
+            old=entry.get('superseded_input') if isinstance(entry,dict) else None
+            if isinstance(old,dict) and isinstance(old.get('spec'),dict):inputs.append(old)
+        inputs.append({'input_revision':value['input_revision'],'spec':value['spec']})
+        origins={}
+        for original in inputs:
+            spec=original['spec'];scope=spec.get('result_scope')
+            if not isinstance(scope,dict) or scope.get('object_ref')!=state['object_ref']:continue
+            for row in scope.get('obligations',[]):
+                if (isinstance(row,dict) and isinstance(row.get('id'),str)
+                        and row['id'] in state['obligations']
+                        and row.get('acceptance')==state['obligations'][row['id']]):
+                    origins.setdefault(row['id'],{'source_ref':scope.get('source_ref'),
+                        'input_revision':original.get('input_revision'),
+                        'request_identity':copy.deepcopy(spec.get('request_identity'))})
+        return {'object_ref':state['object_ref'],'original_goal':state['original_goal'],
+            'obligations':[{'id':key,'acceptance':acceptance,**origins.get(key,
+                {'source_ref':None,'input_revision':None,'request_identity':None})}
+                for key,acceptance in state['obligations'].items()],
+            'meaning':'retained declared requirements and input origins; not authenticated user authority, current permission or completed behavior'}
+
+
     def initialize_result(self,value,prior=None):
         scope=value['spec'].get('result_scope')
         if scope is None:
@@ -297,6 +330,7 @@ class TaskResults:
         unreviewed=[r['result'] for r in self.result_receipts(state) if not r['reviews']]
         original_unknown=any(s.get('continuation') and not s['continuation']['resolved'] for s in value['steps'].values())
         return {'object_ref':state['object_ref'],'original_goal':state['original_goal'],'pending_obligations':pending,
+            'requirements':self.requirement_context(value),
             'program_checks_passed':all(s['state']=='verified' for s in value['steps'].values()),
             'model_turn_terminal':[{'origin':s['continuation']['origin'],'status':s['continuation']['terminal']} for s in value['steps'].values() if s.get('continuation')],
             'current_result':state.get('result'),'substantive_review':state.get('review'),

@@ -152,6 +152,8 @@ task 的 delivery-view 是可选纯读视图，在构造 Store 前返回给定�
 
 每项 observation 给 `delivery_id,stage,case,task_id,baseline,version,inputs,result,source_ref,sha256,report`；report 是原结果 JSON 正文，其指纹与前八个关系字段须匹配，结果为 PASS/FAIL/NOT_RUN/UNKNOWN。新用例不能只改旧报告的 case 名称；相同原任务/回合/用例出现冲突来源不按第一份或摘要时间覆盖。历史范围仅在明确的 `reuse={baseline,source_ref,requirements,code,input,environment,method}` 五轴均为 unchanged、且目标版本/输入/用例仍匹配时复用；有改变就保持待复验。来源和适用性仍由原负责人按真实原件判断，JSON 标签和散列不认证作者、授权或领域结论。
 
+每项交付的 `reported_observations` 保留已绑定原报告全文与来源，包括历史或未选中的用例，避免摘要丢掉原限定；`next_actions` 只指出已声明阶段的具体证据缺口，不提供执行、重试或解除拒绝许可。未采用本视图的原任务同样保留这些事实，不增加必经转换。
+
 此入口只核当前显式关系及原报告字节，不自动读取文件或证明实际部署。source、build、install、load、adoption 的实际证据来自各原入口，当前加载版本的组合仍走适用独验。输出没有执行权限或后台运行保证，不可用它解除原拒绝、UNKNOWN 或真实必要依赖。
 
 ### 项目职责和多任务接续
@@ -293,6 +295,7 @@ const got = await api.readReview(retainedDispatches, dispatch.contract.request, 
 
 已采用持久任务的当前原目标，可在 spec 附可选 `result_scope`：
 `{object_ref,goal,source_ref,obligations:[{id,acceptance}]}`。不是所有小查询的必填门禁。
+原输入经 amend 增加切片后，运行提示与状态的 `requirements` 从既有记录还原累计义务及最早匹配的输入出处；不重播历史阶段指令，不将声明来源冒充人类授权。原件缺失时来源留空，未完义务仍保留；无需为此另建任务或台账。
 采用有限适配且当前目标确实来自原生计划时，原 `request_identity` 可附可选
 `automation_id`，与原 `thread_id/turn_id/message_id` 一同参与当前输入及结果绑定。
 这里 turn/message 标识原目标来源；实际执行回合沿已有 native_result/checkpoint 另记。
