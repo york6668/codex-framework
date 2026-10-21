@@ -720,7 +720,15 @@ class TaskRuntimeTests(fixtures.FixtureCase):
         legacy+='\nfrom pathlib import Path\nPath('+repr(str(marker))+').write_text("unexpected")\n'
         path.write_text(legacy)
         prior=fixtures.seed_runtime(self.repo)
-        runtime.install(self.a,prior)
+        if literal:
+            runtime.install(self.a,prior)
+        else:
+            # Recreate a package already installed by an older installer. The
+            # current installer rejects this expression even on first install;
+            # only fixture setup supplies the historical rendered launcher.
+            rendered=(template%(str(self.a.codex_home),runtime.LEGACY_MODULES)).encode()
+            with mock.patch.object(runtime,'prior_loader_bytes',return_value=rendered):
+                runtime.install(self.a,prior)
         # The initial explicit package install runs its approved smoke commands.
         # Only the later old-template recognition must avoid executing old code.
         marker.unlink()
@@ -790,10 +798,10 @@ class TaskRuntimeTests(fixtures.FixtureCase):
         self.assertEqual(runtime.launcher_path(self.a).read_bytes(),before)
         self.assertFalse(marker.exists())
 
-    def test_manifest_cannot_disguise_nine_module_code_as_legacy_seven(self):
+    def test_manifest_cannot_disguise_current_module_code_as_legacy_seven(self):
         revision=fixtures.seed_runtime(self.repo);runtime.install(self.a,revision)
         directory=runtime.version_path(self.a,revision);m=runtime.load(directory/'manifest.json')
-        for name in ['task_runtime.py','task_worker.py','task_coordination.py']:
+        for name in set(runtime.MODULES)-set(runtime.LEGACY_MODULES):
             (directory/'scripts'/name).unlink();del m['files']['scripts/'+name]
         raw=runtime.encoded(m);(directory/'manifest.json').write_bytes(raw)
         active=runtime.active(self.a);active['manifest_sha256']=runtime.digest(raw)
