@@ -111,6 +111,7 @@ def inspect_session(session_id, execution_id, workspace=None):
             if declines:
                 result["status"] = "failed"
                 result["error"] = "native_permission_declined"
+                result["native_permission_declined"] = True
             elif turn.get("status") == "completed":
                 result["status"] = "completed"
                 result["message"] = finals[0].get("text", "") if len(finals) == 1 else ""
@@ -220,6 +221,9 @@ def execute(prompt, workspace, session_id=None, timeout=180, on_session=None, on
                         if isinstance(item, dict) and item.get("type") in ("command_execution", "file_change") and item.get("status") == "declined":
                             failed = True
                             result["error"] = "native_permission_declined"
+                            # Later terminal/transport errors describe another
+                            # fact; they cannot erase this observed refusal.
+                            result["native_permission_declined"] = True
                         elif isinstance(item, dict) and item.get("type") == "agent_message":
                             message = item.get("text")
                             if not isinstance(message, str) or len(message.encode()) > 32768:

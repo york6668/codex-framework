@@ -767,7 +767,7 @@ def execution_update(store, expected, execution_id, operation):
 @io_call
 def finish(store, expected, execution_id, worker):
     require(isinstance(worker, dict) and worker.get("status") in ("completed", "failed", "unknown"), "invalid worker outcome")
-    observation = {k: worker.get(k) for k in ("status", "session_id", "native_turn_id", "native_turn_sha256", "native_error", "tool_failures", "pid", "started_at", "ended_at", "exit", "usage", "events_sha256", "message_sha256", "error", "prompt_sent")}
+    observation = {k: worker.get(k) for k in ("status", "session_id", "native_turn_id", "native_turn_sha256", "native_error", "native_permission_declined", "tool_failures", "pid", "started_at", "ended_at", "exit", "usage", "events_sha256", "message_sha256", "error", "prompt_sent")}
     observation["execution_id"] = execution_id
     def identify(value):
         execution = value.get("execution")
@@ -799,7 +799,8 @@ def finish(store, expected, execution_id, worker):
         constraints = enforce_constraints(value, "result_commit", execution["step"], checked.get("scope_after") if checked else None)[execution["step"]]
         # Invalid/failed/unknown transport is not a safe automatic retry.
         if worker.get("status") != "completed":
-            declined = worker.get("error") == "native_permission_declined"
+            declined = (worker.get("error") == "native_permission_declined"
+                        or worker.get("native_permission_declined") is True)
             coordinator_stop = worker.get("error") in ("coordinator_pre_prompt_blocked", "coordinator_scope_changed_after_prompt")
             if not coordinator_stop:
                 step.update(state="reconcile" if worker.get("status") == "unknown" and not declined else "blocked",
