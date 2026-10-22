@@ -67,7 +67,9 @@ GitHub 项目是内容来源，Codex 云端执行环境是可选运行位置。�
 
 ## 启动 Hook
 
-界面上的新建、恢复或清空动作，与 `SessionStart` 的 `source` 分别核对。桌面 `/new` 进入空白聊天后，若原生记录为 `startup`，只据此证明该空白聊天入口，不能改记为 `clear`；把 `/new` 当普通文字发到原聊天也不证明发生了生命周期事件。CLI、桌面及其他宿主的记录不互相代签，具体事件以当前宿主的原生记录和 [Hook 合同](https://learn.chatgpt.com/docs/hooks#sessionstart) 为准。
+安排生命周期现场验收前，先核对目标宿主的实际版本、官方入口说明及正常可用入口；[Hook 合同](https://learn.chatgpt.com/docs/hooks#sessionstart) 的 `source` 枚举和框架 matcher 不能证明每个宿主都提供对应操作。已核实当前版本没有入口时，明确该版本的支持边界，对应自动注入、版本核对及规则采用保留未运行；仅缺少入口证据时保留未知，不据此断言不支持，也不反复要求用户操作语义不同的入口。
+
+界面上的新建、恢复或清空动作，与 `SessionStart` 的 `source` 分别核对。桌面 `/new` 进入空白聊天后，若原生记录为 `startup`，只据此证明该空白聊天入口，不能改记为 `clear`；把 `/new` 当普通文字发到原聊天也不证明发生了生命周期事件。清空输入框、终端显示或未读标记均不等于清空会话。CLI、桌面及其他宿主的记录不互相代签；有正常入口时，以同一原生回合的实际事件、注入内容及模型使用验收，不能用私有协议调用或构造事件代替。
 
 `install-hook --native-cli <已核对的 Codex 可执行文件绝对路径>` 在实际 Codex home 的 `hooks.json` 合并一个 `SessionStart` handler，匹配 `startup|resume|clear`，保留其他 Hook。CLI 路径保存在该节点 `framework-sync/native-client.json`，不进入 Git。先从当前宿主正常 CLI 及其 `app-server` 协议核实工具直调、临时上下文和退出行为；不能假定其他宿主或版本也支持。未配置入口时只返回本地核对及发布 UNKNOWN，不声称启动同步已完成。
 
