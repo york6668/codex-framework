@@ -225,6 +225,8 @@ python3 -m unittest discover -s tests -v
 
 已安装的 `SessionStart` Hook 还可在本地任务启动或恢复时读取节点来源清单，注入简短异常或未知摘要；摘要缺席时只读运行 `codex-framework workstation-entry` 直读固定清单，不递归扫描工作站。该入口限制来源目录、文件数量和合计字节，旧记录可报告故障却不能证明健康。它不会在任务空闲时唤醒模型；正常启动的自动注入须单独验收。
 
+已有 mi-local 数据节点可采用 [节点观察适配器](adapters/mi-local/README.md)，将正常资源操作与真实协议探测接到上述固定入口。适配器源码和持续回归由本仓持有，连接配置及观察结果留在节点；按节点实际需要部署，不加入核心 CLI 的强制依赖。清单或采集缺失在所属工作站维护范围内修复、实际复测，不能只登记未知后停止推进。
+
 ## 有限结果的实际返回核对
 
 对于已经发生返回对象错配的原合并/收件路径，`scripts/return_receipt.py` 的 `produce(expected, committed_readback, bindings, payload=payload)` 可在原成功合并后的同一次读回操作中生成完整有限回执；它不修改总表或发送消息。`expected` 固定当前原生委托与逐对象报告、结论、限制和下一步，`bindings` 核对原有总表中的确切回执与下一步投影及报告指纹。原报告各自的身份保持分开。
