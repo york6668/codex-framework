@@ -1,4 +1,7 @@
 import json
+import io
+import os
+from contextlib import redirect_stdout
 from pathlib import Path
 import sys
 import tempfile
@@ -80,6 +83,28 @@ class ObservationTests(unittest.TestCase):
         with patch.object(observation, 'main', return_value=0) as publish:
             self.assertEqual(observation.run_action('observe', [], lambda *_: self.fail('unexpected dispatch')), 0)
             publish.assert_called_once_with()
+
+    def test_identity_failure_withdraws_previous_healthy_claim(self):
+        with tempfile.TemporaryDirectory() as folder:
+            source = Path(folder) / 'workstation/mi-local/observation.json'
+            observation.atomic_json(source, {'status': 'HEALTHY'})
+            with patch.dict(os.environ, {'CODEX_HOME': folder}), \
+                    patch.object(observation.subprocess, 'check_output', side_effect=OSError), \
+                    redirect_stdout(io.StringIO()):
+                self.assertEqual(observation.main(), 2)
+            self.assertEqual(json.loads(source.read_text())['status'], 'OBSERVING')
+            self.assertEqual(json.loads(source.with_name('previous-observation.json').read_text())['status'], 'HEALTHY')
+
+    def test_first_write_failure_cannot_leave_old_claim_active(self):
+        with tempfile.TemporaryDirectory() as folder:
+            source = Path(folder) / 'workstation/mi-local/observation.json'
+            observation.atomic_json(source, {'status': 'HEALTHY'})
+            with patch.dict(os.environ, {'CODEX_HOME': folder}), \
+                    patch.object(observation, 'atomic_json', side_effect=PermissionError), \
+                    redirect_stdout(io.StringIO()):
+                self.assertEqual(observation.main(), 2)
+            self.assertFalse(source.exists())
+            self.assertEqual(json.loads(source.with_name('previous-observation.json').read_text())['status'], 'HEALTHY')
 
 
 if __name__ == '__main__':
