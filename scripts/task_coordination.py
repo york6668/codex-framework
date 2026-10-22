@@ -21,7 +21,7 @@ import task_results
 import delivery_relations
 
 ROOT=ContextVar('task_coordination_root',default=None)
-LOCKED=ContextVar('task_effect_index_locked',default=False)
+LOCKED=ContextVar('task_effect_index_locked',default=None)
 WORKSET=ContextVar('task_coordination_workset',default=())
 ROLES={'implementation','investigation','verification','integration','final_regression','coordination'}
 MODES={'read','write','exclusive'}
@@ -266,7 +266,12 @@ def read_index(root):
 
 @contextmanager
 def index_lock(root):
-    root=Path(root);root.mkdir(parents=True,exist_ok=True)
+    root=Path(root).absolute()
+    if LOCKED.get()==root:
+        yield
+        return
+    need(LOCKED.get() is None,'cannot nest effect locks for different stores')
+    root.mkdir(parents=True,exist_ok=True)
     fd=os.open(task().cf.safe_path(root,'.effects.lock'),os.O_CREAT|os.O_RDWR|getattr(os,'O_NOFOLLOW',0),0o600)
     token=None
     try:
@@ -277,10 +282,36 @@ def index_lock(root):
             except BlockingIOError:
                 need(time.monotonic()<until,'effect reservation update is busy; keep its original owner')
                 time.sleep(.01)
-        token=LOCKED.set(True);yield
+        token=LOCKED.set(root);yield
     finally:
         if token is not None:LOCKED.reset(token)
         os.close(fd)
+
+def continuation_resources(value,key,checkpoint):
+    """Project this original attempt across its retained input revisions.
+
+    An amendment changes the next work, not an unresolved original footprint.
+    Existing superseded inputs carry those facts without a second state file.
+    The same union is used when original terminal evidence retires the claim.
+    """
+    inputs=[value]
+    for entry in value.get('history',[]):
+        prior=entry.get('superseded_input') if isinstance(entry,dict) else None
+        if not isinstance(prior,dict):continue
+        states=prior.get('steps',{})
+        need(isinstance(states,dict),'original continuation input steps unavailable; keep its original owner')
+        state=states.get(key,{})
+        need(isinstance(state,dict),'original continuation input step unavailable; keep its original owner')
+        original=state.get('continuation')
+        need(original is None or isinstance(original,dict),'original continuation input mapping unavailable; keep its original owner')
+        if original and original.get('origin')==checkpoint['origin']:inputs.append(prior)
+    effects={}
+    for original in inputs:
+        spec=original['spec'] if original is value else task().specification(original.get('spec'),filesystem=False)
+        step=next((s for s in spec['steps'] if s['id']==key),None)
+        need(step is not None,'original continuation resource scope missing; keep its original owner')
+        for effect in resources({'spec':spec},step):effects.setdefault(task().encoded(effect),effect)
+    return list(effects.values())
 
 def own_entries(value):
     result=[];specs={s['id']:s for s in value['spec']['steps']};execution=value.get('execution')
@@ -306,19 +337,67 @@ def own_entries(value):
     for name,state in value['steps'].items():
         cp=state.get('continuation')
         if cp and not cp['resolved']:
-            result.append({'task_id':value['task_id'],'execution_id':cp['origin']['attempt_id'],'state':'uncertain','resources':resources(value,specs[name]),'source_ref':'retained original continuation'})
+            result.append({'task_id':value['task_id'],'execution_id':cp['origin']['attempt_id'],'state':'uncertain','resources':continuation_resources(value,name,cp),'source_ref':'retained original continuation'})
     return [x for x in result if x['resources']]
 
-def sync_index(store,value):
+def resolved_executions(value):
+    """Only original durable terminal evidence can retire a stale claim."""
+    resolved={};specs={s['id']:s for s in value['spec']['steps']}
+    def remember(identity,key,scope=None,read_only=False):
+        if key not in specs:return
+        effects=resources(value,specs[key],scope)
+        if read_only:effects=[dict(e,mode='read',operation='read') for e in effects]
+        resolved.setdefault(identity,[]).extend(effects)
+    for key,state in value['steps'].items():
+        checkpoint=state.get('continuation')
+        if checkpoint and checkpoint['resolved']:
+            resolved.setdefault(checkpoint['origin']['attempt_id'],[]).extend(continuation_resources(value,key,checkpoint))
+    for entry in value['history']:
+        execution=entry.get('execution') or entry.get('reconciled_execution') or entry.get('external_observation')
+        if not execution:continue
+        checked=entry.get('validation') or {}
+        worker=entry.get('worker_observation') or {}
+        if checked.get('passed') is True or worker.get('prompt_sent') is False:
+            remember(execution['id'],execution['step'],execution.get('dispatch_scope'),
+                     execution.get('producer_kind')=='external_observation')
+    return resolved
+
+def prepare_index(store,value,previous_value=None):
+    need(LOCKED.get()==store.root.absolute(),'effect preparation requires its store lock')
     own=own_entries(value)
     if not own and not index_path(store.root).exists():return
-    def write():
-        entries=[e for e in read_index(store.root) if e['task_id']!=value['task_id']]+own
-        need(len(entries)<=256,'effect reservation capacity reached; resolve originals, do not evict')
-        task().cf.write_file(index_path(store.root),task().encoded({'version':1,'entries':entries}))
-    if LOCKED.get():write()
-    else:
-        with index_lock(store.root):write()
+    previous=read_index(store.root)
+    own_hashes={task().digest(task().encoded(e)) for e in own}
+    represented=own+(own_entries(previous_value) if previous_value is not None else [])
+    current_ids={e['execution_id'] for e in represented}
+    resolved=resolved_executions(value)
+    for entry in previous:
+        if entry['task_id']!=value['task_id']:continue
+        if entry['state']=='denial':
+            # Missing task-side history never revokes an indexed refusal.
+            fingerprint=task().digest(task().encoded(entry))
+            if fingerprint not in own_hashes:
+                own.append(entry);own_hashes.add(fingerprint)
+        else:
+            need(entry['execution_id'] in current_ids or entry['execution_id'] in resolved,
+                 'unmatched original effect remains unresolved; keep its original owner')
+            known={task().encoded(r) for e in represented if e['execution_id']==entry['execution_id'] for r in e['resources']}
+            known.update(task().encoded(r) for r in resolved.get(entry['execution_id'],[]))
+            need(all(task().encoded(r) in known for r in entry['resources']),
+                 'unmatched original effect resources remain unresolved; keep their original owner')
+    entries=[e for e in previous if e['task_id']!=value['task_id']]+own
+    need(len(entries)<=256,'effect reservation capacity reached; resolve originals, do not evict')
+    raw=task().encoded({'version':1,'entries':entries})
+    need(len(raw)<=1048576,'effect reservation index size bound')
+    return raw
+
+def write_index(store,raw):
+    need(LOCKED.get()==store.root.absolute(),'effect write requires its store lock')
+    if raw is not None:task().cf.write_file(index_path(store.root),raw)
+
+def sync_index(store,value):
+    with index_lock(store.root):
+        write_index(store,prepare_index(store,value))
 
 def effect_projection(value,effects):
     """Project the proposed controller entrance, not a hypothetical producer.
@@ -728,7 +807,8 @@ def workset(codex_home,request):
                         received.append({'task_id':identity,'operation':operation_name,'revision':current['revision'],
                                          'state':'duplicate_reused' if before['revision']==current['revision'] else 'consumed'})
                 except (task().TaskError,OSError,ValueError) as exc:
-                    failed_intakes.add(identity);intake_errors.append({'task_id':identity,'detail':str(exc)})
+                    failed_intakes.add(identity);intake_errors.append({'task_id':identity,'detail':str(exc),
+                        **({'commit':exc.commit_report} if isinstance(exc,task().TaskCommitError) else {})})
                 refresh()
             cursor=0
             for _ in range(maximum):
@@ -747,7 +827,8 @@ def workset(codex_home,request):
                         task().observe_external(store,values[selected]['revision'],observation)
                     else:task().run(store,values[selected]['revision'],1)
                     executed.append({'task_id':selected,'result':'returned'})
-                except (task().TaskError,OSError,ValueError) as exc:executed.append({'task_id':selected,'result':'scoped_error','detail':str(exc)})
+                except (task().TaskError,OSError,ValueError) as exc:executed.append({'task_id':selected,'result':'scoped_error','detail':str(exc),
+                    **({'commit':exc.commit_report} if isinstance(exc,task().TaskCommitError) else {})})
                 refresh()
         projected={identity:task().view(value) for identity,value in values.items()}
         # Read only explicitly declared missing members, never enumerate tasks.

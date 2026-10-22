@@ -44,6 +44,13 @@ class RevisionConflict(TaskError):
     pass
 
 
+class TaskCommitError(TaskError):
+    """The record/index write boundary was crossed; do not replay the action."""
+    def __init__(self, report):
+        super().__init__(report['reason'])
+        self.commit_report = report
+
+
 class IOBudgetError(TaskError):
     def __init__(self, reason, report):
         super().__init__(reason)
@@ -440,12 +447,34 @@ class Store:
         coordination.validate_result_state(value)
         return value
 
-    def save(self, value):
+    def record_bytes(self, value):
         value.pop("record_sha256", None)
         value["record_sha256"] = digest(encoded(value))
         raw = encoded(value)
         require(len(raw) <= LIMIT, "task record size limit; preserve evidence references rather than raw history")
-        cf.write_file(self.path, raw)
+        return raw
+
+    def save(self, value):
+        cf.write_file(self.path, self.record_bytes(value))
+
+    def commit_failure(self, expected, before_sha256, value, phase, exc):
+        report = {"status": "task_partial_commit", "task_id": value["task_id"],
+                  "expected_revision": expected, "attempted_revision": value["revision"],
+                  "committed_revision": None, "task_commit_state": "unknown",
+                  "index_sync_pending": True, "phase": phase,
+                  "reason": str(exc), "error_type": type(exc).__name__,
+                  "next_action": "read_original_task_before_any_retry; sync-effects only from current durable evidence"}
+        try:
+            observed = self.read()
+            report["observed_revision"] = observed["revision"]
+            if observed["record_sha256"] == value["record_sha256"]:
+                report.update(task_commit_state="committed", committed_revision=observed["revision"],
+                              committed_record_sha256=observed["record_sha256"])
+            elif observed["revision"] == expected and observed["record_sha256"] == before_sha256:
+                report["task_commit_state"] = "not_committed"
+        except (TaskError, cf.SyncError, OSError, ValueError, TypeError) as observation_error:
+            report["record_observation_error"] = str(observation_error)
+        return TaskCommitError(report)
 
     def create(self, task_id, spec):
         spec = specification(spec)
@@ -469,22 +498,51 @@ class Store:
             value = self.read()
             if value["revision"] != expected:
                 raise RevisionConflict("task revision conflict; reread before changing it")
-            def apply():
+            before_sha256 = value["record_sha256"]
+            previous_value = copy.deepcopy(value)
+            # Every writer takes task -> effects, never a peer task lock.
+            # Conflict decisions and both writes share this effects snapshot.
+            with coordination.index_lock(self.root):
                 if operation(value) is NO_CHANGE:
                     return value
                 value["revision"] += 1
+                self.record_bytes(value)
+                prepared = coordination.prepare_index(self, value, previous_value)
                 # Publish a conservative claim before the task record: a crash
                 # cannot leave a live producer invisible to another task.
-                if reservation:
-                    coordination.sync_index(self, value)
-                self.save(value)
-                if not reservation:
-                    coordination.sync_index(self, value)
+                phase = "reservation_index_write" if reservation else "task_record_write"
+                try:
+                    if reservation:
+                        coordination.write_index(self, prepared)
+                    phase = "task_record_write"
+                    self.save(value)
+                    if not reservation:
+                        phase = "effect_index_write"
+                        coordination.write_index(self, prepared)
+                except Exception as exc:
+                    failure = self.commit_failure(expected, before_sha256, value, phase, exc)
+                    if reservation or failure.commit_report["task_commit_state"] != "not_committed":
+                        raise failure from exc
+                    raise
                 return value
-            if reservation:
-                with coordination.index_lock(self.root):
-                    return apply()
-            return apply()
+
+    def sync_effects(self, expected):
+        """Explicit CAS recovery, without rerunning a task operation or validator."""
+        require(type(expected) is int, "expected_revision is required")
+        with self.locked():
+            value = self.read()
+            if value["revision"] != expected:
+                raise RevisionConflict("task revision conflict; reread before changing it")
+            with coordination.index_lock(self.root):
+                prepared = coordination.prepare_index(self, value)
+                try:
+                    coordination.write_index(self, prepared)
+                except Exception as exc:
+                    raise self.commit_failure(expected, value["record_sha256"], value,
+                                              "effect_index_recovery", exc) from exc
+            return {"status": "effects_synchronized", "task_id": value["task_id"],
+                    "committed_revision": value["revision"], "record_sha256": value["record_sha256"],
+                    "index_sync_pending": False, "task_record_changed": False}
 
 
 def partition(value, observations=None, selected=None):
@@ -900,11 +958,16 @@ def run_once(store, expected):
                      model=value["spec"].get("native_model"), reasoning_effort=value["spec"].get("native_reasoning_effort"))
     try:
         return finish(store, revision, execution["id"], result)
-    except TaskError:
+    except TaskError as exc:
         # Preserve the late observation without changing any current task state.
         observation = {"execution": execution, "worker": {k: v for k, v in result.items() if k != "message"},
-                       "state": "unapplied_current_revision_conflict"}
-        cf.write_file(cf.safe_path(store.root, execution["id"] + ".observation.json"), encoded(observation))
+                       "state": "partial_task_commit" if isinstance(exc, TaskCommitError) else "unapplied_current_revision_conflict"}
+        if isinstance(exc, TaskCommitError):observation["commit"] = exc.commit_report
+        try:
+            cf.write_file(cf.safe_path(store.root, execution["id"] + ".observation.json"), encoded(observation))
+        except Exception as observation_error:
+            if not isinstance(exc, TaskCommitError):raise
+            exc.commit_report["late_observation_error"] = str(observation_error)
         raise
 
 
@@ -1294,6 +1357,9 @@ def dispatch(codex_home):
             value = store.create(task_id, request.get("spec"))
         elif operation == "status":
             value = store.read()
+        elif operation == "sync-effects":
+            print(json.dumps(store.sync_effects(request.get("expected_revision")), ensure_ascii=False, indent=2))
+            return 0
         elif operation == "run":
             value = run(store, request.get("expected_revision"), request.get("max_turns", 3))
         elif operation == "resume":
@@ -1318,6 +1384,9 @@ def dispatch(codex_home):
         with coordination.context(store.root):
             print(json.dumps(view(value), ensure_ascii=False, indent=2))
         return 2 if operation in ("run", "resume", "verify-effects") and not value["accepted"] else 0
+    except TaskCommitError as exc:
+        print(json.dumps(exc.commit_report, ensure_ascii=False))
+        return 1
     except (TaskError, cf.SyncError, OSError, ValueError, TypeError) as exc:
         print(json.dumps({"status": "task_error", "reason": str(exc)}, ensure_ascii=False))
         return 1
