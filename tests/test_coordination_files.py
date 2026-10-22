@@ -62,7 +62,7 @@ def view_request():
             "progress": [event(1, "goal_verification_pass", result="PASS", covers=["usable"], result_binding=binding),
                          event(2, "delivery_accepted", actor="demo:owner", decision_ref="demo:decision",
                                effect_event_ids=["E1"], closes=["usable"]),
-                         event(3, "successor_executed", related_event_id="E2", result="recorded_and_read_back")]}
+                         event(3, "successor_executed", related_event_id="E2", consumed_event_ids=["E1", "E2"], result="recorded_and_read_back")]}
 
 
 class CoordinationFileTests(unittest.TestCase):
@@ -284,6 +284,39 @@ class CoordinationFileTests(unittest.TestCase):
         self.assertFalse(self.row(request)["scope_accepted_in_supplied_records"])
         request = view_request(); request["progress"].pop()
         self.assertTrue(self.row(request)["next_action_review_needed"])
+
+    def test_foreign_goals_extension_remains_protected_for_existing_snapshot_kinds(self):
+        for kind, initial in (("agreements", agreement_document()), ("tasks", task_document())):
+            with self.subTest(kind=kind):
+                path = self.root / (kind + '.json')
+                initial['goals'] = {'private_extension': ['original-field']}
+                path.write_bytes(files.encoded(initial))
+                before = path.read_bytes()
+                for edit in ('delete', 'replace'):
+                    incoming = copy.deepcopy(initial); incoming.update(revision=2, change_id=edit)
+                    if edit == 'delete': incoming.pop('goals')
+                    else: incoming['goals'] = {'private_extension': ['replacement']}
+                    request = self.request(kind, expected_revision=1, change_id=edit, document=incoming)
+                    self.assertEqual(files.handle(request)['status'], 'invalid_record')
+                    self.assertEqual(path.read_bytes(), before)
+
+    def test_delayed_old_settlement_needs_explicit_actual_consumption_frontier(self):
+        for kind in ('successor_executed', 'legal_stop_recorded'):
+            request = view_request(); request['as_of'] = '2030-01-01T11:00:00Z'
+            request['progress'].pop()
+            request['progress'].append(event(3, 'diagnostic_returned', observed_at='2030-01-01T10:00:00Z'))
+            old = event(4, kind, related_event_id='E2', reason='Old wait only',
+                        consumed_event_ids=['E1','E2'], observed_at='2030-01-01T09:02:00Z')
+            request['progress'].append(old)
+            self.assertTrue(self.row(request)['next_action_review_needed'])
+            request['progress'][-1].pop('consumed_event_ids')
+            self.assertTrue(self.row(request)['next_action_review_needed'])
+            request['progress'].append(event(5, 'legal_stop_recorded', reason='New evidence actually reviewed',
+                consumed_event_ids=['E1','E2','E3','E4'], observed_at='2030-01-01T10:01:00Z'))
+            self.assertFalse(self.row(request)['next_action_review_needed'])
+            # A fresh wall clock without a causal frontier proves no review.
+            request['progress'][-1].pop('consumed_event_ids')
+            self.assertTrue(self.row(request)['next_action_review_needed'])
 
     def test_reread_does_not_refresh_source_future_or_incomplete_history_cannot_close(self):
         request = view_request(); request["progress"] = [event(1, "execution_started")]

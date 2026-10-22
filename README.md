@@ -52,6 +52,8 @@ Mac mini 上的全局文档和 Skills 是部署副本，供 Codex 加载使用�
 
 ## 助手协调与持久文件
 
+反复修复、复发和原因未明的问题使用[逐问题持续处置](.agents/skills/york-task-alignment/references/issue-continuity.md)，将根治目标与有限阶段分开。缺承载时通过现有 `coordination` 的 `kind=goals` 持久化，`operation=goal-review` 消费模型对真实证据的判断并投影下一行动/有据等待；它复用核心来源校验和任务编排，不执行动作、不另建调度。即时助手与原小时兜底共读原记录、核在途及结果、按边界推进；用户停止优先。源码与合成测试不证明自然采用或跨轮根治。
+
 助手侧的共识整理、任务追踪和进度核收使用 [助手协调方法](.agents/skills/york-task-alignment/references/assistant-coordination.md)，数据权威仍在用户资源和原系统工作站。`coordination` 是 0.2.0 源码新增的显式文件适配能力；[契约与模板](.agents/skills/york-task-alignment/references/coordination-file-contract.md) 说明 `read/view/commit`、CAS、完整事件追加及部分回写恢复。它在创建旧 Task Store 前分流，不登记全部会话，不联网、发送、执行或改变调度。源码声明与候选、已发布版本、节点加载及实际采用分别取证，离线通过不表示平台强制采用。
 
 ## 只读展开已有义务引用
@@ -175,6 +177,10 @@ task 的 delivery-view 是可选纯读视图，在构造 Store 前返回给定�
 每项交付的 `reported_observations` 保留已绑定原报告全文与来源，包括历史或未选中的用例，避免摘要丢掉原限定；`next_actions` 只指出已声明阶段的具体证据缺口，不提供执行、重试或解除拒绝许可。未采用本视图的原任务同样保留这些事实，不增加必经转换。
 
 此入口只核当前显式关系及原报告字节，不自动读取文件或证明实际部署。source、build、install、load、adoption 的实际证据来自各原入口，当前加载版本的组合仍走适用独验。输出没有执行权限或后台运行保证，不可用它解除原拒绝、UNKNOWN 或真实必要依赖。
+
+### 普通等待与明确停止
+
+原 `task block` 现在要求 `reason_kind=dependency|capability|business_failure|user_stop`，防止普通等待固化为拒绝；普通条件还带稳定 condition_id，保存到原任务的可选 conditions，不进入共享拒绝索引。原责任核实际满足后用 `resolve-condition` 提交准确当前输入/条件/对象/owner及源观察绑定的报告，原 CAS 下只解除该普通条件并刷新后继；其它条件、停止、拒绝和 UNKNOWN 不受它清除。旧未分类 external_condition 保守保留，缺分类的新请求拒写。具体字段、部分提交恢复及兼容见[条件方法](.agents/skills/york-task-alignment/references/task-conditions.md)。
 
 ### 项目职责和多任务接续
 

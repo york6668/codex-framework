@@ -164,7 +164,7 @@ class ResultInboxTests(fixtures.FixtureCase):
     def test_real_scoped_wait_remains_wait_without_erasing_original_goal(self):
         store, _ = self.create()
         for step in ('a', 'independent'):
-            self.change(store, 'block', step=step, condition='actual external condition for this fixture step', evidence_ref='fixture:original-condition')
+            self.change(store, 'block', step=step, reason_kind='dependency', condition_id='wait-'+step, condition='actual external condition for this fixture step', evidence_ref='fixture:original-condition')
         out = coord.workset(self.a.codex_home, {'operation':'coordinate', 'task_ids':['current']})
         self.assertFalse(out['continuation']['must_continue']); self.assertTrue(out['continuation']['may_wait'])
         self.assertEqual(len(out['continuation']['scoped_waits']), 2)

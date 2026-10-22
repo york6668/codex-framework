@@ -348,7 +348,7 @@ class TaskRuntimeTests(fixtures.FixtureCase):
         steps = [{"id": n, "instruction": "Return 42", "depends_on": ["a"] if n == "b" else [],
                   "checks": [{"kind": "message", "equals": "42"}]} for n in "abc"]
         store, value = self.create(self.spec(steps))
-        value = self.mutate(store, "block", step="a", condition="known input unavailable", evidence_ref="native-item-input-gap")
+        value = self.mutate(store, "block", step="a", reason_kind="dependency", condition_id="input-gap", condition="known input unavailable", evidence_ref="native-item-input-gap")
         self.assertEqual(task.partition(value)["ready"], ["c"])
         with mock.patch("task_worker.execute", return_value=self.worker()) as worker:
             value = task.run(store, value["revision"])
@@ -391,7 +391,7 @@ class TaskRuntimeTests(fixtures.FixtureCase):
     def test_explicit_block_survives_late_success_and_restart(self):
         store, value = self.create()
         value, execution = task.reserve(store, value["revision"])
-        value = self.mutate(store, "block", step="a", condition="exact action cancelled", evidence_ref="original-cancellation-item")
+        value = self.mutate(store, "block", step="a", reason_kind="user_stop", condition="exact action cancelled", evidence_ref="original-cancellation-item")
         with self.assertRaises(task.TaskError):
             task.finish(store, value["revision"], execution["id"], self.worker())
         reopened = task.Store(self.a.codex_home, "fixture")
@@ -431,7 +431,7 @@ class TaskRuntimeTests(fixtures.FixtureCase):
         self.assertEqual(task.partition(value)["ready"], ["b"])
         with self.assertRaisesRegex(task.TaskError, "cannot revoke"):
             self.mutate(store, "reconcile", step="a", source_ref="actual-effect-exists")
-        value = self.mutate(store, "block", step="a", condition="exact cancellation", evidence_ref="original-cancellation")
+        value = self.mutate(store, "block", step="a", reason_kind="user_stop", condition="exact cancellation", evidence_ref="original-cancellation")
         with self.assertRaisesRegex(task.TaskError, "cannot revoke"):
             self.mutate(store, "reconcile", step="a", source_ref="actual-effect-exists")
         self.assertFalse(store.read()["accepted"])

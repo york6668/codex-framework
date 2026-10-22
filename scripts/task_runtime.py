@@ -4,6 +4,7 @@ Native worker completion is never acceptance. Updates use a per-task lock and
 revision compare-and-swap; no scheduler, credential manager or permission grant.
 """
 import copy
+import datetime as dt
 from contextlib import contextmanager
 import fcntl
 import functools
@@ -297,10 +298,111 @@ def same_restricted_scope(hold, step, scope):
     return hold["step"] == step["id"]
 
 
+CONDITION_KINDS = ("dependency", "capability", "business_failure")
+
+
+def matching_conditions(value, step, scope):
+    """A task-local condition is not an object refusal or a peer reservation."""
+    current_ids = set(value["steps"])
+    return [c for c in value.get("conditions", []) if c["state"] == "open"
+            and (c["step"] == step["id"] or c["step"] not in current_ids)
+            and same_restricted_scope(c["scope"], step, scope)]
+
+
+def restriction_kind(hold):
+    kind = hold.get("wait", {}).get("kind")
+    if kind in ("explicit_denial", "user_stop"):
+        return kind
+    return "legacy_unclassified_stop" if kind == "external_condition" else "retained_object_constraint"
+
+
+def validate_conditions(value):
+    conditions = value.get("conditions", [])
+    require(isinstance(conditions, list) and len(conditions) <= 64, "invalid condition history")
+    seen = set()
+    for condition in conditions:
+        require(isinstance(condition, dict) and isinstance(condition.get("id"), str)
+                and ID.fullmatch(condition["id"]) and condition["id"] not in seen, "invalid/duplicate condition identity")
+        seen.add(condition["id"])
+        require(condition.get("kind") in CONDITION_KINDS and condition.get("state") in ("open", "resolved")
+                and text(condition.get("condition")) and text(condition.get("evidence_ref"))
+                and isinstance(condition.get("scope"), dict) and isinstance(condition["scope"].get("files"), list)
+                and condition["scope"].get("step") == condition.get("step")
+                and text(condition.get("step")) and text(condition.get("request_id"))
+                and type(condition.get("input_revision")) is int and condition["input_revision"] > 0
+                and isinstance(condition.get("task_input_sha256"), str) and SHA.fullmatch(condition["task_input_sha256"])
+                and "owner_ref" in condition and (condition["owner_ref"] is None or text(condition["owner_ref"]))
+                and condition.get("prior_state") in ("pending", "running", "verified", "blocked", "reconcile"),
+                "invalid scoped condition record")
+        require(condition["state"] != "resolved" or isinstance(condition.get("resolution"), dict), "resolved condition needs retained source")
+
+
+def resolve_condition(value, request):
+    key = request.get("step")
+    require(key in value["steps"], "condition resolution needs an exact current step")
+    condition = next((c for c in value.get("conditions", []) if c["id"] == request.get("condition_id")), None)
+    require(condition is not None, "unknown ordinary condition; legacy stops/denials cannot be released here")
+    spec = next(s for s in value["spec"]["steps"] if s["id"] == key)
+    scope = file_scope(value["spec"], spec)
+    require(not scope["file_identity_errors"] and (condition["step"] == key or condition["step"] not in value["steps"])
+            and same_restricted_scope(condition["scope"], spec, scope),
+            "condition resolution does not match the original object")
+    report = coordination.read_json(value["spec"]["workspace"], request.get("path"), request.get("sha256"), value, unique=True)
+    original_hash = (condition.get("resolution") or {}).get("condition_sha256") or digest(encoded(condition))
+    expected = {"kind": "condition_satisfaction", "task_id": value["task_id"], "request_id": value["spec"]["request_id"],
+                "input_revision": value["input_revision"], "task_input_sha256": value["acceptance_sha256"],
+                "step_id": key, "condition_id": condition["id"], "condition_kind": condition["kind"],
+                "condition_sha256": original_hash, "owner_ref": condition["owner_ref"], "scope_sha256": digest(encoded(scope))}
+    require(all(k in report and type(report[k]) is type(v) and report[k] == v for k, v in expected.items()),
+            "condition report must bind the current task/input/owner/condition/object scope")
+    require(report.get("result") == "satisfied" and isinstance(report.get("evidence_refs"), list)
+            and report["evidence_refs"] and all(text(r) for r in report["evidence_refs"]),
+            "condition report needs the original owner's actual satisfaction evidence")
+    maximum = request.get("max_age_seconds")
+    require(type(maximum) is int and maximum >= 0 and text(report.get("observed_at")), "condition resolution needs an explicit source freshness budget")
+    observed = dt.datetime.fromisoformat(report["observed_at"].replace("Z", "+00:00"))
+    require(observed.utcoffset() is not None, "condition observation time must include timezone")
+    age = (dt.datetime.now(dt.timezone.utc) - observed).total_seconds()
+    require(0 <= age <= maximum, "condition satisfaction observation is stale or future")
+    reference = {"path": request["path"], "sha256": request["sha256"]}
+    if condition["state"] == "resolved":
+        require(condition["resolution"]["report"] == reference, "condition already resolved by a different original report")
+        return NO_CHANGE
+    require(digest(encoded(file_scope(value["spec"], spec))) == digest(encoded(scope)),
+            "condition object changed while its satisfaction source was read")
+    condition.update(state="resolved", resolution={"report": reference, "condition_sha256": original_hash,
+                     "input_revision": value["input_revision"], "task_input_sha256": value["acceptance_sha256"],
+                     "observed_at": report["observed_at"], "evidence_refs": copy.deepcopy(report["evidence_refs"])})
+    state = value["steps"][key]
+    if not matching_conditions(value, spec, scope):
+        if state.get("unresolved_execution") or (value.get("execution") and value["execution"]["step"] == key):
+            state.update(state="reconcile", wait={"kind": "original_effect_requires_readback", "condition_resolved": condition["id"]})
+        elif state.get("continuation") and not state["continuation"]["resolved"]:
+            state.update(state="blocked", wait={"kind": "original_continuation_requires_readback", "condition_resolved": condition["id"]})
+        elif not any(same_restricted_scope(h, spec, scope) for h in value.get("restrictions", [])):
+            # Resolve only the ordinary gate. Do not fabricate verification,
+            # reset model runs, clear a refusal, or replay a completed effect.
+            prior = next((c["prior_state"] for c in value["conditions"] if c["step"] == key and c["prior_state"] == "verified"), None)
+            checked = state.get("validation") or {}
+            if prior and checked.get("passed"):
+                if (checked.get("acceptance_sha256") == value["acceptance_sha256"] and
+                        digest(encoded(checked.get("scope_after"))) == digest(encoded(scope))):
+                    state.update(state="verified", wait=None)
+                else:
+                    state.update(state="blocked", wait={"kind": "verified_object_changed",
+                                 "next": "inspect_current_effect_before_new_validation; no_completed_effect_replay"})
+            else:
+                state.update(state="pending", wait=None)
+            state.pop("constraint_derived", None)
+    enforce_constraints(value, "condition_resolution")
+    return None
+
+
 def assessment(value, key, expected_scope=None, related=True, dependencies=True):
     spec = next(s for s in value["spec"]["steps"] if s["id"] == key)
     scope = file_scope(value["spec"], spec)
     matches = [h for h in value.get("restrictions", []) if same_restricted_scope(h, spec, scope)]
+    conditions = matching_conditions(value, spec, scope)
     reason = None
     if matches:
         reason = "current_object_restriction"
@@ -315,9 +417,13 @@ def assessment(value, key, expected_scope=None, related=True, dependencies=True)
     relationships = coordination.related(value, spec, dependencies=dependencies) if related and reason is None else []
     if reason is None and relationships:
         reason = "related_" + relationships[0]["kind"]
+    if reason is None and conditions:
+        reason = "current_condition_wait"
     return {"scope": scope, "reason": reason, "restriction_refs": [digest(encoded(h)) for h in matches],
+            "restriction_kinds": [restriction_kind(h) for h in matches],
             "source_waits": [h["wait"] for h in matches], "blocked": reason is not None,
-            "related_conditions": relationships}
+            "related_conditions": relationships, "condition_refs": [c["id"] for c in conditions],
+            "condition_kinds": [c["kind"] for c in conditions]}
 
 
 def enforce_constraints(value, phase, key=None, expected_scope=None):
@@ -344,6 +450,10 @@ def enforce_constraints(value, phase, key=None, expected_scope=None):
                         "phase": phase, "source_ref": source or prior_wait.get("source_ref"), "restriction_refs": observed["restriction_refs"],
                         "related_conditions": observed["related_conditions"],
                         "next": "inspect_original_constraint_and_actual_object; use verified isolation if stronger stability is required"})
+            if observed["reason"] == "current_condition_wait":
+                step["wait"] = {"kind": "condition_wait", "condition_refs": observed["condition_refs"],
+                                "condition_kinds": observed["condition_kinds"],
+                                "next": "original_owner_verifies_condition_then_resolve_condition; no_automatic_retry"}
             value["accepted"] = False
         execution = value.get("execution")
         if execution and execution["step"] == name:
@@ -435,7 +545,7 @@ class Store:
         require(isinstance(value, dict) and value.get("format") == 1 and type(value.get("revision")) is int, "invalid task state")
         require(value.get("record_sha256") == digest(encoded({k: v for k, v in value.items() if k != "record_sha256"})), "task record fingerprint mismatch")
         fields = {"format", "task_id", "revision", "input_revision", "spec", "acceptance_sha256", "steps", "execution", "native_session_id", "history", "review", "loaded", "delivery", "accepted", "record_sha256"}
-        require(fields <= set(value) <= fields | {"restrictions", "acceptance_observation", "result_state"} and isinstance(value.get("restrictions", []), list), "invalid task record fields")
+        require(fields <= set(value) <= fields | {"restrictions", "conditions", "acceptance_observation", "result_state"} and isinstance(value.get("restrictions", []), list), "invalid task record fields")
         require(value["revision"] >= 1 and type(value["input_revision"]) is int and value["input_revision"] >= 1 and type(value["accepted"]) is bool, "invalid task version or acceptance")
         spec = specification(value["spec"], filesystem=False)
         require(value["acceptance_sha256"] == digest(encoded(spec)), "acceptance specification mismatch")
@@ -444,6 +554,7 @@ class Store:
             require(isinstance(step, dict) and step.get("state") in ("pending", "running", "verified", "blocked", "reconcile") and type(step.get("runs")) is int and step["runs"] >= 0 and isinstance(step.get("evidence"), list), "invalid step state")
         require(value["execution"] is None or isinstance(value["execution"], dict), "invalid execution state")
         require(isinstance(value["history"], list) and len(value["history"]) <= 64 and isinstance(value["delivery"], dict), "invalid task history/delivery")
+        validate_conditions(value)
         coordination.validate_result_state(value)
         return value
 
@@ -553,7 +664,9 @@ def partition(value, observations=None, selected=None):
         key = spec["id"]
         step = value["steps"][key]
         if observations[key]["blocked"]:
-            row={"step": key, "condition": observations[key]["reason"], "restriction_refs": observations[key]["restriction_refs"]}
+            row={"step": key, "condition": observations[key]["reason"], "restriction_refs": observations[key]["restriction_refs"],
+                 "restriction_kinds": observations[key].get("restriction_kinds", []),
+                 "condition_refs": observations[key].get("condition_refs", []), "condition_kinds": observations[key].get("condition_kinds", [])}
             conditions=observations[key]['related_conditions']
             if (any(c['kind']=='local_dependency_evidence_required' for c in conditions)
                     and not any(c['kind'] in ('retained_refusal','occupied_effect') for c in conditions)):
@@ -1083,7 +1196,7 @@ def change(store, request):
                     holds[digest(encoded(hold))] = hold
                 wait = previous.get("wait") or {}
                 uncertain = previous["state"] in ("running", "reconcile") and (previous.get("unresolved_execution") or (old["execution"] and old["execution"]["step"] == prior["id"]))
-                if uncertain or (not previous.get("constraint_derived") and wait.get("kind") in ("explicit_denial", "external_condition")):
+                if uncertain or (not previous.get("constraint_derived") and wait.get("kind") in ("explicit_denial", "external_condition", "user_stop")):
                     hold = restriction(prior_spec, previous, prior, old["input_revision"],
                                        old["execution"] if old["execution"] and old["execution"]["step"] == prior["id"] else None)
                     if previous.get("constraint_derived") and uncertain:
@@ -1117,10 +1230,30 @@ def change(store, request):
         elif operation in ("collect-result", "review-result"):
             changed=coordination.collect_result(value,{"path":request.get("path"),"sha256":request.get("sha256")},review=operation=="review-result")
             if not changed:return NO_CHANGE
+        elif operation == "resolve-condition":
+            return resolve_condition(value, request)
         elif operation == "block":
             key = request.get("step")
             require(key in value["steps"] and text(request.get("condition")) and text(request.get("evidence_ref")), "block needs step, exact condition and evidence")
-            value["steps"][key].update(state="blocked", wait={"kind": "external_condition", "condition": request["condition"], "evidence_ref": request["evidence_ref"]})
+            reason = request.get("reason_kind")
+            require(reason in (*CONDITION_KINDS, "user_stop"),
+                    "block needs explicit reason_kind dependency/capability/business_failure/user_stop; unclassified legacy decisions are never inferred or downgraded")
+            if reason in CONDITION_KINDS:
+                identity = request.get("condition_id")
+                require(isinstance(identity, str) and ID.fullmatch(identity), "ordinary block needs a stable condition_id")
+                conditions = value.setdefault("conditions", [])
+                require(not any(c["id"] == identity for c in conditions), "condition_id already exists; read its actual state instead of replaying block")
+                require(len(conditions) < 64, "condition history limit; preserve original references")
+                spec = next(s for s in value["spec"]["steps"] if s["id"] == key)
+                conditions.append({"id": identity, "kind": reason, "state": "open", "step": key,
+                    "condition": request["condition"], "evidence_ref": request["evidence_ref"],
+                    "input_revision": value["input_revision"], "task_input_sha256": value["acceptance_sha256"],
+                    "request_id": value["spec"]["request_id"], "owner_ref": (value["spec"].get("assignment") or {}).get("owner"),
+                    "scope": {"step": key, **file_scope(value["spec"], spec)}, "prior_state": value["steps"][key]["state"]})
+                wait = {"kind": "condition_wait", "condition_refs": [identity], "condition_kinds": [reason]}
+            else:
+                wait = {"kind": "user_stop", "condition": request["condition"], "evidence_ref": request["evidence_ref"]}
+            value["steps"][key].update(state="blocked", wait=wait)
             value["accepted"] = False
             value["review"] = value["loaded"] = None
             # Preserve an already-dispatched outcome separately. Blocking can't
@@ -1129,7 +1262,10 @@ def change(store, request):
                 value["steps"][key]["unresolved_execution"] = value["execution"]
                 value["history"].append({"blocked_inflight": value["execution"], "condition": request["condition"], "evidence_ref": request["evidence_ref"]})
                 value["execution"] = None
-            remember_restriction(value, key)
+            if reason == "user_stop":
+                remember_restriction(value, key)
+            else:
+                enforce_constraints(value, "condition_registered", key)
         elif operation == "approval":
             key = request.get("step")
             require(key in value["steps"], "unknown approval step")
@@ -1164,7 +1300,7 @@ def change(store, request):
             require(key in value["steps"] and text(request.get("source_ref")), "reconciliation needs the exact step and observed effect source")
             step = value["steps"][key]
             require(step["state"] in ("reconcile", "running", "blocked"), "step has no unresolved effect or failure")
-            require((step.get("wait") or {}).get("kind") not in ("external_condition", "explicit_denial"),
+            require((step.get("wait") or {}).get("kind") not in ("external_condition", "explicit_denial", "user_stop"),
                     "effect readback cannot revoke an explicit block or denial; retain the original decision")
             observed = enforce_constraints(value, "reconcile", key)[key]
             require(not observed["blocked"], "effect readback cannot revoke current object constraint")
@@ -1364,7 +1500,7 @@ def dispatch(codex_home):
             value = run(store, request.get("expected_revision"), request.get("max_turns", 3))
         elif operation == "resume":
             value = resume(store, request.get("max_turns", 3))
-        elif operation in ("amend", "block", "approval", "delivery", "reconcile", "review", "accept", "checkpoint", "continue", "collect-result", "review-result"):
+        elif operation in ("amend", "block", "resolve-condition", "approval", "delivery", "reconcile", "review", "accept", "checkpoint", "continue", "collect-result", "review-result"):
             value = change(store, request)
         elif operation == "verify-effects":
             value = observe_external(store, request.get("expected_revision"), {"path": request.get("path"), "sha256": request.get("sha256")})

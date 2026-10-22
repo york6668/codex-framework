@@ -40,7 +40,7 @@ class ExternalCollectionPartitionTests(fixtures.FixtureCase):
         return store, {'path': 'return.json', 'sha256': task.digest(report)}
 
     def block(self, store):
-        return task.change(store, {'operation': 'block', 'expected_revision': store.read()['revision'], 'step': 'live',
+        return task.change(store, {'operation': 'block', 'expected_revision': store.read()['revision'], 'step': 'live', 'reason_kind': 'capability', 'condition_id': 'environment',
                                    'condition': 'Only this fixture environment is unavailable', 'evidence_ref': 'fixture:scoped-observation'})
 
     def collect(self, store, ref):

@@ -214,7 +214,7 @@ class ProjectRuntimeTests(fixtures.FixtureCase):
 
     def test_explicit_pause_stays_in_project_and_not_cleared_by_new_input(self):
         a,_=self.create('paused',project='core');b,_=self.create('continue',project='business')
-        self.change(a,'block',step='a',condition='User paused this project',evidence_ref='synthetic:direct-user-project-scope')
+        self.change(a,'block',step='a',reason_kind='user_stop',condition='User paused this project',evidence_ref='synthetic:direct-user-project-scope')
         current=a.read()['spec'];current['acceptance_version']='v2';value=self.change(a,'amend',spec=current)
         self.assertFalse(task.partition(value)['ready']);self.assertTrue(self.run_synthetic(b)['accepted'])
 

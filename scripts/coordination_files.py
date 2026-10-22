@@ -16,14 +16,15 @@ import stat
 import sys
 import uuid
 
-from source_evidence import _node_root, parse_statement, resource_scope_matches
+from source_evidence import (_node_root, _node_bytes, parse_statement, resource_scope_matches,
+                             source_body, verify as verify_source)
 
 FORMAT = 1
 MAX_BYTES = 1024 * 1024
 MAX_REQUEST_BYTES = 4 * MAX_BYTES
 MAX_ROWS = 256
 MAX_EVENTS = 4096
-KINDS = {"agreements", "tasks", "progress"}
+KINDS = {"agreements", "tasks", "progress", "goals"}
 REQUIREMENT_FIELDS = ("request_ref", "requirement_ref", "agreements", "scope", "acceptance", "write_scope")
 TASK_FIELDS = set(REQUIREMENT_FIELDS) | {
     "task_id", "input_revision", "plan_revision", "assignment", "execution", "native_binding",
@@ -134,6 +135,8 @@ def validate_snapshot(kind, document):
 
         for identity in seen:
             visit(identity)
+    elif kind == "goals":
+        validate_goals(rows)
     else:
         need(text(document.get("system_id")), "tasks need system_id")
         seen = set()
@@ -192,6 +195,8 @@ def validate_events(events):
                 timestamp(event[field])
         need(strings(event.get("evidence_refs")), "event needs evidence_refs")
         need("covers" not in event or strings(event["covers"], nonempty=True), "invalid criterion coverage")
+        need("consumed_event_ids" not in event or strings(event["consumed_event_ids"], nonempty=True),
+             "settlement frontier must explicitly name the consumed evidence events")
         if event["kind"] == "delivery_accepted":
             need(strings(event.get("effect_event_ids"), nonempty=True)
                  and strings(event.get("closes"), nonempty=True) and text(event.get("decision_ref")),
@@ -308,7 +313,8 @@ def preserve_extensions(previous, incoming, known):
 def preserve(kind, previous, incoming):
     """Reject silent loss of history; these checks do not approve the new intent."""
     need(previous["authority"] == incoming["authority"], "authority rebinding requires original owner migration")
-    known = {"format_version", "revision", "change_id", "authority", "agreements", "systems", "tasks", "system_id"}
+    known = {"format_version", "revision", "change_id", "authority"} | {
+        "agreements": {"agreements", "systems"}, "tasks": {"tasks", "system_id"}, "goals": {"goals"}}[kind]
     preserve_extensions(previous, incoming, known)
     if kind == "agreements":
         new = {key(row): row for row in incoming[kind]}
@@ -327,6 +333,18 @@ def preserve(kind, previous, incoming):
                 need(isinstance(change, dict) and change.get("from") == old["status"]
                      and change.get("to") == current["status"] and text(change.get("source_ref"))
                      and text(change.get("reason")), "invalid status change provenance")
+    elif kind == "goals":
+        new = {g["goal_id"]: g for g in incoming[kind]}
+        for old in previous[kind]:
+            need(old["goal_id"] in new, "concrete issue history cannot be removed")
+            current = new[old["goal_id"]]
+            appended = {"reviews", "phase_refs", "repairs", "relations"}
+            need({k: v for k, v in old.items() if k not in appended} ==
+                 {k: v for k, v in current.items() if k not in appended},
+                 "goal identity/criteria remain sourced; record a changed requirement as a linked goal")
+            for field in appended:
+                need(current.get(field, [])[:len(old.get(field, []))] == old.get(field, []),
+                     "goal history is append-only: " + field)
     else:
         need(previous["system_id"] == incoming["system_id"], "cannot change task system identity")
         new = {row["task_id"]: row for row in incoming[kind]}
@@ -433,6 +451,309 @@ def same_effect(event, task):
             and original.get("path", "") == current.get("path", ""))
 
 
+def goal_action(value):
+    """Canonical effect identity, independent of issue/path/task/sender labels."""
+    need(isinstance(value, dict) and set(value) == {"object_ref", "destination_ref", "effect"}
+         and all(text(v) for v in value.values()), "goal action needs exact object/destination/effect")
+    return tuple(value[k] for k in ("object_ref", "destination_ref", "effect"))
+
+
+def goal_rows(value, name):
+    need(isinstance(value, list) and len(value) <= MAX_ROWS
+         and all(isinstance(row, dict) and text(row.get("id")) for row in value)
+         and len({row["id"] for row in value}) == len(value), "invalid/duplicate goal " + name)
+    return value
+
+
+def structured_attempt_ref(value):
+    return (isinstance(value, dict) and set(value) == {"goal_id", "review_id", "attempt_id"}
+            and all(text(v) for v in value.values()))
+
+
+def validate_goal_review(goal, review):
+    need(isinstance(review, dict) and all(text(review.get(k)) for k in
+         ("id", "rationale", "reviewed_at")), "goal review needs model rationale and identity")
+    timestamp(review["reviewed_at"])
+    trigger = review.get("trigger")
+    need(isinstance(trigger, dict) and trigger.get("kind") in
+         ("return", "blocked", "resume", "natural_turn", "recurrence", "correction", "failure", "publication", "adoption")
+         and text(trigger.get("ref")),
+         "goal review needs an actual return/block/resume/natural turn/recurrence reference")
+    need(strings(review.get("basis_refs"), nonempty=True), "goal review needs versioned evidence references")
+    need(isinstance(review.get("evidence_context", {}), dict), "evidence context must use the existing source contract")
+    control = review.get("user_control")
+    if control is not None:
+        need(isinstance(control, dict) and control.get("kind") in ("user_stop", "user_resume")
+             and all(text(control.get(k)) for k in ("id", "source_ref")), "user control needs exact sourced stop/resume")
+        need(control["kind"] != "user_resume" or text(control.get("supersedes")),
+             "only explicit user resumption tied to the original stop can resume")
+    criteria = goal_rows(review.get("criteria"), "criterion assessments")
+    need({a["id"] for a in criteria} == {a["id"] for a in goal["criteria"]},
+         "review must assess this concrete issue's own criteria")
+    for item in criteria:
+        need(item.get("status") in ("met", "unmet", "unknown") and text(item.get("reason"))
+             and strings(item.get("evidence_refs")), "criterion assessment needs reason and evidence")
+        need(item["status"] != "met" or item["evidence_refs"], "met criterion needs actual evidence")
+    for question in goal_rows(review.get("causal_questions"), "causal questions"):
+        need(text(question.get("question")) and question.get("status") in ("open", "answered", "ruled_out")
+             and type(question.get("required_for_closure")) is bool and strings(question.get("evidence_refs")),
+             "causal question needs explicit uncertainty, applicability and evidence")
+        need(question["status"] == "open" or question["evidence_refs"], "resolved cause needs evidence")
+    for path in goal_rows(review.get("paths"), "evidence paths"):
+        goal_action(path.get("action"))
+        need("basis_refs" not in path or strings(path["basis_refs"], nonempty=True),
+             "path-specific evidence basis must name actual relevant source revisions")
+        need(text(path.get("purpose")) and strings(path.get("question_ids"))
+             and set(path["question_ids"]) <= {q["id"] for q in review["causal_questions"]},
+             "path must explain the uncertainty it can resolve")
+        for field, statuses in (("permission", ("allowed", "denied", "unknown")),
+                                ("capability", ("supported", "unavailable", "unknown"))):
+            basis = path.get(field)
+            need(isinstance(basis, dict) and basis.get("status") in statuses
+                 and strings(basis.get("evidence_refs"), nonempty=True), "path needs actual " + field + " basis")
+        need(isinstance(path.get("dependencies"), list), "path dependencies must be explicit")
+        for dep in path["dependencies"]:
+            need(isinstance(dep, dict) and text(dep.get("ref")) and text(dep.get("reason"))
+                 and dep.get("status") in ("satisfied", "missing", "unknown")
+                 and strings(dep.get("evidence_refs"), nonempty=True), "invalid actual path dependency")
+    for attempt in goal_rows(review.get("attempts"), "actual attempts"):
+        goal_action(attempt.get("action"))
+        need(attempt.get("result") in ("done", "failed", "denied", "unknown")
+             and strings(attempt.get("basis_refs"), nonempty=True)
+             and strings(attempt.get("evidence_refs"), nonempty=True), "actual attempt needs original result/evidence")
+    for reconciliation in goal_rows(review.get("reconciliations", []), "original-result reconciliations"):
+        goal_action(reconciliation.get("action"))
+        need((text(reconciliation.get("attempt_ref")) or structured_attempt_ref(reconciliation.get("attempt_ref")))
+             and reconciliation.get("result") in ("committed", "not_executed")
+             and strings(reconciliation.get("evidence_refs"), nonempty=True)
+             and isinstance(reconciliation.get("proof"), dict), "reconciliation needs proof of the exact original outcome")
+    decision = review.get("decision")
+    need(isinstance(decision, dict) and decision.get("kind") in ("act", "wait", "close")
+         and text(decision.get("owner_ref")) and text(decision.get("reason")), "model must choose action or evidenced wait/closure proposal")
+    if decision["kind"] == "act":
+        need(text(decision.get("path_id")), "action decision needs a concrete evidence path")
+    elif decision["kind"] == "wait":
+        conditions = decision.get("resume_when")
+        need(isinstance(conditions, list) and conditions and all(isinstance(c, dict)
+             and all(text(c.get(k)) for k in ("source_ref", "condition", "owner_ref")) for c in conditions),
+             "waiting needs an observable evidence change, source and responsible owner")
+    else:
+        need(text(decision.get("acceptance_ref")), "closure proposal needs original owner acceptance reference")
+
+
+def validate_goals(rows):
+    goal_rows([dict(g, id=g.get("goal_id")) if isinstance(g, dict) else g for g in rows], "concrete issues")
+    for goal in rows:
+        need(all(text(goal.get(k)) for k in ("goal_id", "source_ref", "statement", "owner_ref"))
+             and strings(goal.get("original_refs"), nonempty=True) and strings(goal.get("phase_refs")),
+             "goal must link the original requirement/objects and finite phases")
+        criteria = goal_rows(goal.get("criteria"), "closure criteria")
+        need(criteria and all(text(c.get("criterion_ref")) for c in criteria), "define closure per concrete issue")
+        for relation in goal.get("relations", []):
+            need(isinstance(relation, dict) and text(relation.get("issue_ref"))
+                 and relation.get("status") in ("hypothesis", "supported", "ruled_out")
+                 and text(relation.get("statement")) and strings(relation.get("evidence_refs")),
+                 "cross-issue relation must retain its evidence level")
+            need(relation["status"] == "hypothesis" or relation["evidence_refs"], "non-hypothetical relation needs evidence")
+        for repair in goal.get("repairs", []):
+            need(isinstance(repair, dict) and text(repair.get("repair_ref"))
+                 and all(strings(repair.get(k)) for k in
+                         ("version_refs", "node_refs", "verification_refs", "recurrence_refs", "impact_refs")),
+                 "repair history needs applicability, verification, recurrence and domain impact references")
+        reviews = goal_rows(goal.get("reviews"), "reviews")
+        for index, review in enumerate(reviews):
+            validate_goal_review(goal, review)
+            if index:
+                old_questions = {q["id"] for q in reviews[index - 1]["causal_questions"]}
+                need(old_questions <= {q["id"] for q in review["causal_questions"]},
+                     "unresolved causal questions cannot silently disappear at a phase boundary")
+
+
+def goal_dependency_supported(review, dependency):
+    """Reuse core source verification and exact resource scope, not a status label.
+
+    This is for a consumer that claims a returned result is ready. Read-only
+    discovery paths need no fabricated completed producer. Stable historical
+    evidence is reusable by the model; a new dependent dispatch needs a current
+    observation of that producer's applicable result and absence of in-flight work.
+    """
+    proof = dependency.get("proof", {})
+    if not isinstance(proof, dict):
+        return False
+    record, expected = proof.get("record"), proof.get("expected_scope")
+    if not isinstance(record, dict) or not isinstance(expected, dict):
+        return False
+    if not all(text(expected.get(k)) for k in ("kind", "id", "node_id", "product_version", "content_ref", "request_ref")):
+        return False
+    if not positive(expected.get("input_revision")) or not resource_scope_matches(record.get("resource"), expected):
+        return False
+    maximum = proof.get("max_age_seconds")
+    if type(maximum) is not int or not 0 <= maximum <= 86400:
+        return False
+    body = source_body(review.get("evidence_context", {}), record)
+    if body is None and record.get("source") == "node":
+        project = proof.get("project", {})
+        if not isinstance(project, dict) or not verify_source({}, project, record):
+            return False
+        try:
+            base = Path(project["root"])
+            with _node_root(base) as descriptor:
+                raw = _node_bytes(descriptor, Path(record["node_path"]).parts)
+            if raw is None or hashlib.sha256(raw).hexdigest() != record.get("digest"):
+                return False
+            body = raw.decode("utf-8")
+        except (OSError, ValueError, UnicodeError):
+            return False
+    if body is None:
+        return False
+    try:
+        actual = parse_statement(body)
+        if not (isinstance(actual, dict) and resource_scope_matches(actual.get("resource"), expected)
+                and actual.get("result") == record.get("result")
+                and actual["result"] in ("passed", "verified", "applied", "observed")
+                and actual.get("status") == "completed"):
+            return False
+        age = (timestamp(review["reviewed_at"]) - timestamp(actual.get("observed_at"))).total_seconds()
+        return 0 <= age <= maximum
+    except (FileError, ValueError, TypeError):
+        return False
+
+
+def goal_review(request):
+    """Build a bounded evidence packet for the model; never run a proposed action.
+
+    Stated permission, evidence authenticity, root cause and domain acceptance
+    remain model/owner judgments. No URI is followed. Only an explicitly bound
+    node-file dependency proof uses the existing core source reader.
+    """
+    document = validate_snapshot("goals", request.get("goals"))
+    goal = next((g for g in document["goals"] if g["goal_id"] == request.get("goal_id")), None)
+    need(goal is not None, "select an existing concrete issue; no implicit registration")
+    review = request.get("review")
+    if review is None:
+        state = "OPEN"
+        if goal["reviews"]:
+            state = goal_review(dict(request, review=goal["reviews"][-1]))["goal_state"]
+        return {"status": "goal_review", "goal_id": goal["goal_id"], "goal_state": state,
+                "model_review_needed": True, "original_refs": goal["original_refs"],
+                "criteria": goal["criteria"], "phase_refs": goal["phase_refs"],
+                "last_review": goal["reviews"][-1] if goal["reviews"] else None,
+                "meaning": "read current canonical evidence and judge this issue again at the actual trigger"}
+    validate_goal_review(goal, review)
+    if any(r["id"] == review["id"] for r in goal["reviews"]):
+        need(goal["reviews"][-1] == review, "review replay must match the exact latest record")
+    previous = [r for r in goal["reviews"] if r["id"] != review["id"]]
+    if previous:
+        need({q["id"] for q in previous[-1]["causal_questions"]} <= {q["id"] for q in review["causal_questions"]},
+             "carry prior causal questions into the current model judgment")
+    controls = [r["user_control"] for r in previous if r.get("user_control")]
+    stopped_by = None
+    control_issue = False
+    for control in controls + ([review["user_control"]] if review.get("user_control") else []):
+        if control["kind"] == "user_stop":
+            stopped_by = control
+        elif stopped_by and control.get("supersedes") == stopped_by["id"]:
+            stopped_by = None
+        else:
+            control_issue = True
+    # Restrictions bind effects across issue/task/path labels. A new case cannot
+    # grant a denied write. UNKNOWN reconciliation remains an original-object
+    # investigation, not an automatic retry switch in this optional helper.
+    reviews = [(g["goal_id"], r) for g in document["goals"] for r in g["reviews"]]
+    reviews += [(goal["goal_id"], review)]
+    attempts = {(identity, r["id"], a["id"]): a for identity, r in reviews for a in r["attempts"]}
+    aliases = {}
+    for identity in attempts:
+        aliases.setdefault("/".join(identity), []).append(identity)
+    def attempt_identity(reference):
+        if structured_attempt_ref(reference):
+            return tuple(reference[k] for k in ("goal_id", "review_id", "attempt_id"))
+        # Read legacy references only when their components are unambiguous.
+        # A collision can never erase a refusal or reconcile an UNKNOWN.
+        matches = aliases.get(reference, []) if text(reference) else []
+        return matches[0] if len(matches) == 1 else None
+    reconciled = {}
+    reconciliation_gaps = []
+    for _, r in reviews:
+        for resolution in r.get("reconciliations", []):
+            identity = attempt_identity(resolution["attempt_ref"])
+            target = attempts.get(identity)
+            if identity is None:
+                reconciliation_gaps.append({"attempt_ref": resolution["attempt_ref"], "reason": "missing_or_ambiguous_original_attempt"})
+            scope = resolution["proof"].get("expected_scope", {})
+            if (isinstance(scope, dict) and target and target["result"] == "unknown" and
+                    goal_action(target["action"]) == goal_action(resolution["action"]) and
+                    attempt_identity(scope.get("original_attempt_ref")) == identity and
+                    scope.get("effect_outcome") == resolution["result"] and
+                    scope.get("effect_action") == resolution["action"] and
+                    goal_dependency_supported(r, {"proof": resolution["proof"]})):
+                reconciled.setdefault(identity, set()).add(resolution["result"])
+    candidates = []
+    for path in review["paths"]:
+        reasons = []
+        action = goal_action(path["action"])
+        matching = [(ref, a) for ref, a in attempts.items() if goal_action(a["action"]) == action]
+        if stopped_by:
+            reasons.append("user_stopped")
+        if path["permission"]["status"] != "allowed":
+            reasons.append("permission_" + path["permission"]["status"])
+        if path["capability"]["status"] != "supported":
+            reasons.append("capability_" + path["capability"]["status"])
+        reasons.extend("dependency_" + d["status"] + ":" + d["ref"] for d in path["dependencies"]
+                       if d["status"] != "satisfied")
+        reasons.extend("dependency_result_unverified:" + d["ref"] for d in path["dependencies"]
+                       if d["status"] == "satisfied" and not goal_dependency_supported(review, d))
+        if any(a["result"] == "denied" for _, a in matching):
+            reasons.append("original_denial_retained")
+        if any(a["result"] == "unknown" and len(reconciled.get(ref, set())) != 1 for ref, a in matching):
+            reasons.append("inspect_original_effect_before_any_retry")
+        if any(reconciled.get(ref) == {"committed"} for ref, _ in matching):
+            reasons.append("original_effect_already_committed_do_not_repeat")
+        basis = path.get("basis_refs", review["basis_refs"])
+        if any(set(basis) <= set(a["basis_refs"]) for _, a in matching):
+            reasons.append("no_new_evidence_for_same_effect")
+        candidates.append({"path_id": path["id"], "eligible_in_supplied_records": not reasons,
+                           "reasons": reasons, "action": path["action"], "purpose": path["purpose"]})
+    decision, issues = review["decision"], []
+    if control_issue:
+        issues.append("user_control_provenance_mismatch")
+    eligible = [p for p in candidates if p["eligible_in_supplied_records"]]
+    chosen = next((p for p in eligible if p["path_id"] == decision.get("path_id")), None)
+    unresolved = [q["id"] for q in review["causal_questions"] if q["status"] == "open" and q["required_for_closure"]]
+    pending = [c["id"] for c in review["criteria"] if c["status"] != "met"]
+    if decision["kind"] == "act" and chosen is None:
+        issues.append("chosen_path_not_supported")
+    if decision["kind"] == "wait" and eligible:
+        issues.append("independent_evidence_path_available")
+    if decision["kind"] == "close":
+        if stopped_by:
+            issues.append("user_stop_requires_explicit_resumption")
+        if pending or unresolved:
+            issues.append("root_criteria_or_required_cause_unresolved")
+        if decision["owner_ref"] != goal["owner_ref"]:
+            issues.append("closure_owner_mismatch")
+        if review["trigger"]["kind"] == "recurrence":
+            issues.append("recurrence_requires_fresh_issue_verification")
+    changed = not previous or set(review["basis_refs"]) != set(previous[-1]["basis_refs"])
+    return {"status": "goal_review", "goal_id": goal["goal_id"],
+            "goal_state": "USER_STOPPED" if stopped_by else
+                "CLOSED_IN_SUPPLIED_RECORDS" if decision["kind"] == "close" and not issues else "OPEN",
+            "user_stop": stopped_by,
+            "model_review_needed": bool(issues), "decision_supported": not issues,
+            "decision_issues": issues, "pending_criteria": pending, "unresolved_causal_questions": unresolved,
+            "paths": candidates, "selected_next_action": chosen if not issues and decision["kind"] == "act" else None,
+            "wait": decision if not issues and decision["kind"] == "wait" else None,
+            "evidence_changed": changed, "record_needed": changed or not previous or
+                previous[-1]["decision"] != decision or previous[-1]["criteria"] != review["criteria"] or
+                previous[-1]["causal_questions"] != review["causal_questions"] or
+                previous[-1]["paths"] != review["paths"] or bool(review["attempts"]) or bool(review.get("user_control")),
+            "reconciled_original_attempts": [{"attempt_ref": dict(zip(("goal_id", "review_id", "attempt_id"), k)),
+                                              "results": sorted(v)} for k, v in reconciled.items()],
+            "reconciliation_gaps": reconciliation_gaps,
+            "action_executed": False, "root_cause_verified": False,
+            "meaning": "model judgment over referenced evidence; finite phase completion never closes an issue"}
+
+
 def view(request):
     agreements = validate_snapshot("agreements", request.get("agreements"))
     tasks = validate_snapshot("tasks", request.get("tasks"))
@@ -523,6 +844,32 @@ def view(request):
                       and e["seq"] > event_sequences[e["related_event_id"]]]
         stopped = [e["event_id"] for e in current if e["kind"] == "legal_stop_recorded"
                    and e["evidence_refs"] and text(e.get("reason"))]
+        facts = {e["event_id"] for e in current if e["kind"] not in ("successor_executed", "legal_stop_recorded")}
+        by_event = {e["event_id"]: e for e in current}
+        frontiers, unbound = {}, []
+        for identity in successors + stopped:
+            event = by_event[identity]
+            consumed = event.get("consumed_event_ids")
+            valid = (strings(consumed, nonempty=True) and event["observed_at"] is not None
+                     and timestamp(event["observed_at"]) <= as_of
+                     and all(ref in by_event and by_event[ref]["seq"] < event["seq"] for ref in consumed))
+            if valid:
+                # Explicit causal consumption is required. Source times only
+                # reject an impossible claim; later bookkeeping seq proves no
+                # knowledge of the returns already in the journal.
+                valid = all(by_event[ref]["observed_at"] is not None and
+                            timestamp(by_event[ref]["observed_at"]) <= timestamp(event["observed_at"])
+                            for ref in consumed)
+            if valid:
+                frontiers[identity] = set(consumed)
+            else:
+                unbound.append(identity)
+        # A newer decision also acknowledges any earlier decisions/late ledger
+        # entries it actually reviewed. Missing legacy bindings require review,
+        # but an explicit later frontier can finish that review without erasing
+        # the old records or turning their append order into causal knowledge.
+        settled = [identity for identity, consumed in frontiers.items() if set(by_event) - {identity} <= consumed]
+        settled_through = max((event_sequences[ref] for consumed in frontiers.values() for ref in consumed if ref in facts), default=0)
         projected.append({"task_id": task["task_id"], "input_revision": task["input_revision"],
             "scope_accepted_in_supplied_records": not pending, "pending_acceptance": pending,
             "acceptance_events": accepted, "acceptance_effects": acceptance_effects,
@@ -535,7 +882,11 @@ def view(request):
                                    "observed_at": latest["observed_at"] if latest else None,
                                    "age_seconds": age, "freshness": freshness},
             "dependencies": task["dependencies"], "successor_event_ids": successors,
-            "stop_event_ids": stopped, "next_action_review_needed": not successors and not stopped})
+            "stop_event_ids": stopped,
+            "continuation_settled_through_seq": settled_through,
+            "continuation_frontier_event_ids": sorted(facts, key=event_sequences.get),
+            "settlement_event_ids": settled, "unbound_settlement_event_ids": unbound,
+            "next_action_review_needed": not settled})
     return {"status": "read_only_view", "tasks": projected,
             "source_read_gaps": request.get("source_read_gaps", []),
             "meaning": "relationships in supplied records only; stable scoped acceptance does not expire by age"}
@@ -546,15 +897,17 @@ def handle(request):
     output = {"schema": "coordination-files-result-v1", "operation": operation,
               "domain_action_performed": False, "limitations": LIMITS}
     try:
-        need(operation in ("read", "view", "commit"), "operation must be read/view/commit")
+        need(operation in ("read", "view", "commit", "goal-review"), "operation must be read/view/commit/goal-review")
         # Reject action-like parameters instead of suggesting an alternate route.
         allowed = ({"operation", "agreements", "tasks", "progress", "as_of", "max_age_seconds",
                     "history_complete", "source_read_gaps"} if operation == "view" else
+                   {"operation", "goals", "goal_id", "review"} if operation == "goal-review" else
                    {"operation", "binding"} if operation == "read" else
                    {"operation", "binding", "expected_revision", "expected_last_seq", "create",
                     "change_id", "document", "event"})
         need(set(request) <= allowed, "unknown operation parameter")
-        output.update(view(request) if operation == "view" else file_operation(request))
+        output.update(goal_review(request) if operation == "goal-review" else
+                      view(request) if operation == "view" else file_operation(request))
     except FileError as exc:
         output.update(status=exc.status, reason=str(exc), binding=request.get("binding") if isinstance(request, dict) else None,
                       change_id=request.get("change_id") if isinstance(request, dict) else None,
@@ -579,4 +932,4 @@ def dispatch():
                   "reason": "invalid or oversized UTF-8 JSON request", "domain_action_performed": False}
     output.update(tool_revision=loaded_tool_revision(), tool_version=loaded_tool_version())
     print(json.dumps(output, ensure_ascii=False, indent=2, allow_nan=False))
-    return 0 if output["status"] in ("read", "read_only_view", "committed", "duplicate_reused") else 1
+    return 0 if output["status"] in ("read", "read_only_view", "goal_review", "committed", "duplicate_reused") else 1

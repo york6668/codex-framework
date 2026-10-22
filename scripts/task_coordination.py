@@ -324,6 +324,8 @@ def own_entries(value):
         unresolved=state.get('unresolved_execution')
         if state['state'] in ('running','blocked','reconcile') and unresolved and not(execution and unresolved['id']==execution['id']):
             result.append({'task_id':value['task_id'],'execution_id':unresolved['id'],'state':'uncertain','resources':resources(value,specs[name],unresolved.get('dispatch_scope')),'source_ref':(state.get('wait') or {}).get('source_ref','unresolved original effect')})
+    # Only original hard decisions/unknown effects live in restrictions.
+    # Task-local conditions never reserve a peer's object as a refusal.
     for hold in value.get('restrictions',[]):
         effects=hold.get('resource_effects')
         if effects is None:
@@ -895,25 +897,34 @@ def delivery_responsibility(current):
                               obligations=copy.deepcopy(dimensions['pending_obligations']),
                               requirements=[copy.deepcopy(row) for row in retained.get('obligations',[])
                                             if row['id'] in dimensions['pending_obligations']]))
-    ordinary={'failed','validation_error','tool_failure_requires_diagnosis','no_progress'}
+    ordinary={'failed','validation_error','tool_failure_requires_diagnosis','no_progress','business_failure','verified_object_changed'}
     for item in partition['waiting']:
         condition=item.get('condition');step=current['steps'].get(item['step'],{})
         kind=condition.get('kind') if isinstance(condition,dict) else condition
         wait_kind=(step.get('wait') or {}).get('kind')
-        denied=bool(item.get('restriction_refs')) or kind=='explicit_denial' or wait_kind=='explicit_denial'
+        restrictions=item.get('restriction_kinds',[])
+        stopped='user_stop' in restrictions or wait_kind=='user_stop'
+        legacy='legacy_unclassified_stop' in restrictions
+        denied='explicit_denial' in restrictions or kind=='explicit_denial' or wait_kind=='explicit_denial'
+        retained=bool(item.get('restriction_refs'))
         unknown=(bool(step.get('unresolved_execution')) or
                  bool(step.get('continuation') and not step['continuation']['resolved']) or
                  kind in ('unknown','reconcile','original_continuation_requires_readback') or
                  (isinstance(condition,dict) and condition.get('validator_possible_effects') is True))
+        condition_kinds=item.get('condition_kinds') or (step.get('wait') or {}).get('condition_kinds',[])
         # Diagnose an ordinary failure without relaunching its possibly effective
         # operation. A coexisting refusal or UNKNOWN always retains priority.
-        if not denied and not unknown and (kind in ordinary or wait_kind in ordinary):
+        if not retained and not denied and not stopped and not unknown and (kind in ordinary or wait_kind in ordinary or 'business_failure' in condition_kinds):
             actions.append(action('diagnose_original_failure',executor,step=item['step'],
                                   condition=copy.deepcopy(condition)))
         else:
             row=action('retain_original_scoped_wait',executor,step=item['step'],
                        condition=copy.deepcopy(condition),
-                       recovery='retain_exact_refusal' if denied else 'inspect_only_original_permitted_outcome' if unknown else 'resolve_original_dependency_or_condition')
+                       recovery='retain_exact_refusal' if denied else
+                                'wait_for_original_explicit_user_resumption' if stopped else
+                                'inspect_original_legacy_stop_source_no_automatic_release' if legacy else
+                                'inspect_only_original_permitted_outcome' if unknown else
+                                'retain_original_object_constraint' if retained else 'resolve_original_dependency_or_condition')
             row.update({k:copy.deepcopy(v) for k,v in item.items() if k not in ('step','condition')})
             if unknown:row['unresolved_effect']=True
             waiting.append(row)
