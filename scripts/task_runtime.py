@@ -554,6 +554,16 @@ def view(value):
         result["next_action"] = {"kind": "completed" if result["accepted"] else "review_load_or_accept", "bounded": True}
     else:
         result["next_action"] = {"kind": "resolve_specific_wait", "conditions": result["work_partition"]["waiting"], "bounded": True}
+    responsibility=coordination.delivery_responsibility(result)
+    result['delivery_responsibility']=responsibility
+    result['next_action'].update(executor=responsibility['executor'],
+        delivery_owner=responsibility['delivery_owner'],current_input=responsibility['current_input'])
+    if responsibility['next_actions']:
+        selected=responsibility['next_actions'][0]
+        if selected['kind']==result['next_action']['kind']:
+            result['next_action'].update(copy.deepcopy(selected),bounded=True)
+        else:
+            result['next_action']=dict(selected,bounded=True)
     return result
 
 

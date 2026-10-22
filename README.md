@@ -19,7 +19,7 @@ Mac mini 上的全局文档和 Skills 是部署副本，供 Codex 加载使用�
 | Mac mini 等数据节点机器 | 保存实际数据、历史、配置和运行状态，提供编排所需工具与执行资源；由适用核心方法支持的模型编排落实当前要求并核验效果。机器不是独立的设计、任务发起或选择采用主体；不默认全部节点升级全部规范。 |
 | Codex 云端执行环境 | 按需使用的另一执行环境，从同一 GitHub 项目安装框架；其配置、任务和环境发布不等于 GitHub 框架发布。 |
 
-本文的“GitHub 项目”指源码与规范来源，“Codex 云端执行环境”指任务运行位置。Mac mini 直接通过当前可用的仓库连接或 Git 访问 GitHub，读取规范不要求中转到另一个 Codex 任务。本仓为私有仓库，使用独立 Git 历史；旧 GitLab 配置仓与记忆仓仅保留历史用途，现行共享框架以本 GitHub 项目为准。
+本文的“GitHub 项目”指源码与规范来源，“Codex 云端执行环境”指任务运行位置。Mac mini 直接通过当前可用的仓库连接或 Git 访问 GitHub，读取规范不要求中转到另一个 Codex 任务。本仓已由用户确认为公开仓库，使用独立 Git 历史；旧 GitLab 配置仓与记忆仓仅保留历史用途，现行共享框架以本 GitHub 项目为准。
 
 历史记忆、任务记录、业务代码/数据、会话、认证、工具授权规则、插件包和运行缓存不在本框架同步范围内。公司业务源码、契约与长期测试源码由公司 GitLab 维护，本地检出负责实现与测试，不迁入共享框架；运行材料、实际机器配置与数据留在执行节点。获准文档、页面运行资源和效果图按项目交付范围导出。
 
@@ -65,7 +65,7 @@ python3 scripts/obligation_projection.py /path/to/existing.json \
 
 ## 在另一台电脑安装
 
-需要 Git、Python 3.9+ 和可用的 GitHub 私有仓库访问权限；配置与认证按 [共享资源入口](.codex/workstation/README.md) 发现。支持 macOS 与 Linux；Windows 可在 WSL 中使用。不要复制其他设备的登录凭据。
+需要 Git、Python 3.9+ 和对应 GitHub 仓库的必要访问权限；配置与认证按 [共享资源入口](.codex/workstation/README.md) 发现。支持 macOS 与 Linux；Windows 可在 WSL 中使用。不要复制其他设备的登录凭据。
 
 ```sh
 git clone --branch 'york-worktree/Codex框架共享' \
@@ -167,6 +167,8 @@ task 的 delivery-view 是可选纯读视图，在构造 Store 前返回给定�
 此入口只核当前显式关系及原报告字节，不自动读取文件或证明实际部署。source、build、install、load、adoption 的实际证据来自各原入口，当前加载版本的组合仍走适用独验。输出没有执行权限或后台运行保证，不可用它解除原拒绝、UNKNOWN 或真实必要依赖。
 
 ### 项目职责和多任务接续
+
+既有任务的 `status` 和 `coordinate/work` 实际消费原 `assignment.owner/delivery_owner`，在 `delivery_responsibility` 中区分分段执行者与最终交付责任；原目标、来源、输入修订、验收版本、结果审阅及剩余义务随下一动作保留。结果审阅交原交付责任，普通失败交原实施者诊断，拒绝及 UNKNOWN 保留准确等待且不授权重试；独立工作仍可推进。该输出只作当前任务的有界判定，不发送消息、不创建执行机会、不认证负责人或原件；`end_to_end_complete:null` 明确不能从分段通过推定接收端已收到可用结果。没有登记原责任时保持未声明，不默认转给助手，也不为普通任务新增必填输入。App、计划或领域任务是否消费此入口、接收端实际效果各自验证。
 
 既有单任务 spec 继续使用。需要多项目协同时，模型按项目来源补 `project={id,goal,responsibility,source_ref,obligations:[{id,acceptance,task_ids}]}` 与 `assignment={owner,role,delivery_owner,covers}`；role 为 implementation、investigation、verification、integration、final_regression 或 coordination。`request_identity={thread_id,turn_id,message_id}` 绑定本轮选定原生输入。它们不证明授权或来源原件真实；旧 PASS 不能替代当前任务输入。`verify-return` 读取 workspace 内给定 path/sha256 的报告，核对 request_id/task_id/project_id/input_revision/task_input_sha256 及适用原生身份，只回报关联状态，不签收项目。
 

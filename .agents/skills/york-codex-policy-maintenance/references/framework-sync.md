@@ -1,6 +1,6 @@
 # 任务启动同步与明确变更刷新
 
-共享框架、长期规范、York Skills、引用及分发源码由 GitHub 私有仓库 `york6668/codex-framework` 持有、维护和发布，发布分支固定为 `york-worktree/Codex框架共享`。Mac mini 是实际数据存储与执行节点，全局文档和 Skills 是部署副本。BTC 专属方法归 `york6668/btc-core-strategy`，不由本共享同步器安装或覆盖。
+共享框架、长期规范、York Skills、引用及分发源码由 用户已确认公开的 GitHub 仓库 `york6668/codex-framework` 持有、维护和发布，发布分支固定为 `york-worktree/Codex框架共享`。Mac mini 是实际数据存储与执行节点，全局文档和 Skills 是部署副本。BTC 专属方法归 `york6668/btc-core-strategy`，不由本共享同步器安装或覆盖。
 
 任务新建、恢复或清空时检查 GitHub 发布版本，补齐缺失部署、兼容更新变化，再读取适用规则并使用节点实际数据与工具完成需求。后续只在用户要求、当前任务完成长期规范发布或收到明确的已发布变更信息时刷新。普通追加消息和上下文压缩不联网，不设置轮询或跨任务通知。当前用户指令立即生效，读取到的框架不能覆盖更高优先级要求。
 

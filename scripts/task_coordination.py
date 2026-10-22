@@ -772,30 +772,96 @@ def workset(codex_home,request):
 # relationships do not authenticate a native source or grade domain reasoning.
 
 
-def continuation_projection(projected,closed):
+def delivery_responsibility(current):
+    """Route existing finite-task evidence back to its original responsibility.
+
+    This is a decision projection in the actual status/workset path, not a sender,
+    permission grant, native identity authenticator or endpoint receipt checker.
+    """
+    spec=current['spec'];assignment=spec.get('assignment') or {}
+    executor=assignment.get('owner');delivery_owner=assignment.get('delivery_owner')
+    scope=spec.get('result_scope') or {};project=spec.get('project') or {}
+    dimensions=current.get('result_dimensions') or {}
+    binding={key:copy.deepcopy(current.get(key)) for key in ('input_revision','acceptance_sha256')}
+    binding.update(request_id=spec['request_id'],acceptance_version=spec['acceptance_version'],
+                   request_identity=copy.deepcopy(spec.get('request_identity')))
+    retained=dimensions.get('requirements') or {}
+    goal=retained.get('original_goal',scope.get('goal',project.get('goal',spec['requirement'])))
+    # An amended engineering slice is not the source of a retained older goal.
+    goal_source=(scope.get('source_ref') if scope.get('goal')==goal else
+                 project.get('source_ref') if project.get('goal')==goal else None)
     actions=[];waiting=[]
+    def action(kind,owner=None,**fields):
+        return dict(task_id=current['task_id'],kind=kind,owner=owner,
+            executor=executor,delivery_owner=delivery_owner,original_goal=goal,
+            requirement_context=copy.deepcopy(retained) or None,
+            current_input=copy.deepcopy(binding),expected_revision=current['revision'],
+            execution_authorized=False,may_repeat_effect=False,**fields)
+    partition=current['work_partition']
+    for key in partition['ready']:
+        actions.append(action('execute_or_collect_original_step',executor,step=key))
+    for item in partition['unresolved']:
+        actions.append(action('verify_original_dependency_evidence',executor,step=item['step'],
+                              evidence_gaps=copy.deepcopy(item.get('evidence_gaps',[]))))
+    if dimensions.get('reviewable_results'):
+        actions.append(action('review_original_results',delivery_owner,
+                              results=copy.deepcopy(dimensions['reviewable_results'])))
+    for followup in dimensions.get('continuable_results',[]):
+        extra=copy.deepcopy(followup);kind=extra.pop('kind')
+        actions.append(action(kind,executor,**extra))
+    if dimensions.get('pending_obligations') and not partition['waiting'] and not partition['ready']:
+        actions.append(action('continue_original_obligations',delivery_owner,
+                              obligations=copy.deepcopy(dimensions['pending_obligations']),
+                              requirements=[copy.deepcopy(row) for row in retained.get('obligations',[])
+                                            if row['id'] in dimensions['pending_obligations']]))
+    ordinary={'failed','validation_error','tool_failure_requires_diagnosis','no_progress'}
+    for item in partition['waiting']:
+        condition=item.get('condition');step=current['steps'].get(item['step'],{})
+        kind=condition.get('kind') if isinstance(condition,dict) else condition
+        wait_kind=(step.get('wait') or {}).get('kind')
+        denied=bool(item.get('restriction_refs')) or kind=='explicit_denial' or wait_kind=='explicit_denial'
+        unknown=(bool(step.get('unresolved_execution')) or
+                 bool(step.get('continuation') and not step['continuation']['resolved']) or
+                 kind in ('unknown','reconcile','original_continuation_requires_readback') or
+                 (isinstance(condition,dict) and condition.get('validator_possible_effects') is True))
+        # Diagnose an ordinary failure without relaunching its possibly effective
+        # operation. A coexisting refusal or UNKNOWN always retains priority.
+        if not denied and not unknown and (kind in ordinary or wait_kind in ordinary):
+            actions.append(action('diagnose_original_failure',executor,step=item['step'],
+                                  condition=copy.deepcopy(condition)))
+        else:
+            row=action('retain_original_scoped_wait',executor,step=item['step'],
+                       condition=copy.deepcopy(condition),
+                       recovery='retain_exact_refusal' if denied else 'inspect_only_original_permitted_outcome' if unknown else 'resolve_original_dependency_or_condition')
+            row.update({k:copy.deepcopy(v) for k,v in item.items() if k not in ('step','condition')})
+            if unknown:row['unresolved_effect']=True
+            waiting.append(row)
+    return {'executor':executor,'delivery_owner':delivery_owner,'original_goal':goal,
+            'goal_source':goal_source,
+            'requirement_context':copy.deepcopy(retained) or None,
+            'object_ref':scope.get('object_ref'),'current_input':binding,
+            'segment_accepted':current['accepted'],
+            'pending_obligations':copy.deepcopy(dimensions.get('pending_obligations')),
+            'result_evidence':{k:copy.deepcopy(dimensions.get(k)) for k in
+                ('current_result','result_receipts','substantive_review','business_outcome','receipt_errors')},
+            'end_to_end_complete':None,
+            'gaps':[] if delivery_owner else ['delivery_owner_not_declared'],
+            'next_actions':actions,'scoped_waits':waiting,
+            'scope':'declared original responsibility and current finite input only; actual recipient usability requires original delivery evidence'}
+
+
+def continuation_projection(projected,closed):
+    actions=[];waiting=[];responsibilities={}
     for identity,current in projected.items():
-        owner=current['spec'].get('assignment',{}).get('owner')
-        for key in current['work_partition']['ready']:
-            actions.append({'task_id':identity,'step':key,'kind':'execute_or_collect_original_step',
-                            'owner':owner,'expected_revision':current['revision']})
-        for item in current['work_partition']['unresolved']:
-            actions.append({'task_id':identity,'kind':'verify_original_dependency_evidence','step':item['step'],'owner':owner})
-        dimensions=current.get('result_dimensions')
-        if dimensions:
-            if dimensions['reviewable_results']:
-                actions.append({'task_id':identity,'kind':'review_original_results','owner':owner,
-                                'expected_revision':current['revision'],'results':dimensions['reviewable_results']})
-            for action in dimensions['continuable_results']:
-                actions.append({'task_id':identity,'owner':owner,'expected_revision':current['revision'],**action})
-            if dimensions['pending_obligations'] and not current['work_partition']['waiting'] and not current['work_partition']['ready']:
-                actions.append({'task_id':identity,'kind':'continue_original_obligations','owner':owner,
-                                'obligations':dimensions['pending_obligations']})
-        waiting.extend({'task_id':identity,**item} for item in current['work_partition']['waiting'])
+        responsibility=delivery_responsibility(current)
+        responsibilities[identity]=responsibility
+        actions.extend(responsibility['next_actions']);waiting.extend(responsibility['scoped_waits'])
     if not closed['complete'] and not actions and not waiting:
-        actions.append({'kind':'resolve_original_finalization','gaps':closed['gaps']})
+        actions.append({'kind':'resolve_original_finalization','gaps':closed['gaps'],
+                        'execution_authorized':False,'may_repeat_effect':False})
     return {'must_continue':bool(actions),'may_wait':bool(waiting) and not actions,
-            'next_actions':actions,'scoped_waits':waiting,'host_execution_required':True,'background_active':False,
+            'next_actions':actions,'scoped_waits':waiting,'responsibilities':responsibilities,
+            'host_execution_required':True,'background_active':False,
             'scope':'bounded existing-task decision; caller needs an actual authorised original host opportunity, not a new scheduler or delivery claim'}
 
 
