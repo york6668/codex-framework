@@ -4,6 +4,7 @@
 import argparse
 import base64
 import contextlib
+import errno
 import fcntl
 import json
 import os
@@ -15,7 +16,7 @@ import tempfile
 
 REMOTE = "https://github.com/york6668/codex-framework.git"
 BRANCH = "york-worktree/Codex框架共享"
-RELEASE_VERSION = "0.1.3"
+RELEASE_VERSION = "0.1.4"
 SKILLS = (
     "york-codex-policy-maintenance", "york-cross-repo-change", "york-engineering", "york-java-test",
     "york-local-data", "york-log-query", "york-provider-docs", "york-safe-delivery",
@@ -31,6 +32,33 @@ UNKNOWN = object()
 
 class SyncError(Exception):
     pass
+
+
+class GitError(SyncError):
+    """Bounded diagnostic facts; never retain stderr, URLs or credentials."""
+    def __init__(self, operation, category, reason, *, exit_code=None, error_number=None):
+        super().__init__("Git " + operation + " 失败：" + reason)
+        self.details = {"operation": operation, "category": category,
+                        "exit_code": exit_code, "errno": error_number}
+
+
+def git_failure_category(stderr):
+    error = stderr.lower()
+    if "host key" in error or "remote host identification has changed" in error:
+        return "host_trust", "SSH 主机信任核验失败"
+    if any(s in error for s in ("authentication failed", "could not read username",
+                                "could not read password", "invalid username or password",
+                                "permission denied (publickey", "terminal prompts disabled")):
+        return "authentication", "认证入口未完成；不据此推定用户授权缺失"
+    if "permission denied" in error or "operation not permitted" in error:
+        local = any(s in error for s in ("cannot open", "could not open", "unable to create",
+                                         "cannot create", "could not create"))
+        return (("filesystem_access", "文件访问被拒绝；所在节点及原因待核") if local else
+                ("access_denied", "访问被拒绝；具体层及授权原因未确定"))
+    if any(s in error for s in ("could not resolve", "connection timed out", "connection refused",
+                                "network is unreachable", "failed to connect")):
+        return "network", "网络连接未完成"
+    return "unclassified", "操作失败；网络、仓库或工作区原因尚未确定"
 
 
 def allowed(name):
@@ -91,24 +119,25 @@ def write_file(path, value):
             os.unlink(temporary)
 
 
-def git(repo, *args, optional=False, timeout=60):
+def git(repo, *args, optional=False, timeout=60, no_lazy_fetch=False):
     env = dict(os.environ, GIT_TERMINAL_PROMPT="0")
     env["GCM_INTERACTIVE"] = "never"
     env.setdefault("GIT_SSH_COMMAND", "ssh -o BatchMode=yes -o ConnectTimeout=5 "
                    "-o StrictHostKeyChecking=yes -o UpdateHostKeys=no")
     try:
-        result = subprocess.run(["git", "-C", str(repo), *args], env=env,
+        command = ["git"] + (["--no-lazy-fetch"] if no_lazy_fetch else [])
+        result = subprocess.run([*command, "-C", str(repo), *args], env=env,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 text=True, timeout=timeout)
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise SyncError("Git 操作未完成；没有应用本机文件") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise GitError(args[0], "timeout", "操作超时；未据此改变认证或授权") from exc
+    except OSError as exc:
+        category = "process_access" if exc.errno in (errno.EACCES, errno.EPERM) else "process_unavailable"
+        raise GitError(args[0], category, "Git 进程未能完成；保留具体系统错误类别",
+                       error_number=exc.errno) from exc
     if result.returncode and not optional:
-        error = result.stderr.lower()
-        reason = ("认证不可用" if any(s in error for s in
-                  ("username", "authentication", "permission denied", "credential"))
-                  else "SSH 主机信任缺失" if "host key" in error
-                  else "网络、仓库或工作区不可用")
-        raise SyncError("Git " + args[0] + " 失败：" + reason)
+        category, reason = git_failure_category(result.stderr)
+        raise GitError(args[0], category, reason, exit_code=result.returncode)
     return result.stdout.strip() if result.returncode == 0 else None
 
 

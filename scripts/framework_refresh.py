@@ -223,19 +223,67 @@ def cached_files(framework):
     return validate_snapshot(snapshot)
 
 
-def sync_status(framework):
+def source_baseline(framework, revision):
+    """Compare committed history to an explicit read result, never an origin cache.
+
+    This does not fetch or certify the caller's remote read, inspect dirty files,
+    grant publication permission, or make a candidate into a published version.
+    """
+    if not isinstance(revision, str) or not SHA.fullmatch(revision):
+        raise cf.SyncError("基线比较要求本次读取的完整发布提交 SHA")
+    result = {"status": "unknown", "selected_revision": revision,
+              "basis": "caller-supplied-revision", "scope": "committed-history-only",
+              "remote_read_performed": False, "working_tree_compared": False}
+    def local_git(*args, **kwargs):
+        # A metadata command can fetch a missing promisor object implicitly.
+        # Unsupported Git fails before executing the command; never retry
+        # without this explicit option or silently depend on an ignored env var.
+        return cf.git(framework.repo, *args, no_lazy_fetch=True, **kwargs)
+    try:
+        origin = local_git("config", "--get", "remote.origin.url")
+        if origin not in (cf.REMOTE, cf.REMOTE.removesuffix(".git"),
+                          "git@github.com:york6668/codex-framework.git"):
+            raise cf.SyncError("本机 origin 未指向共享框架；未采用该基线")
+        head = local_git("rev-parse", "HEAD")
+        local_git("rev-parse", "--verify", revision + "^{commit}")
+        shallow = local_git("rev-parse", "--is-shallow-repository") == "true"
+        if shallow and head != revision:
+            return dict(result, status="history-incomplete", head=head,
+                        reason="本机为浅历史；不能据截断的祖先计数认定领先、落后或分叉")
+        ahead, behind = map(int, local_git("rev-list", "--left-right", "--count",
+                                          head + "..." + revision).split())
+        tracking = local_git("rev-parse", "--verify",
+                             "refs/remotes/origin/" + cf.BRANCH, optional=True)
+    except (cf.SyncError, ValueError) as exc:
+        result["reason"] = str(exc) if isinstance(exc, cf.SyncError) else "基线比较未返回有效计数"
+        if isinstance(exc, cf.GitError):
+            result["error_details"] = exc.details
+        return result
+    result.update(status=("diverged" if ahead and behind else "ahead" if ahead else
+                          "behind" if behind else "same-commit"),
+                  head=head, ahead=ahead, behind=behind, cached_tracking_revision=tracking,
+                  cached_tracking_matches_selected=(tracking == revision))
+    return result
+
+
+def sync_status(framework, publication_revision=None):
     import framework_runtime as runtime
     try:
         state = runtime.sync_state(framework)
         binding = runtime.describe(framework, state)
     except (cf.SyncError, OSError) as exc:
         return {"status": "runtime-unavailable", "document_status": "unknown",
+                "publication": {"status": "not-checked", "basis": "saved-sync-state"},
                 "source": cf.REMOTE, "branch": cf.BRANCH, "expected_revision": "none",
                 "runtime": {"status": "unknown", "reason": str(exc)}}
     result = dict(state, source=cf.REMOTE, branch=cf.BRANCH,
                   expected_revision=state.get("observed_revision") or "none", runtime=binding,
                   local_overrides=binding["local_overrides"],
                   document_status=state.get("status", "unknown"))
+    result["publication"] = {"status": "not-checked", "basis": "saved-sync-state",
+                             "cached_revision": state.get("observed_revision")}
+    if publication_revision is not None:
+        result["source_baseline"] = source_baseline(framework, publication_revision)
     if binding["status"] not in ("matched", "unmanaged"):
         result["status"] = "runtime-" + binding["status"]
     return result
@@ -274,12 +322,18 @@ def save_sync(framework, state):
     framework.save_state(framework.load_state(), sync=state)
 
 
-def failure(framework, previous, cloud_error, local_error):
+def failure(framework, previous, cloud_error, local_error, local_error_details=None):
     state = dict(previous, status="pending-user", cloud_error=cloud_error[:400],
                  local_error=local_error[:400])
+    state.pop("local_error_details", None)
+    if local_error_details is not None:
+        state["last_git_error"] = dict(local_error_details,
+                                      scope="last_failed_git_attempt_not_current_authorization")
     notify = state != previous
     save_sync(framework, state)
-    return dict(state, notify=notify, message="云端与本机入口均不可用，待用户处理；继续使用已安装规范")
+    return dict(state, notify=notify,
+                message="两个读取入口本次均未完成；保留已安装规范，维护任务核查具体错误并继续无依赖工作。"
+                        "pending-user 为兼容状态，不证明缺少用户授权或只能由用户修复。")
 
 
 def refresh(framework, *, snapshot=None, revision=None, cloud_error=None, expected_revision, route="cloud"):
@@ -310,7 +364,8 @@ def refresh(framework, *, snapshot=None, revision=None, cloud_error=None, expect
                 revision = snapshot["revision"]
             except (cf.SyncError, OSError, ValueError, subprocess.SubprocessError) as exc:
                 reason = str(exc) if isinstance(exc, cf.SyncError) else "本机 Git 内容读取失败或超时"
-                return failure(framework, previous, cloud_error, reason)
+                return failure(framework, previous, cloud_error, reason,
+                               exc.details if isinstance(exc, cf.GitError) else None)
         if previous.get("applied_revision") == revision and not previous.get("conflicts"):
             state = dict(previous, status="current", route=route)
             state.pop("cloud_error", None)
@@ -501,7 +556,7 @@ def session_start(framework, event):
 
 def dispatch(framework, args):
     if args.command == "sync-status":
-        output = sync_status(framework)
+        output = sync_status(framework, getattr(args, "revision", None))
     elif args.command == "install-hook":
         with framework.lock():
             output = install_hook(framework, args.native_cli)
