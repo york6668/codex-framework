@@ -1,4 +1,4 @@
-version: 6
+version: 7
 maintenance_owner: CODEX_MODEL
 entry:
   file: codex:AGENTS.md
@@ -25,3 +25,7 @@ domains:
     file: skills:york-cross-repo-change/SKILL.md
   task-alignment:
     file: skills:york-task-alignment/SKILL.md
+  assistant-coordination:
+    file: skills:york-task-alignment/references/assistant-coordination.md
+  coordination-file-contract:
+    file: skills:york-task-alignment/references/coordination-file-contract.md

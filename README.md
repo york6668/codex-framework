@@ -50,6 +50,10 @@ Mac mini 上的全局文档和 Skills 是部署副本，供 Codex 加载使用�
 
 运行版本链实现与隔离回归见下节；独立验收、发布、真实安装及采用各自取证。原生来源适配与统一有界读取、结果后的主动协调及真实采用仍按后续工作包推进，不移动 BTC 额度权威或节点实际配置。
 
+## 助手协调与持久文件
+
+助手侧的共识整理、任务追踪和进度核收使用 [助手协调方法](.agents/skills/york-task-alignment/references/assistant-coordination.md)，数据权威仍在用户资源和原系统工作站。`coordination` 是 0.2.0 源码新增的显式文件适配能力；[契约与模板](.agents/skills/york-task-alignment/references/coordination-file-contract.md) 说明 `read/view/commit`、CAS、完整事件追加及部分回写恢复。它在创建旧 Task Store 前分流，不登记全部会话，不联网、发送、执行或改变调度。源码声明与候选、已发布版本、节点加载及实际采用分别取证，离线通过不表示平台强制采用。
+
 ## 只读展开已有义务引用
 
 ```sh
