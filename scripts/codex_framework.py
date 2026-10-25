@@ -16,7 +16,7 @@ import tempfile
 
 REMOTE = "https://github.com/york6668/codex-framework.git"
 BRANCH = "york-worktree/Codex框架共享"
-RELEASE_VERSION = "0.3.0"
+RELEASE_VERSION = "0.3.1"
 SKILLS = (
     "york-codex-policy-maintenance", "york-cross-repo-change", "york-engineering", "york-java-test",
     "york-local-data", "york-log-query", "york-provider-docs", "york-safe-delivery",
