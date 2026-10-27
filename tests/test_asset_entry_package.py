@@ -12,6 +12,8 @@ import framework_runtime as runtime
 class AssetEntryPackageTests(FixtureCase):
     def test_installed_reader_consumes_optional_producer_without_claiming_health(self):
         revision = seed_runtime(self.repo)
+        release = runtime.declared_release_version(
+            (self.repo / "scripts/codex_framework.py").read_text())
         env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
 
         def cli(path, *args):
@@ -21,7 +23,7 @@ class AssetEntryPackageTests(FixtureCase):
                 capture_output=True, text=True, env=env, timeout=30)
 
         installed = cli(self.repo / "scripts/codex_framework.py", "--repo", str(self.repo),
-                        "install", "--revision", revision, "--release-version", "0.3.1",
+                        "install", "--revision", revision, "--release-version", release,
                         "--expected-runtime", "none")
         self.assertEqual(installed.returncode, 0, installed.stdout + installed.stderr)
         directory = runtime.version_path(self.a, revision)
@@ -36,7 +38,7 @@ class AssetEntryPackageTests(FixtureCase):
         work = self.a.codex_home / "workstation"
         work.mkdir(parents=True, exist_ok=True)
         identity = {"project_id": "file-metadata-package-test", "task_ref": "synthetic:package",
-                    "node_id": "isolated-node", "version": "0.3.1"}
+                    "node_id": "isolated-node", "version": release}
         stages = {x: {"status": "UNKNOWN", "value": None} for x in
                   ("candidate", "installed", "loaded", "selection", "reserved", "effect", "health", "retirement")}
         stages["installed"] = {"op": "field", "source": "active", "field": "revision",
@@ -44,7 +46,7 @@ class AssetEntryPackageTests(FixtureCase):
         selection = {"schema": "node-asset-selection-v1", "identity": identity,
                      "sources": {"active": {"kind": "json", "path": str(runtime.pointer(self.a)),
                                             "allowed_root": str(self.a.codex_home)}},
-                     "assets": [{"id": "framework", "version_label": "0.3.1",
+                     "assets": [{"id": "framework", "version_label": release,
                                  "owner_ref": "synthetic-owner", "stages": stages}]}
         selection_path = work / "selection.json"
         selection_path.write_text(json.dumps(selection))
@@ -74,9 +76,9 @@ class AssetEntryPackageTests(FixtureCase):
         version = cli(runtime.launcher_path(self.a), "version")
         self.assertEqual(version.returncode, 0, version.stdout + version.stderr)
         status = json.loads(version.stdout)
-        self.assertEqual(status["source_version"], "0.3.1")
+        self.assertEqual(status["source_version"], release)
         for key in ("tool_version", "active_version", "document_version"):
-            self.assertEqual(status["runtime"][key], "0.3.1")
+            self.assertEqual(status["runtime"][key], release)
 
 
 if __name__ == "__main__":
