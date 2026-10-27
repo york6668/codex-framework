@@ -56,10 +56,10 @@ class RefreshTests(FixtureCase):
         self.assertIn(".codex/memory-framework.md", result["changed"])
         self.assertEqual(self.a.target(".codex/memory-framework.md").read_text(), "updated shared method\n")
 
-    def test_conflict_preserves_local_btc_and_applies_independent_update(self):
+    def test_conflict_preserves_local_domain_method_and_applies_independent_update(self):
         self.install_snapshot()
         path = self.a.target(".codex/AGENTS.md")
-        local = path.read_text() + "\nBTC local exception\n"
+        local = path.read_text() + "\nDomain local exception\n"
         put(path, local)
         put(self.repo / ".codex/AGENTS.md", "new upstream global rule\n")
         put(self.repo / ".codex/memory-framework.md", "new memory method\n")
@@ -116,8 +116,8 @@ class RefreshTests(FixtureCase):
 
     def test_private_files_and_unrelated_skills_are_never_modified(self):
         private = {".codex/config.toml": "existing runtime", ".codex/memories/notes.md": "local memory",
-                   ".codex/workstation/local.md": "device paths", ".agents/skills/btc-core-strategy/SKILL.md": "BTC methods",
-                   ".codex/btc/runtime.json": "local asset facts"}
+                   ".codex/workstation/local.md": "device paths", ".agents/skills/private-domain-example/SKILL.md": "domain methods",
+                   ".codex/example-domain/runtime.json": "local asset facts"}
         for name, content in private.items():
             put(self.a.home / name, content)
         self.install_snapshot()

@@ -17,11 +17,11 @@ class WorkstationCheckTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.now = "2026-10-14T08:00:00+00:00"
         self.path = self.root / "state.json"
-        self.data = {"project_id": "btc", "task_ref": "codex:thread:original",
+        self.data = {"project_id": "example", "task_ref": "codex:thread:original",
                      "node_id": "mac-mini", "version": "v2", "observed_at": self.now,
                      "status": "HEALTHY", "complete": True, "resources": []}
         self.payload = {"schema": "workstation-check-v1", "now": self.now,
-                        "scope": {"project_id": "btc", "task_ref": "codex:thread:original",
+                        "scope": {"project_id": "example", "task_ref": "codex:thread:original",
                                   "node_id": "mac-mini", "version": "v2"},
                         "sources": [{"id": "service", "path": str(self.path),
                                      "max_age_seconds": 900, "status_path": "status",

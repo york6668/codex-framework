@@ -34,10 +34,10 @@ OpenAI 设计与能力依据按 [官方依据与能力核验](../../york-enginee
 
 `claim: completed` 仍需目标验收来源，且不能留下剩余步骤；本地事故还须使用 `close_issue` 核对实际节点采用和效果，合成 CI 不能替代。`continuous_tracking` 的静态投影仍返回未验证：它不能承诺未来执行，也不判定 App 调度不可用、不暂停已开启调度或拦截实际回合中的获准步骤。SessionStart Hook 不提供空闲唤醒；用户控制的 App 原生触发及其运行记录按实际范围单独验收，缺少执行机会时只说明该范围未知。此入口不自动拦截计划工具、等待或交接，使用点依任务规范由模型执行，真实行为仍需正常任务入口复测。
 
-先从 Codex 原生 `read_thread(includeOutputs=true)` 定位原线程、用户目标与相关工具调用；从节点实际入口读取能力、预算、数据状态及采用版本。项目规范、Git 提交和节点事实仍在原处。把适用规范引用、项目与任务范围、原线程、拟执行动作及相关来源放入临时 JSON，经标准输入调用：
+先从 Codex 原生 `read_thread(includeOutputs=true)` 定位原线程、用户目标与相关工具调用；从节点实际入口读取能力、预算、数据状态及采用版本。项目规范、Git 提交和节点事实仍在原处。把适用规范引用、项目与任务范围、原线程、拟执行动作及相关来源放入临时 JSON，将 `CHECK_INPUT` 设为该文件的实际位置，经标准输入调用；不要求固定临时目录或另一机器的路径：
 
 ```sh
-python3 scripts/codex_framework.py check < /tmp/current-action.json
+python3 scripts/codex_framework.py check < "$CHECK_INPUT"
 ```
 
 输入的 `project.id` 和 `task.project_id` 必须一致，`task.native_ref` 与 `context.task_ref` 都指向要接续的同一原生线程（`codex:thread:<id>`）。`project.scopes`、`task.scopes` 分别给出项目和本任务范围；每项由 `kind`、`id`、可选的相对 `path` 与 `access: read|write` 组成。`action.resource` 使用同样的身份字段，`kind` 是 `read|write|invoke|repair|publish`。资源身份应取自实际仓库、数据或服务，不用路径相似性推断归属。范围和路径的包含检查会拒绝跨项目及同项目其他任务越界。

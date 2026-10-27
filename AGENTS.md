@@ -1,6 +1,6 @@
 # Codex 共享框架
 
-核心框架、长期规范、Skills、引用及可复用源码由对应 GitHub 项目持有、维护和发布；Mac mini 是数据存储与执行节点，其全局文档和 Skills 是部署副本。本仓 `york6668/codex-framework` 持有共享框架，BTC 专属方法归 `york6668/btc-core-strategy`。本地检出用于开发修订，长期变更回到所属 GitHub 项目发布，再刷新部署副本与任务上下文；未发布修改受保护并明确标识，不形成另一套框架权威。完整职责与任务流程见 [README](README.md)。
+核心框架、长期规范、Skills、引用及可复用源码由对应 GitHub 项目持有、维护和发布；执行节点是数据存储与执行节点，其全局文档和 Skills 是部署副本。本仓 `york6668/codex-framework` 持有共享框架；具体项目归属和私有方法来源由助手与工作站按现有项目入口承接。本地检出用于开发修订，长期变更回到所属 GitHub 项目发布，再刷新部署副本与任务上下文；未发布修改受保护并明确标识，不形成另一套框架权威。完整职责与任务流程见 [README](README.md)。
 
 本仓的完整用户偏好在 [.codex/AGENTS.md](.codex/AGENTS.md)，开始工作时读取该文件。专业方法位于 `.agents/skills/york-*`，按当前问题选用。
 

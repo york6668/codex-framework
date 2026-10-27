@@ -26,7 +26,7 @@ IDENTITY = {"project_id": "workstation-asset-observation", "task_ref": "codex:th
 STAGES = ("candidate", "installed", "loaded", "selection", "reserved", "effect", "health", "retirement")
 
 
-def row(name="btc"):
+def row(name="example"):
     stages = {k: {"status": "UNKNOWN", "value": None, "refs": []} for k in STAGES}
     stages["installed"] = {"status": "METADATA_OBSERVED", "value": "current-new", "refs": ["release"]}
     stages["reserved"] = {"status": "ROLLBACK_RETAINED", "value": "previous-old", "refs": ["release"]}

@@ -100,7 +100,7 @@ class ContinuityTests(fixtures.FixtureCase):
 
     def test_old_true_pass_cannot_answer_current_native_request(self):
         store,_=self.create();ref=self.result(store)
-        p=self.root/ref['path'];data=json.loads(p.read_bytes());data['request_identity']['turn_id']='old-btc-turn'
+        p=self.root/ref['path'];data=json.loads(p.read_bytes());data['request_identity']['turn_id']='old-example-turn'
         bad=self.ref(ref['path'],data)
         with self.assertRaisesRegex(task.TaskError,'current project/task/native'):self.change(store,'collect-result',**bad)
         self.assertFalse(store.read()['accepted'])
