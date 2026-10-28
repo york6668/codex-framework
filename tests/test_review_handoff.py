@@ -50,21 +50,21 @@ const d=JSON.parse(fs.readFileSync(0,'utf8'));
 (async()=>{
  let r;
  if(d.op==='make') r=api.makeReviewDispatch(...d.args);
- else if(d.op==='receive') r=api.receiveReview(d.dispatches,d.selected,d.native,d.readback);
+ else if(d.op==='receive') r=api.receiveReview(d.dispatches,d.selected,d.native,d.readback,d.source);
  else if(d.op==='recoverNative') r=api.recoverNativeDispatch(d.native,d.pin);
  else if(d.op==='recover') r=api.recoverDispatch(d.raw,d.sha);
  else if(d.op==='observe') r=api.observeReview(d.dispatch,d.native);
  else if(d.op==='readOnly') {
    const calls=[];
    const got=await api.readReview(d.dispatches,d.selected,{
-     readNative:async target=>{calls.push(['readNative',target]);return d.native;},
+     source:d.source,readNative:async target=>{calls.push(['readNative',target]);return d.native;},
      readReport:async ref=>{calls.push(['readReport',ref]);return d.readback;}});
    r={...got,calls};
  }
  else if(d.op==='decide') r=api.decideReview(d.bound,d.decision);
  else if(d.op==='continue') {
    const calls=[], retained=[]; const record=d.record;
-   const io={readNative:async target=>{calls.push('read');return d.native;},
+   const io={source:d.source,readNative:async target=>{calls.push('read');return d.native;},
      readReport:async ref=>d.readback,
      retain:async raw=>{retained.push(JSON.parse(raw));return d.retain!==false;},
      consume:async bound=>{calls.push('consume');if(d.consumeThrows)throw Error('lost consumer ack');
@@ -90,7 +90,7 @@ const d=JSON.parse(fs.readFileSync(0,'utf8'));
      const sent=await api.sendReview(record,{retain:async raw=>{calls.push(['retain',JSON.parse(raw).attempt]);return d.retain!==false;},
        send:async (target,prompt)=>{calls.push(['send',target,prompt]);if(d.sendThrows)throw Error('lost ack');return {native:'ack'};}});
      const received=d.doRead?await api.readReview(d.dispatches,d.selected,{
-       readNative:async target=>{calls.push(['readNative',target]);return d.native;},
+       source:d.source,readNative:async target=>{calls.push(['readNative',target]);return d.native;},
        readReport:async ref=>{calls.push(['readReport',ref]);return d.readback;}}):null;
      r={sent,received,calls,record};
    }catch(e){r={error:e.message,calls,record};}
@@ -150,6 +150,79 @@ const d=JSON.parse(fs.readFileSync(0,'utf8'));
                                'role': 'assistant', 'text': self.body, 'truncated': False}],
                     'nextCursor': 'original-provider-cursor'}, 'isError': False}
 
+    def result_source(self):
+        return review.review_source(self.dispatch["prompt"], self.rb["ref"], self.rb["text"].encode(),
+            request_pointer="/original_request", result_pointer="/domain_review", evidence_readbacks=self.evidence)
+
+    def test_original_result_is_read_independently_of_human_final(self):
+        source = self.result_source()
+        self.assertEqual(set(source), {"request", "report"})
+        native = self.native_read(self.dispatch, "核对完成，原结果已保存。存在失败项，由原责任续修。")
+        got = self.js("readOnly", dispatches=[self.dispatch], selected=source["request"],
+                      native=native, source=source, readback=self.rb)
+        self.assertEqual(got["evaluation"]["binding"], "bound")
+        self.assertEqual(got["evaluation"]["result"], self.result)
+        self.assertEqual(got["evaluation"]["result_acceptance"], "unreviewed")
+        self.assertEqual(got["calls"], [["readNative", "reviewer"], ["readReport", self.rb["ref"]]])
+        missing = self.js("receive", dispatches=[self.dispatch], selected=source["request"], native=native, readback=self.rb)
+        self.assertEqual(missing["binding"], "unknown")
+
+    def test_result_locator_does_not_grant_read_or_clear_old_obligations(self):
+        source = self.result_source()
+        source["request"] = dict(source["request"], request_id="wrong-request")
+        got = self.js("readOnly", dispatches=[self.dispatch], selected=self.dispatch["contract"]["request"],
+                      native=self.native_read(self.dispatch, "只供用户阅读"), source=source, readback=self.rb)
+        self.assertEqual(got["calls"], [["readNative", "reviewer"]])
+        self.assertEqual(got["evaluation"]["binding"], "rejected")
+        self.assertEqual(got["evaluation"]["pending_requests"], [self.dispatch["contract"]["request"]])
+
+    def test_local_readback_projects_only_requested_result(self):
+        # Synthetic canary stays in the original node's unrelated fields, not
+        # the locator or adapter output. This is not a test with real secrets.
+        import uuid
+        marker = "local-only-" + uuid.uuid4().hex
+        report = json.loads(self.rb["text"])
+        report["unrelated_local_detail"] = marker
+        self.rb["text"] = json.dumps(report, ensure_ascii=False)
+        Path(self.rb["ref"]).write_text(self.rb["text"])
+        source = self.result_source()
+        native = self.native_read(self.dispatch, "结果供原责任核收")
+        body = json.loads(native["content"][0]["text"])
+        body["turns"][0]["items"].insert(1, {"id": "private-tool-output", "type": "functionCallOutput", "text": marker})
+        native["content"][0]["text"] = json.dumps(body)
+        got = self.js("readOnly", dispatches=[self.dispatch], selected=source["request"],
+                      native=native, source=source, readback=self.rb)
+        self.assertEqual(got["evaluation"]["binding"], "bound")
+        self.assertNotIn(marker, json.dumps(got))
+        self.assertNotIn(marker, json.dumps(source))
+        self.assertNotIn("native_readback", got)
+
+    def test_verified_native_pagination_stays_unknown_without_reading_report(self):
+        raw = self.native_read(self.dispatch, "结果在较早轮次")
+        body = json.loads(raw["content"][0]["text"])
+        body["turns"] = []
+        body["page"] = {"order": "newest_first", "limit": 1, "hasMore": True, "nextCursor": "provider-cursor"}
+        raw["content"][0]["text"] = json.dumps(body)
+        got = self.js("readOnly", dispatches=[self.dispatch], selected=self.dispatch["contract"]["request"],
+                      native=raw, source=self.result_source(), readback=self.rb)
+        self.assertEqual(got["evaluation"]["binding"], "unknown")
+        self.assertEqual(got["evaluation"]["next_cursor"], "provider-cursor")
+        self.assertEqual(got["calls"], [["readNative", "reviewer"]])
+
+    def test_prose_return_duplicate_and_lost_receipt_never_replay(self):
+        source = self.result_source()
+        arguments = dict(dispatches=[self.dispatch], selected=source["request"], source=source,
+                         native=self.native_read(self.dispatch, "核对完成，原结果供责任方审阅"), readback=self.rb)
+        record = {"dispatch": self.dispatch, "attempt": "returned", "native_receipt": None}
+        got = self.js("continue", record=record, repeat=2, **arguments)
+        self.assertEqual(got["calls"].count("consume"), 1)
+        self.assertTrue(all(row["state"] == "consumed" for row in got["outputs"]))
+        lost = self.js("continue", record=record, consumeThrows=True, **arguments)
+        self.assertEqual(lost["outputs"][0]["state"], "unknown")
+        resumed = self.js("continue", record=lost["record"], inspect="committed", **arguments)
+        self.assertNotIn("consume", resumed["calls"])
+        self.assertEqual(resumed["outputs"][0]["state"], "consumed")
+
     def test_cloud_actual_projection_is_recognized_but_not_a_fabricated_native_final(self):
         raw = self.cloud_projection()
         got = self.receive(native=raw)
@@ -162,8 +235,8 @@ const d=JSON.parse(fs.readFileSync(0,'utf8'));
         read = self.js('readOnly', dispatches=[self.dispatch], selected=self.dispatch['contract']['request'],
                        native=raw, readback=self.rb)
         self.assertEqual(read['calls'], [['readNative', 'reviewer']])
-        self.assertEqual(read['native_readback'], raw)
-        self.assertNotIn('schemaVersion', read['native_readback']['structuredContent'])
+        self.assertNotIn('native_readback', read)
+        self.assertEqual(read['evaluation']['native_read_schema'], 'cloud_threads')
 
     def test_cloud_latest_status_cannot_certify_an_older_request_turn(self):
         pin = {'sender_thread': 'parent', 'target_thread': 'reviewer',
@@ -234,9 +307,9 @@ const d=JSON.parse(fs.readFileSync(0,'utf8'));
             "final_utf8_sha256": bound["final_utf8_sha256"], "report_sha256": bound["report_sha256"],
             "reason": "Original parent has separately reviewed actual failure and limits"})
 
-    def test_H01_wrong_old_actual_final_is_rejected_without_destroying_old_work(self):
+    def test_H01_unlocated_old_final_is_unknown_without_destroying_old_work(self):
         result = self.receive(native=self.native_read(self.dispatch, "Old statistics E2E PASS c2be; current input a473 was not answered"))
-        self.assertEqual(result["binding"], "rejected")
+        self.assertEqual(result["binding"], "unknown")
         self.assertEqual(result["pending_requests"], [self.dispatch["contract"]["request"]])
         self.assertTrue(result["preserve_completed_work"])
 
@@ -297,7 +370,7 @@ const d=JSON.parse(fs.readFileSync(0,'utf8'));
             self.assertTrue(bound["independent_work_may_continue"])
 
     def test_H07_visible_compaction_marker_does_not_change_original_request(self):
-        self.assertEqual(self.receive(native=self.native_read(self.dispatch, "old topic", marker=True))["binding"], "rejected")
+        self.assertEqual(self.receive(native=self.native_read(self.dispatch, "old topic", marker=True))["binding"], "unknown")
         self.assertEqual(self.receive(native=self.native_read(self.dispatch, self.body, marker=True))["binding"], "bound")
 
     def test_H08_missing_cache_or_failed_retention_sends_nothing(self):

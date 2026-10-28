@@ -948,7 +948,7 @@ def execution_update(store, expected, execution_id, operation):
 @io_call
 def finish(store, expected, execution_id, worker):
     require(isinstance(worker, dict) and worker.get("status") in ("completed", "failed", "unknown"), "invalid worker outcome")
-    observation = {k: worker.get(k) for k in ("status", "session_id", "native_turn_id", "native_turn_sha256", "native_error", "native_permission_declined", "tool_failures", "pid", "started_at", "ended_at", "exit", "usage", "events_sha256", "message_sha256", "error", "prompt_sent")}
+    observation = {k: worker.get(k) for k in ("status", "session_id", "native_turn_id", "native_final_id", "native_turn_sha256", "native_error", "native_permission_declined", "tool_failures", "pid", "started_at", "ended_at", "exit", "usage", "events_sha256", "message_sha256", "error", "prompt_sent")}
     observation["execution_id"] = execution_id
     def identify(value):
         execution = value.get("execution")
@@ -1120,7 +1120,7 @@ def require_stopped(execution):
 @coordination.scoped
 @io_call
 def resume(store, max_turns=3):
-    """Restart from durable facts only; never invent a fresh request or effect."""
+    """Recover the original stopped execution only; never launch or auto-accept."""
     value = store.read()
     require(value["spec"].get("execution_mode", "native") == "native", "external task outcome requires explicit effect collection/reconciliation, not model resume")
     execution = value.get("execution")
@@ -1152,10 +1152,9 @@ def resume(store, max_turns=3):
         else:
             value = finish(store, value["revision"], execution["id"], {"status": "unknown", "session_id": None,
                                   "error": "missing_native_identity_inspect_original_effect_no_replay"})
-    if partition(value)["ready"]:
-        value = run(store, value["revision"], max_turns)
-    elif not value["accepted"] and all(s["state"] == "verified" for s in value["steps"].values()) and not value["spec"].get("review_required") and not value["spec"].get("load_required") and (coordination.result_state(value) is None or not coordination.result_state(value)["pending"]):
-        value = change(store, {"operation": "accept", "expected_revision": value["revision"]})
+    # Recovery consumes only the stopped original execution. Ready successors
+    # are continued by the existing native task; never launch a new model here
+    # or sign owner acceptance merely because passive validation succeeded.
     return value
 
 
@@ -1480,6 +1479,13 @@ def dispatch(codex_home):
         request = json.loads(raw)
         require(isinstance(request, dict), "request must be an object")
         operation = request.get("operation")
+        # Recovery of existing records stays on its original identity. New work
+        # belongs to the existing native task, not a second task registry.
+        if operation in ("register", "run", "work"):
+            print(json.dumps({"status": "retired_operation", "operation": operation,
+                "reason": "new work uses the existing native task and original domain record",
+                "records_changed": False, "may_replay": False}, ensure_ascii=False))
+            return 2
         if operation in ("coordinate", "work"):
             result = coordination.workset(codex_home, request)
             print(json.dumps(result, ensure_ascii=False, indent=2))

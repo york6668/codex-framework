@@ -389,12 +389,12 @@ class ProjectRuntimeTests(fixtures.FixtureCase):
             self.assertEqual(result.stderr,'');return result,json.loads(result.stdout)
         (self.root/'cli-output').write_bytes(b'actual')
         spec=self.spec('cli',project='core',execution_mode='external',steps=[{'id':'a','instruction':'Collect already produced effect','checks':[{'kind':'file','path':'cli-output','sha256':task.digest(b'actual')}]}])
-        result,value=invoke({'operation':'register','task_id':'cli','spec':spec});self.assertEqual(result.returncode,0)
+        value=task.Store(self.a.codex_home,'cli').create('cli',spec)  # historical fixture; no new CLI registration
         reference=self.put_report('cli-report.json',self.report(value))
         result,reply=invoke({'operation':'verify-return','task_id':'cli',**reference});self.assertEqual(result.returncode,0);self.assertEqual(reply['status'],'bound')
         result,reply=invoke({'operation':'verify-effects','task_id':'cli','expected_revision':1,**reference});self.assertEqual(result.returncode,0);self.assertTrue(reply['accepted']);self.assertEqual(reply['steps']['a']['runs'],0)
         result,reply=invoke({'operation':'coordinate','task_ids':['cli']});self.assertEqual(result.returncode,0);self.assertFalse(reply['overall_complete'])
-        result,reply=invoke({'operation':'work','task_ids':['cli'],'expected_revisions':{'cli':reply['tasks']['cli']['revision']}});self.assertEqual(result.returncode,2);self.assertEqual(reply['executed'],[])
+        result,reply=invoke({'operation':'work','task_ids':['cli'],'expected_revisions':{'cli':reply['tasks']['cli']['revision']}});self.assertEqual(result.returncode,2);self.assertEqual(reply['status'],'retired_operation')
 
     def test_progress_dependency_requires_proof_without_changing_independent_actions(self):
         import execution_check as check

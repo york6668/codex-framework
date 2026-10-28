@@ -276,8 +276,22 @@ class TaskRuntimeTests(fixtures.FixtureCase):
         with mock.patch('task_runtime.os.kill',side_effect=ProcessLookupError), mock.patch('task_worker.inspect_session',return_value=self.worker()) as read, mock.patch('task_worker.execute',side_effect=AssertionError('unknown effect repeated')):
             value=task.resume(store)
         read.assert_called_once_with(original['session_id'],original['id'],str(self.root))
-        self.assertTrue(value['accepted'])
+        self.assertFalse(value['accepted'])
+        self.assertEqual(value['steps']['a']['state'], 'verified')
         self.assertEqual(value['steps']['a']['runs'],1)
+
+    def test_recovery_does_not_dispatch_ready_successors_or_sign_owner_acceptance(self):
+        steps = [{"id": name, "instruction": "Return result", "checks": [{"kind": "message", "equals": "42"}]} for name in ("a", "b")]
+        store, value = self.create(self.spec(steps))
+        value, execution = task.reserve(store, value["revision"])
+        store.update(value["revision"], lambda v: v["execution"].update(session_id="original-session"))
+        observed = dict(self.worker(), session_id="original-session")
+        with mock.patch("task_runtime.os.kill", side_effect=ProcessLookupError), mock.patch("task_worker.inspect_session", return_value=observed) as read, mock.patch("task_worker.execute", side_effect=AssertionError("retired model dispatch")):
+            recovered = task.resume(store)
+        self.assertEqual(read.call_count, 1)
+        self.assertEqual(recovered["steps"]["a"]["state"], "verified")
+        self.assertEqual(recovered["steps"]["b"]["runs"], 0)
+        self.assertFalse(recovered["accepted"])
 
     def test_repeated_resume_never_replays_a_validation_with_lost_receipt(self):
         command=[sys.executable,'-c',"from pathlib import Path;p=Path('once');p.write_text(p.read_text()+'x' if p.exists() else 'x')"]
@@ -665,15 +679,29 @@ class TaskRuntimeTests(fixtures.FixtureCase):
         with self.assertRaisesRegex(task.TaskError, "different task input"):
             self.mutate(store, "review", report_path=str(report), report_sha256=hashlib.sha256(report.read_bytes()).hexdigest())
 
-    def test_version_bound_installed_entry_contains_task_engine_and_rejects_accept_without_checks(self):
+    def test_installed_entry_retires_dispatch_but_preserves_original_recovery(self):
         revision = fixtures.seed_runtime(self.repo)
         runtime.install(self.a, revision)
         argv = [sys.executable, str(runtime.launcher_path(self.a)), "--home", str(self.a.home), "task"]
         def call(payload):
             return subprocess.run(argv, input=json.dumps(payload), text=True, capture_output=True, timeout=10)
-        registered = call({"operation": "register", "task_id": "entry", "spec": self.spec()})
-        self.assertEqual(registered.returncode, 0, registered.stderr)
-        value = json.loads(registered.stdout)
+        for operation in ("register", "run", "work"):
+            retired = call({"operation": operation, "task_id": "entry", "spec": self.spec()})
+            self.assertEqual(retired.returncode, 2, retired.stderr)
+            self.assertEqual(json.loads(retired.stdout)["status"], "retired_operation")
+            self.assertFalse((self.a.codex_home / "task-runtime").exists())
+        # Construct a historical record locally; no new CLI registration.
+        store = task.Store(self.a.codex_home, "entry")
+        value = store.create("entry", self.spec())
+        before = store.path.read_bytes()
+        status = call({"operation": "status", "task_id": "entry"})
+        self.assertEqual(status.returncode, 0, status.stderr)
+        self.assertEqual(json.loads(status.stdout)["task_id"], "entry")
+        self.assertEqual(store.path.read_bytes(), before)
+        recovered = call({"operation": "resume", "task_id": "entry"})
+        self.assertEqual(recovered.returncode, 2, recovered.stderr)
+        self.assertEqual(json.loads(recovered.stdout)["steps"]["a"]["runs"], 0)
+        self.assertEqual(store.path.read_bytes(), before)
         denied = call({"operation": "accept", "task_id": "entry", "expected_revision": value["revision"]})
         self.assertEqual(denied.returncode, 1)
         self.assertIn("mandatory current acceptance evidence missing", denied.stdout)

@@ -100,7 +100,7 @@ def inspect_session(session_id, execution_id, workspace=None):
             result["error"] = "original_native_turn_not_uniquely_found_in_bounded_page"
         else:
             turn = matches[0]
-            if not isinstance(turn.get("id"), str):
+            if not isinstance(turn.get("id"), str) or not turn["id"].strip():
                 raise ValueError("native_turn_identity_invalid")
             result["native_turn_id"] = turn["id"]
             finals = [item for item in turn["items"] if item.get("type") == "agentMessage" and item.get("phase") == "final_answer"]
@@ -113,12 +113,16 @@ def inspect_session(session_id, execution_id, workspace=None):
                 result["error"] = "native_permission_declined"
                 result["native_permission_declined"] = True
             elif turn.get("status") == "completed":
-                result["status"] = "completed"
-                result["message"] = finals[0].get("text", "") if len(finals) == 1 else ""
-                if not isinstance(result["message"], str) or len(result["message"].encode()) > 32768:
-                    result["message"] = ""
+                if turn.get("error") is not None:
+                    raise ValueError("native_completed_turn_has_error")
+                if len(finals) != 1 or ("truncated" in finals[0] and finals[0]["truncated"] is not False):
+                    raise ValueError("native_final_missing_ambiguous_or_truncated")
+                if not isinstance(finals[0].get("id"), str) or not finals[0]["id"].strip():
+                    raise ValueError("native_final_identity_missing")
+                message = finals[0].get("text")
+                if not isinstance(message, str) or len(message.encode()) > 32768:
                     raise ValueError("native_final_missing_or_too_large")
-                result["error"] = None if len(finals) == 1 else "final_text_identity_not_established"
+                result.update(status="completed", message=message, error=None, native_final_id=finals[0]["id"])
             elif turn.get("status") in ("failed", "interrupted"):
                 result["status"] = "failed"
                 result["error"] = "original_native_turn_" + turn["status"]
@@ -127,7 +131,7 @@ def inspect_session(session_id, execution_id, workspace=None):
                 result["error"] = "original_native_turn_still_active"
             result["native_turn_sha256"] = hashlib.sha256(json.dumps(turn, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
-        result["error"] = type(exc).__name__ + ": " + str(exc)
+        result.update(status="unknown", message="", error=type(exc).__name__ + ": " + str(exc))
     finally:
         selector.close()
         if child:

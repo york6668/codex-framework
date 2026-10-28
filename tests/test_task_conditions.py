@@ -237,7 +237,7 @@ class TaskConditionTests(FixtureCase):
         def invoke(payload):
             result=subprocess.run(command,input=json.dumps(payload),text=True,capture_output=True,timeout=10)
             return result.returncode,json.loads(result.stdout)
-        code,value=invoke({'operation':'register','task_id':'installed','spec':self.spec()});self.assertEqual(code,0)
+        value=task.Store(self.a.codex_home,'installed').create('installed',self.spec())  # existing recovery fixture
         code,value=invoke({'operation':'block','task_id':'installed','expected_revision':value['revision'],'step':'a',
                           'reason_kind':'dependency','condition_id':'input-ready','condition':'Input not available','evidence_ref':'synthetic:original'})
         self.assertEqual(code,0);self.assertEqual(value['restrictions'],[])

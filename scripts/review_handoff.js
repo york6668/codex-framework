@@ -168,6 +168,8 @@ function createReviewHandoff(sha256Utf8, receiveKnownFinal=null) {
     if(raw.structuredContent!==undefined) need(same(raw.structuredContent,b),"conflicting native envelope");
     need(object(b) && b.schemaVersion===1 && object(b.thread) && Array.isArray(b.turns),"unsupported native read schema");
     need(!Object.prototype.hasOwnProperty.call(b,"threadId"),"conflicting native read schemas");
+    if(b.page!==undefined) need(object(b.page) && typeof b.page.hasMore==="boolean" &&
+      (b.page.nextCursor===null || text(b.page.nextCursor)) && (!b.page.hasMore || text(b.page.nextCursor)),"native page shape");
     return {schema:"codex_app",body:b};
   }
   function cloudUnknown(b,target,originalTurn=null) {
@@ -247,6 +249,8 @@ function createReviewHandoff(sha256Utf8, receiveKnownFinal=null) {
       if(native.schema==="cloud_threads") return cloudUnknown(b,d.contract.request.target_thread);
       need(b.thread.id===d.contract.request.target_thread,"native thread mismatch");
       const matches=b.turns.filter(t=>object(t) && Array.isArray(t.items) && t.items.some(i=>delegated(i,d)));
+      if(matches.length===0 && b.page && b.page.hasMore) return {state:"unknown",native_read_schema:"codex_app",
+        reason:"original request is outside this page",next_cursor:b.page.nextCursor};
       need(matches.length===1,"native request turn missing or ambiguous");
       const t=matches[0], inputs=t.items.filter(i=>delegated(i,d));
       need(inputs.length===1 && text(inputs[0].id) && text(t.id),"native input missing or ambiguous");
@@ -286,11 +290,22 @@ function createReviewHandoff(sha256Utf8, receiveKnownFinal=null) {
   }
   function packet(body) {
     need(keys(body,["format","request","report","result"]) && body.format==="review-return-v1","return fields");
-    request(body.request); result(body.result);
-    need(keys(body.report,["ref","sha256","request_pointer","result_pointer"]) && text(body.report.ref) && sha(body.report.sha256),"report fields");
-    for(const k of ["request_pointer","result_pointer"]) need(typeof body.report[k]==="string" && body.report[k].startsWith("/"),"report pointers");
+    source({request:body.request,report:body.report}); result(body.result);
   }
-  function receiveReview(dispatches,selectedRequest,raw,readback) {
+  function source(value) {
+    need(keys(value,["request","report"]),"original result source fields"); request(value.request);
+    need(keys(value.report,["ref","sha256","request_pointer","result_pointer"]) && text(value.report.ref) && sha(value.report.sha256),"report fields");
+    for(const k of ["request_pointer","result_pointer"]) need(typeof value.report[k]==="string" && value.report[k].startsWith("/"),"report pointers");
+  }
+  function resultSource(observed,originalSource) {
+    if(originalSource!==null && originalSource!==undefined) {
+      source(originalSource); return {body:originalSource,legacy:false};
+    }
+    // Recovery of already issued v1 requests. Never extract JSON from prose or
+    // infer a missing source from a report's self-declared identity.
+    const body=parse(observed.text,true); packet(body); return {body,legacy:true};
+  }
+  function receiveReview(dispatches,selectedRequest,raw,readback,originalSource=null) {
     let chosen, pending=[];
     const answer=(binding,reason,extra={})=>({binding,reason,coverage:"unknown",result_acceptance:"unreviewed",
       accepted_requests:[],pending_requests:pending,preserve_completed_work:true,independent_work_may_continue:true,...extra});
@@ -306,14 +321,15 @@ function createReviewHandoff(sha256Utf8, receiveKnownFinal=null) {
     } catch(e) { if(e.name!=="ReviewHandoffError") throw e; return answer("unknown",e.message); }
     const observed=observeReview(chosen,raw);
     if(observed.state!=="observed") return answer("unknown",observed.reason,
-      observed.native_read_schema==="cloud_threads" ? {native_read_schema:observed.native_read_schema,next_cursor:observed.next_cursor} : {});
+      observed.native_read_schema ? {native_read_schema:observed.native_read_schema,next_cursor:observed.next_cursor} : {});
     const supersedes=chosen.contract.supersedes;
     const retired=supersedes && dispatches.some(d=>same(d.contract.request,supersedes)) ? [supersedes] : [];
     pending=pending.filter(r=>!retired.some(s=>same(s,r)));
+    if(originalSource==null && !observed.text.startsWith("{"))
+      return answer("unknown","original result reference unavailable",{native_final_ref:observed.final_ref});
     try {
-      const body=parse(observed.text,true); packet(body);
+      const located=resultSource(observed,originalSource), body=located.body;
       need(same(body.request,selectedRequest),"current request not returned");
-      need(same(body.result.subjects,chosen.contract.subjects),"report input subjects mismatch");
       if(readback===null || readback===undefined || (object(readback) && readback.truncated===true))
         return answer("unknown","original report readback unavailable or truncated",{native_final_ref:observed.final_ref});
       need(object(readback) && keys(readback,["ref","text","truncated","evidence"]) && readback.truncated===false &&
@@ -321,27 +337,29 @@ function createReviewHandoff(sha256Utf8, receiveKnownFinal=null) {
       need(hash(readback.text)===body.report.sha256,"report readback fingerprint mismatch");
       const report=parse(readback.text);
       need(same(pointer(report,body.report.request_pointer),body.request),"report original request mismatch");
-      need(same(pointer(report,body.report.result_pointer),body.result),"report original result mismatch");
+      const actual=pointer(report,body.report.result_pointer); result(actual);
+      need(same(actual.subjects,chosen.contract.subjects),"report input subjects mismatch");
+      if(located.legacy) need(same(actual,body.result),"report original result mismatch");
       need(Array.isArray(readback.evidence) && readback.evidence.length<=128,"evidence readbacks unavailable");
       const evidenceKeys=new Set();
       for(const e of readback.evidence) {
         need(keys(e,["ref","text","truncated"]) && text(e.ref) && e.truncated===false && typeof e.text==="string","evidence readback fields");
         need(!evidenceKeys.has(e.ref),"duplicate evidence readback"); evidenceKeys.add(e.ref);
       }
-      for(const a of body.result.answers) for(const e of a.evidence) {
+      for(const a of actual.answers) for(const e of a.evidence) {
         const rb=readback.evidence.find(x=>x.ref===e.ref);
         need(rb && hash(rb.text)===e.sha256,"evidence reference/fingerprint mismatch");
       }
       const obligations=chosen.contract.questions.flatMap(q=>q.object_keys.map(k=>canon([k,q.question_key])));
-      need(body.result.answers.every(a=>obligations.includes(canon([a.object_key,a.question_key]))),"unrequested answer object/question");
-      const missing=obligations.filter(k=>!body.result.answers.some(a=>canon([a.object_key,a.question_key])===k));
-      const incomplete=body.result.answers.filter(a=>!["completed","failed"].includes(a.status));
-      return answer("bound","current_input_report_and_whole_final_bound",{
+      need(actual.answers.every(a=>obligations.includes(canon([a.object_key,a.question_key]))),"unrequested answer object/question");
+      const missing=obligations.filter(k=>!actual.answers.some(a=>canon([a.object_key,a.question_key])===k));
+      const incomplete=actual.answers.filter(a=>!["completed","failed"].includes(a.status));
+      return answer("bound","current_input_and_original_report_bound",{
         coverage:missing.length || incomplete.length?"partial":"complete",missing_obligations:missing.map(x=>JSON.parse(x)),
         incomplete_answers:incomplete.map(a=>({object_key:a.object_key,question_key:a.question_key,status:a.status})),
         superseded_requests:retired,request:selectedRequest,native_final_ref:observed.final_ref,
         native_turn_id:observed.turn_id,native_input_ref:observed.input_ref,final_utf8_sha256:observed.final_utf8_sha256,
-        report_sha256:body.report.sha256,result:body.result});
+        report_sha256:body.report.sha256,result:actual});
     } catch(e) { if(e.name!=="ReviewHandoffError") throw e; return answer("rejected",e.message,{native_final_ref:observed.final_ref}); }
   }
   async function readReview(dispatches,selectedRequest,io) {
@@ -354,19 +372,21 @@ function createReviewHandoff(sha256Utf8, receiveKnownFinal=null) {
     dispatch(chosen);
     let raw;
     try { raw=await io.readNative(selectedRequest.target_thread); }
-    catch(e) { return {evaluation:{...receiveReview(dispatches,selectedRequest,null,null),reason:"original native read threw; inspect original operation"},native_readback:null}; }
+    catch(e) { return {evaluation:{...receiveReview(dispatches,selectedRequest,null,null),reason:"original native read threw; inspect original operation"}}; }
     const observed=observeReview(chosen,raw);
     let report=null;
     if(observed.state==="observed") {
       try {
-        const body=parse(observed.text,true); packet(body);
+        const located=resultSource(observed,io.source), body=located.body;
         // Validate identity before invoking the caller's bounded/authorised reader.
-        if(same(body.request,selectedRequest) && same(body.result.subjects,chosen.contract.subjects)) {
+        if(same(body.request,selectedRequest) && (!located.legacy || same(body.result.subjects,chosen.contract.subjects))) {
           try { report=await io.readReport(body.report.ref); } catch(e) { report=null; }
         }
       } catch(e) { if(e.name!=="ReviewHandoffError") throw e; }
     }
-    return {evaluation:receiveReview(dispatches,selectedRequest,raw,report),native_readback:raw};
+    // Raw tool output and report/evidence bytes remain in the caller's local
+    // read operation. Return only the requested result and native references.
+    return {evaluation:receiveReview(dispatches,selectedRequest,raw,report,io.source)};
   }
   function decideReview(bound,decision) {
     need(object(bound) && bound.binding==="bound","bound result required");

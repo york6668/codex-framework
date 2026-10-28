@@ -151,9 +151,9 @@ def _result(result, contract, evidence_readbacks):
     _text(result["next_scope"], "next scope")
 
 
-def produce_review(prompt, report_ref, report_readback, *, request_pointer,
-                   result_pointer, evidence_readbacks):
-    """Call at the worker's original report finalisation/readback; no writes.
+def review_source(prompt, report_ref, report_readback, *, request_pointer,
+                  result_pointer, evidence_readbacks):
+    """Return a locator from the original report readback; no writes or sending.
 
     Missing/not_run answers are legal and remain partial at the receiver. Neither
     producer nor receiver confers substantive acceptance from report self-labels.
@@ -173,10 +173,24 @@ def produce_review(prompt, report_ref, report_readback, *, request_pointer,
         raise ReceiptError("report original request mismatch")
     result = _pointer(report, result_pointer)
     _result(result, c, evidence_readbacks)
-    body = canonical({"format": "review-return-v1", "request": c["request"],
+    return {"request": c["request"],
         "report": {"ref": report_ref, "sha256": hashlib.sha256(report_readback).hexdigest(),
-                   "request_pointer": request_pointer, "result_pointer": result_pointer},
-        "result": result})
+                   "request_pointer": request_pointer, "result_pointer": result_pointer}}
+
+
+def produce_review(prompt, report_ref, report_readback, *, request_pointer,
+                   result_pointer, evidence_readbacks):
+    """Compatibility for already issued review-return-v1 requests only.
+
+    New callers retain review_source() in their original result record and let
+    the human-facing final describe the result. Neither path grants permission
+    to expose the report, evidence or unrelated fields to a model or another chat.
+    """
+    source = review_source(prompt, report_ref, report_readback,
+                           request_pointer=request_pointer, result_pointer=result_pointer,
+                           evidence_readbacks=evidence_readbacks)
+    body = canonical({"format": "review-return-v1", **source,
+                      "result": _pointer(_decode(report_readback), result_pointer)})
     if len(body.encode()) > MAX_BYTES:
         raise ReceiptError("final too large")
     return body
