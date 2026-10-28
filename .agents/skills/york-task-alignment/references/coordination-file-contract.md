@@ -36,7 +36,7 @@
 
 若原 owner 已约定另一个锁，binding 可显式附 `lock_path`，必须为同父目录下另一个规范绝对文件路径。例如原共识写入者用 `/explicit/authorised/agreements.lock`，继续使用该同一锁；不猜锁路径，也不在另一锁下并行写。未指定时默认 `<path>.coordination.lock`。选择锁仍不转移写入责任，实际采用前由原 owner 确认承接。各 kind 只解释自己的字段；例如 agreements/tasks 已有同名 goals 扩展仍是受保护私有扩展。既有快照根字段及 task 行的未知扩展字段完整保留（扩展值内的嵌套内容一并比较），删除或改变扩展语义走原适配器；不能因只知道最小 schema 就丢弃源分组、保护约束或领域元数据。
 
-已有 `format=1` Task Store 的任务/进度继续使用 `codex-framework task` 的 status、amend、原结果核收等既有入口，按原 expected_revision 和输入契约操作。`coordination read/commit` 不接受它为 tasks 快照，拒写是防止误迁移；不要为绕过格式错误另造 tasks/progress 权威副本。仅通过原字段引用/内存投影消费该记录，是否需要未来只读映射由真实消费者缺口决定。
+已有 `format=1` Task Store 保持原位，旧 `task` 命令已归档退出当前入口。原责任按准确文件与原生身份读取原结果，仍有效义务在已有原生任务和原权威中承接；不改旧拒绝、未决效果或核收标志。`coordination read/commit` 不接受它为 tasks 快照，拒写是防止误迁移；不要为绕过格式错误另造 tasks/progress 权威副本。仅通过原字段引用消费该记录，历史代码与协议从原仓或原节点的已批准版本找回，不由本文件工具恢复执行。
 
 事件写入使用 `expected_last_seq`，不能混用 snapshot expected_revision：
 

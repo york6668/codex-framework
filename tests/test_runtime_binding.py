@@ -180,7 +180,7 @@ fcntl.flock = observe_flock
     def test_loader_legacy_templates_upgrade_rollback_and_previous_installer_handoff(self):
         path = self.repo / "scripts/framework_runtime.py"
         current = path.read_text()
-        for count in (7, 9, 10, 12):
+        for count in (7, 9, 10, 12, 13, 8):
             with self.subTest(modules=count):
                 # Construct the supported old closure and append-mode loader;
                 # an old installer emits its own template during a handoff.
@@ -190,31 +190,48 @@ fcntl.flock = observe_flock
                 declaration = next(n for n in ast.parse(legacy).body if isinstance(n, ast.Assign)
                                    and isinstance(n.targets[0], ast.Name) and n.targets[0].id == "MODULES")
                 lines = legacy.splitlines(keepends=True)
-                lines[declaration.lineno - 1:declaration.end_lineno] = ["MODULES = " + repr(runtime.MODULES[:count]) + "\n"]
+                old_modules = runtime.MODULES if count == 8 else runtime.LEGACY_RUNTIME_MODULES[:count]
+                lines[declaration.lineno - 1:declaration.end_lineno] = ["MODULES = " + repr(old_modules) + "\n"]
                 path.write_text("".join(lines))
-                run_git(self.repo, "add", str(path))
+                # Only historical package identities are exercised. Retired
+                # engine implementations are not copied back into the source.
+                for name in set(old_modules) - set(runtime.MODULES):
+                    put(self.repo / "scripts" / name, '"""Inactive historical package fixture."""\n')
+                run_git(self.repo, "add", "scripts")
                 run_git(self.repo, "commit", "-m", "synthetic legacy loader " + str(count))
                 previous = run_git(self.repo, "rev-parse", "HEAD")
                 f = cf.Framework(self.repo, self.root / ("legacy-device-" + str(count)))
+                historical = {"task-runtime/original.json": '{"accepted":false,"input_revision":4}\n',
+                              "task-runtime/.effects.json": '{"state":"uncertain","reason":"explicit_denial"}\n'}
+                for name, body in historical.items():
+                    put(f.codex_home / name, body)
                 installed = self.source_cli("install", "--revision", previous, f=f)
                 self.assertEqual(installed.returncode, 0, installed.stdout + installed.stderr)
                 old_launcher = runtime.launcher_path(f).read_bytes()
                 self.assertEqual(json.loads(self.cli("sync-status", f=f).stdout)["runtime"]["tool_revision"], previous)
+                for name, body in historical.items():
+                    self.assertEqual((f.codex_home / name).read_text(), body)
                 path.write_text(current)
-                run_git(self.repo, "add", str(path))
+                for name in set(old_modules) - set(runtime.MODULES):
+                    (self.repo / "scripts" / name).unlink()
+                run_git(self.repo, "add", "scripts")
                 run_git(self.repo, "commit", "-m", "new read-only loader " + str(count))
                 revision = run_git(self.repo, "rev-parse", "HEAD")
                 installed = self.source_cli("install", "--revision", revision, "--expected-runtime", previous, f=f)
                 self.assertEqual(installed.returncode, 0, installed.stdout + installed.stderr)
                 self.assertEqual(runtime.launcher_path(f).read_bytes(), runtime.loader_bytes(f))
                 self.assertEqual(json.loads(self.cli("sync-status", f=f).stdout)["runtime"]["tool_revision"], revision)
+                for name, body in historical.items():
+                    self.assertEqual((f.codex_home / name).read_text(), body)
                 rollback = self.cli("runtime-rollback", "--revision", previous, "--expected-runtime", revision, f=f)
                 self.assertEqual(rollback.returncode, 0, rollback.stdout + rollback.stderr)
                 self.assertEqual(runtime.launcher_path(f).read_bytes(), old_launcher)
                 self.assertEqual(json.loads(self.cli("sync-status", f=f).stdout)["runtime"]["tool_revision"], previous)
+                for name, body in historical.items():
+                    self.assertEqual((f.codex_home / name).read_text(), body)
                 hook = self.source_cli("install-hook", f=f)
                 self.assertEqual(hook.returncode, 0, hook.stdout + hook.stderr)
-                if count != len(runtime.MODULES):
+                if old_modules != runtime.MODULES:
                     # An old smaller closure cannot approve a future closure;
                     # migration uses the supported new-source installer.
                     installed = self.source_cli("install", "--revision", revision,
@@ -655,26 +672,21 @@ fcntl.flock = observe_flock
         self.assertEqual(result.returncode, 1)
         self.assertNotIn("Traceback", result.stderr)
 
-        # Both moved responsibilities must execute from the installed package,
-        # even when the checkout's versions are unusable. The pure view must
-        # still leave the task store absent.
-        from test_delivery_view import DeliveryViewTests
-        for name in ("task_results.py", "delivery_relations.py"):
-            (self.repo / "scripts" / name).write_text("raise AssertionError('unmanaged checkout import')\n")
-        result = self.cli("task", payload=DeliveryViewTests().request())
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        projected = json.loads(result.stdout)
-        self.assertTrue(projected["complete"])
-        self.assertFalse(projected["summary_is_execution_gate"])
-        self.assertEqual(projected["effect"], "pure_projection_no_store_or_tool_calls")
+        # Retired commands cannot reintroduce a task store or dispatch even if
+        # a checkout still has old source. Installed current capabilities stay
+        # independent of that checkout.
+        put(self.repo / "scripts/task_runtime.py", "raise AssertionError('retired checkout import')\n")
+        result = self.cli("task", payload={"operation": "work"})
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("invalid choice", result.stderr)
         self.assertFalse((self.a.codex_home / "task-runtime").exists())
 
-    def test_result_modules_reject_bad_source_and_managed_payloads(self):
+    def test_current_modules_reject_bad_source_and_managed_payloads(self):
         installed = self.source_cli("install", "--revision", self.p)
         self.assertEqual(installed.returncode, 0, installed.stdout + installed.stderr)
         before = self.installed_state(), runtime.launcher_path(self.a).read_bytes()
         marker = self.root / "unapproved-result-code-executed"
-        for name in ("task_results.py", "delivery_relations.py"):
+        for name in ("coordination_files.py", "source_evidence.py"):
             for problem in ("missing", "mode", "symlink"):
                 with self.subTest(module=name, source=problem):
                     run_git(self.repo, "reset", "--hard", self.p)
@@ -706,7 +718,7 @@ fcntl.flock = observe_flock
                         path.unlink()
                         if problem == "symlink":
                             path.symlink_to(marker)
-                    rejected = self.cli("task", payload={"operation": "delivery-view"})
+                    rejected = self.cli("coordination", payload={"operation": "read"})
                     self.assertEqual(rejected.returncode, 1, rejected.stdout + rejected.stderr)
                     unavailable = json.loads(rejected.stdout)
                     self.assertEqual(unavailable["status"], "runtime-unavailable")

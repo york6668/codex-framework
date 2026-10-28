@@ -16,7 +16,7 @@ import tempfile
 
 REMOTE = "https://github.com/york6668/codex-framework.git"
 BRANCH = "york-worktree/Codex框架共享"
-RELEASE_VERSION = "0.4.0"
+RELEASE_VERSION = "0.5.0"
 SKILLS = (
     "york-codex-policy-maintenance", "york-cross-repo-change", "york-engineering", "york-java-test",
     "york-local-data", "york-log-query", "york-provider-docs", "york-safe-delivery",
@@ -316,7 +316,7 @@ def main(argv=None):
     parser.add_argument("--codex-home", type=Path, help="显式指定目标 Codex home")
     parser.add_argument("command", choices=("version", "status", "install", "apply", "pull", "export",
                         "sync-status", "refresh", "install-hook", "session-start", "check",
-                        "workstation-check", "workstation-entry", "runtime-recover", "runtime-rollback", "task", "coordination"))
+                        "workstation-check", "workstation-entry", "runtime-recover", "runtime-rollback", "coordination"))
     parser.add_argument("--apply", action="store_true", help="pull 后应用；否则仅预览差异")
     parser.add_argument("--snapshot", type=Path, help="原生连接取得的完整共享内容快照")
     parser.add_argument("--revision", help="原生连接刚读取的发布提交 SHA")
@@ -342,9 +342,6 @@ def main(argv=None):
         from coordination_files import dispatch
         return dispatch()
     codex_home = args.codex_home or (os.environ.get("CODEX_HOME") if args.home is None else None)
-    if args.command == "task":
-        from task_runtime import dispatch
-        return dispatch(codex_home or (args.home or Path.home()) / ".codex")
     if args.command == "workstation-entry":
         from workstation_entry import dispatch
         return dispatch(codex_home or (args.home or Path.home()) / ".codex")

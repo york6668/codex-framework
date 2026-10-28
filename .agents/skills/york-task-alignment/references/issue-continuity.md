@@ -13,7 +13,7 @@
 ## 每个真实机会的工作流
 
 1. **识别及历史。** 新用户纠正、失败/拒绝/UNKNOWN、阶段返回、发布采用、恢复、复发、自然回合触发模型判断。先关联已有具体问题，核历次修复的机制、版本/节点/输入、复测范围、复发及领域影响。相似现象不先合并根因；时间过去不证明失败，缺少返回不等于失败。
-2. **核原结果。** 读取原任务当前输入、在途/终态、匹配产物及原 owner 的有限核收。事实、未核假设、计划、实际执行结果分开。依赖步骤必须取得适用对象/节点/产品及内容版本/请求/input_revision 的真实返回和新鲜源观察；重读不刷新源事实。复用原生读回或 `check` 的适用能力，普通任务不补登记；旧 Task Store 仅按[原结果交接](result-handoff.md)核对原身份、结果和必要恢复，已退役的 `task register/run/work` 不再作为执行入口。缺失、过期、错绑、截断、UNKNOWN、ACK、预计 PASS、历史成功均不能代理本次成功；先取证，真正独立的工作继续。
+2. **核原结果。** 读取原任务当前输入、在途/终态、匹配产物及原 owner 的有限核收。事实、未核假设、计划、实际执行结果分开。依赖步骤必须取得适用对象/节点/产品及内容版本/请求/input_revision 的真实返回和新鲜源观察；重读不刷新源事实。复用原生读回或 `check` 的适用能力，普通任务不补登记；旧 Task Store 仅按[原结果交接](result-handoff.md)核对原身份、结果和必要恢复，已归档的 `task` 执行链不再作为当前入口。缺失、过期、错绑、截断、UNKNOWN、ACK、预计 PASS、历史成功均不能代理本次成功；先取证，真正独立的工作继续。
 3. **模型选择。** 对照本问题根治标准与实际证明，解释因果未明项、已排除路径、尚未探索且合法的路径、真实依赖及什么新增证据会改变结论。具体路径说明能区分哪些解释、对象/目的地/副作用、实际入口及授权依据。字段校验、修复次数和提示词不能代替模型判断。旁支缺陷修好仍核它是否解释原失败；观测不足仍查独立合法路径。
 4. **行动及有界分派。** 本范围可做就执行；确需原责任时，只沿已有消息授权及受支持的原入口交有限输入、范围和验收。先核在途及原效果，不因新任务名、sender、问题名或调度轮重派。选定路径、建议、消息 ACK 各自只证明该阶段，不填成已执行。原责任回收真实返回后再判断。工程范围及时交付，不能把其他系统修复塞入一个大任务。
 5. **逐问题关闭及复发。** 调查完成只关闭调查，阶段 PASS 不关闭根治。只有该具体问题的标准与适用实质核收支持才关闭；补丁或分类不联动关闭他项。复发关联同一问题，保留原修复、关闭与适用版本/节点，重新判断和复测，不直接重用旧 PASS。
@@ -49,7 +49,7 @@ path 可用 `basis_refs` 指明与该效果相关的实际源修订，避免无�
 
 attempts 仅记录实际动作的 `id/action/result/basis_refs/evidence_refs`，result=done/failed/denied/unknown。计划或 ACK 不填 done。拒绝/UNKNOWN 按原效果跨问题/路径 ID 保留；本帮助器不提供清除限制接口。
 
-原 Task Store 的普通条件与停止/拒绝按[条件方法](task-conditions.md)分流，原责任核真实满足后仅解除对应条件。新验证返回后重新读原事项、刷新本轮依赖及下一动作；已经满足的缺口不继续沿用旧 BLOCKED/等待。原系统状态由原写入者在授权内更新并读回，问题侧只补相应引用；记录回写失败先核已发生效果，不能重放领域动作补账。需要记录 UNKNOWN 已核结果时，review 可附 `reconciliations[{id,attempt_ref,action,result,evidence_refs,proof}]`，attempt_ref 使用 `{goal_id,review_id,attempt_id}` 结构身份；旧斜杠字符串只在所有所给原尝试中唯一可拆解时兼容，歧义不解除任何拒绝或 UNKNOWN，result=committed/not_executed。proof 仍用核心原件校验；expected_scope 还须包含 original_attempt_ref、effect_action、effect_outcome 并与原结果完全一致。核明已提交就不重放，核明未执行只消除这个 UNKNOWN 观察缺口，实际重试仍按原授权/入口及新证据判断；拒绝不被 reconciliation 清除，也不回写原 Task Store/effects。冲突或未证实继续未决。
+原任务的普通条件与停止/拒绝按[条件方法](task-conditions.md)分流，原责任在原权威核真实满足后仅解除对应条件；已归档 Task Store 与受拒写回保持原位。新验证返回后重新读原事项、刷新本轮依赖及下一动作；已经满足的缺口不继续沿用旧 BLOCKED/等待。原系统状态由原写入者在授权内更新并读回，问题侧只补相应引用；记录回写失败先核已发生效果，不能重放领域动作补账。需要记录 UNKNOWN 已核结果时，review 可附 `reconciliations[{id,attempt_ref,action,result,evidence_refs,proof}]`，attempt_ref 使用 `{goal_id,review_id,attempt_id}` 结构身份；旧斜杠字符串只在所有所给原尝试中唯一可拆解时兼容，歧义不解除任何拒绝或 UNKNOWN，result=committed/not_executed。proof 仍用核心原件校验；expected_scope 还须包含 original_attempt_ref、effect_action、effect_outcome 并与原结果完全一致。核明已提交就不重放，核明未执行只消除这个 UNKNOWN 观察缺口，实际重试仍按原授权/入口及新证据判断；拒绝不被 reconciliation 清除，也不回写原 Task Store/effects。冲突或未证实继续未决。
 
 decision 由模型选择：act 带 path_id/owner_ref/reason；wait 带 owner_ref/reason 及 `resume_when[{source_ref,condition,owner_ref}]`；close 还需原 owner 的 acceptance_ref、全部本问题标准已满足和必需因果问题已解。`CLOSED_IN_SUPPLIED_RECORDS` 只说明所给关系支持，不能认证身份、原因真实性或领域验收。recurrence 本轮重开，不能直接复用旧关闭。
 

@@ -86,7 +86,7 @@ python3 "$HOME/work/codex-framework/scripts/codex_framework.py" install
 
 ## 固定版本运行与恢复
 
-`install` 按 `scripts/framework_runtime.py` 的 `MODULES` 唯一声明部署完整 CLI 闭包（当前 13 个模块，含 `coordination_files.py`）；从旧受管入口升级时，先按原活动指针、已批准包指纹及完整包校验，静态还原原入口模板并逐字匹配，随后由标准安装事务更新；未知或已改入口保持阻塞；`acceptance_capture` 是独立工具，不在运行闭包。每个完整提交在 Codex home 的 `framework-sync/runtime/versions/<commit>/` 保存模块、正文快照和 hash/模式/输入契约 manifest。`active.json` 指向一个已校验版本，`approved.json` 保存已校验版本的 manifest hash。正常 `$HOME/.local/bin/codex-framework` 是无仓库导入的稳定 loader，每次先固定物理目录、核对整个包，再导入；旧进程继续使用原目录。
+`install` 按 `scripts/framework_runtime.py` 的 `MODULES` 唯一声明部署完整 CLI 闭包（当前 8 个模块，含 `coordination_files.py`）；从旧受管入口升级时，先按原活动指针、已批准包指纹及完整包校验，静态还原原入口模板并逐字匹配，随后由标准安装事务更新；未知或已改入口保持阻塞；`acceptance_capture` 是独立工具，不在运行闭包。每个完整提交在 Codex home 的 `framework-sync/runtime/versions/<commit>/` 保存模块、正文快照和 hash/模式/输入契约 manifest。`active.json` 指向一个已校验版本，`approved.json` 保存已校验版本的 manifest hash。正常 `$HOME/.local/bin/codex-framework` 是无仓库导入的稳定 loader，每次先固定物理目录、核对整个包，再导入；旧进程继续使用原目录。
 
 ```sh
 # 已核对且存在于本地 Git 的发布分支头；首次 expected-runtime 使用 none。
@@ -140,7 +140,7 @@ python3 /path/to/codex-framework/scripts/codex_framework.py install \
 
 当前持续工作使用已有 Codex 原生任务和调度。原生平台持有执行机会、thread/turn/item 身份、启停和工具权限；模型在实际回合读取原需求、回收原结果、由责任方核收并推进合法后继。业务事实写回原系统，文件和自报字段不提供唤醒或权限，不为同一工作另建执行入口。
 
-`task-runtime` 自建执行入口自 0.4.0 起停止新登记与模型运行：`task register/run/work` 返回 `retired_operation`，不创建记录、不派发、不重放。原有 `task-runtime/` 数据及版本包保持原位。仍有历史消费者或未决效果时，必要的 `status`、仅恢复原执行的 `resume`、原结果核对/收取和条件修复暂保兼容；它们只处理原身份，不作为新任务的登记或调度方式；`resume` 不再派发就绪后继或自动签署核收。
+`task-runtime` 已归档：0.4.0 停止新登记与模型运行；在已知消费者完成核对、原生入口实际承接后，0.5.0 移除 `task` 命令及其五个执行模块，当前安装包和导出不再包含旧执行链。已有 `task-runtime/` 数据、拒绝、UNKNOWN 及历史运行包保持原位，不转换状态、不补发动作。原结果和仍有效义务由原生任务及原责任记录承接；历史源码与协议可从原仓 0.4.0 内容修订 `2c2dce5bfee549012e5cde8536c62dfdcd6855e7` 找回。历史包可恢复不构成重新启用旧执行或获准清账；明确需要回退时仅恢复框架代码和正文，不覆盖节点业务状态。
 
 退役按已确认节点和明确来源逐项核对：有效义务由谁承接、原结果能否找回、未知效果如何核对、正常原生入口是否实际运行。单节点无目录不能证明其他节点无任务。核清之前不删除记录或旧版本，不批量重放；核清并完成替代验证的范围再退出安装模块和剩余兼容实现。历史协议见 [0.3.6 原版本](https://github.com/york6668/codex-framework/blob/ec8e228c0227b524aebabf0ec23232f8af8effe9/README.md#持久任务执行入口)，仅用于恢复已有对象，不引导新任务使用。回退运行代码不覆盖业务状态，也不恢复旧任务的执行授权。
 
@@ -197,6 +197,6 @@ python3 -m unittest discover -s tests -v
 
 可选的 `review_handoff.py/js` 由原调用者在已授权读取中使用，具体见[原结果交接](.agents/skills/york-task-alignment/references/result-handoff.md)。库不增加平台回调、队列或权限，也不注册全局拦截。旧 `review-return-v1` 和有限结果回执仅保留已有请求兼容；新工作不要求 final 与整段 JSON 相同。
 
-当前受管 CLI 模块由 `scripts/framework_runtime.py:MODULES` 声明，共 13 个；七模块仅指早期兼容版本。交接库不在此闭包中，CLI/正文安装不能证明调用者已加载它。节点实际采用须核对对应源码版本及真实调用。后续完整退役以已核消费者及恢复责任为依据，不能仅按模块数量裁剪。
+当前受管 CLI 模块由 `scripts/framework_runtime.py:MODULES` 声明，共 8 个；7、9、10、12、13 模块闭包仅用于核对已批准的历史运行包和回退。交接库不在此闭包中，CLI/正文安装不能证明调用者已加载它。节点实际采用须核对对应源码版本及真实调用；历史恢复不清除原拒绝或 UNKNOWN。
 
 取证与交接须分别核对本地读取、模型上下文、跨聊天和公开发布边界，见[数据流方法](.agents/skills/york-workstation/references/environment-sync.md#读取模型上下文交接与发布)。本机执行不等于内容仅留本机。测试用临时生成标记，验证工具输出和交接只带本任务允许的最小内容；历史处理范围未知时单独保留。

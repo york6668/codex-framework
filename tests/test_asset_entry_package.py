@@ -28,7 +28,7 @@ class AssetEntryPackageTests(FixtureCase):
         self.assertEqual(installed.returncode, 0, installed.stdout + installed.stderr)
         directory = runtime.version_path(self.a, revision)
         manifest = json.loads((directory / "manifest.json").read_text())
-        self.assertEqual(len(runtime.MODULES), 13)
+        self.assertEqual(len(runtime.MODULES), 8)
         self.assertEqual(set(manifest["files"]),
                          {"scripts/" + x for x in runtime.MODULES} | {"snapshot.json"})
         self.assertFalse((directory / "adapters").exists())

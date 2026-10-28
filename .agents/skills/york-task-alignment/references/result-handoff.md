@@ -14,6 +14,8 @@
 
 ## 兼容、核收和恢复
 
+旧 `task-runtime` 已归档退出当前命令入口和安装包；历史 Task Store/effects、原结果及已批准版本包保留原位。恢复先读原身份和效果，仍有效义务由现有原生任务与原责任承接，不恢复旧执行链、不迁改原拒绝或 UNKNOWN。此处的请求格式兼容属于结果读取，不能作为旧执行器入口。
+
 已发出的 `review-return-v1` 可继续使用 `produce_review` 与无 source 的旧读取方式核对，严格旧格式不迁改历史请求；有限结果回执也只保留原请求恢复。新请求不借此预填未知结果，不从 final 反造请求。来源缺失保留 UNKNOWN；定位冲突拒收，不自动重发或改目标。
 
 `receiveReview` 只做关系绑定，不自动实质 accepted。`decideReview` 由原责任根据真实证据决定，未答/limited/blocked/not_run/unknown 仍为 partial。修订只替代明确指定的同发送者原请求；其他请求、有效旧结果、拒绝及恢复责任继续保留。旧输入的结果不能满足新义务。
