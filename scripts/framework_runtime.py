@@ -22,7 +22,8 @@ FORMAT = 1
 INPUT_CONTRACT = 1
 MODULES = ("codex_framework.py", "execution_check.py", "framework_refresh.py",
            "source_evidence.py", "workstation_check.py", "workstation_entry.py",
-           "framework_runtime.py", "coordination_files.py")
+           "framework_runtime.py", "coordination_files.py", "usage_guard.py")
+PRE_GUARD_MODULES = MODULES[:-1]
 # Historical package identities remain readable for approved rollback. They do
 # not add retired code to a new package or migrate any node-owned task records.
 LEGACY_RUNTIME_MODULES = ("codex_framework.py", "execution_check.py", "framework_refresh.py",
@@ -31,7 +32,7 @@ LEGACY_RUNTIME_MODULES = ("codex_framework.py", "execution_check.py", "framework
            "task_results.py", "delivery_relations.py", "coordination_files.py")
 LEGACY_MODULES = LEGACY_RUNTIME_MODULES[:7]
 SUPPORTED_MODULES = (LEGACY_MODULES, LEGACY_RUNTIME_MODULES[:9], LEGACY_RUNTIME_MODULES[:10],
-                     LEGACY_RUNTIME_MODULES[:12], LEGACY_RUNTIME_MODULES, MODULES)
+                     LEGACY_RUNTIME_MODULES[:12], LEGACY_RUNTIME_MODULES, PRE_GUARD_MODULES, MODULES)
 SHA = re.compile(r"[0-9a-f]{40}\Z")
 
 
@@ -291,7 +292,10 @@ LEGACY_MODULES = ("codex_framework.py", "execution_check.py", "framework_refresh
                  "framework_runtime.py", "task_runtime.py", "task_worker.py", "task_coordination.py",
                  "task_results.py", "delivery_relations.py", "coordination_files.py")
 SUPPORTED_MODULES = (LEGACY_MODULES[:7], LEGACY_MODULES[:9], LEGACY_MODULES[:10],
-                     LEGACY_MODULES[:12], LEGACY_MODULES, MODULES)
+                     LEGACY_MODULES[:12], LEGACY_MODULES,
+                     ("codex_framework.py", "execution_check.py", "framework_refresh.py",
+                      "source_evidence.py", "workstation_check.py", "workstation_entry.py",
+                      "framework_runtime.py", "coordination_files.py"), MODULES)
 
 def read(path):
     for item in (path, *path.parents):

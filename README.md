@@ -86,7 +86,7 @@ python3 "$HOME/work/codex-framework/scripts/codex_framework.py" install
 
 ## 固定版本运行与恢复
 
-`install` 按 `scripts/framework_runtime.py` 的 `MODULES` 唯一声明部署完整 CLI 闭包（当前 8 个模块，含 `coordination_files.py`）；从旧受管入口升级时，先按原活动指针、已批准包指纹及完整包校验，静态还原原入口模板并逐字匹配，随后由标准安装事务更新；未知或已改入口保持阻塞；`acceptance_capture` 是独立工具，不在运行闭包。每个完整提交在 Codex home 的 `framework-sync/runtime/versions/<commit>/` 保存模块、正文快照和 hash/模式/输入契约 manifest。`active.json` 指向一个已校验版本，`approved.json` 保存已校验版本的 manifest hash。正常 `$HOME/.local/bin/codex-framework` 是无仓库导入的稳定 loader，每次先固定物理目录、核对整个包，再导入；旧进程继续使用原目录。
+`install` 按 `scripts/framework_runtime.py` 的 `MODULES` 唯一声明部署完整 CLI 闭包（当前 9 个模块，含 `coordination_files.py` 和 `usage_guard.py`）；从旧受管入口升级时，先按原活动指针、已批准包指纹及完整包校验，静态还原原入口模板并逐字匹配，随后由标准安装事务更新；未知或已改入口保持阻塞；`acceptance_capture` 是独立工具，不在运行闭包。每个完整提交在 Codex home 的 `framework-sync/runtime/versions/<commit>/` 保存模块、正文快照和 hash/模式/输入契约 manifest。`active.json` 指向一个已校验版本，`approved.json` 保存已校验版本的 manifest hash。正常 `$HOME/.local/bin/codex-framework` 是无仓库导入的稳定 loader，每次先固定物理目录、核对整个包，再导入；旧进程继续使用原目录。
 
 ```sh
 # 已核对且存在于本地 Git 的发布分支头；首次 expected-runtime 使用 none。
