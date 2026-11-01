@@ -9,7 +9,8 @@ import unittest
 
 SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS))
-from obligation_projection import ProjectionError, load_json, project, resolve
+from obligation_projection import (ProjectionError, READ_INPUT_BYTES, READ_OUTPUT_BYTES,
+                                   encoded, load_json, project, read_context, resolve)
 
 
 class ObligationProjectionTests(unittest.TestCase):
@@ -130,6 +131,124 @@ class ObligationProjectionTests(unittest.TestCase):
             path.write_bytes(b'{')
             p = subprocess.run(argv, text=True, capture_output=True)
             self.assertEqual((p.returncode, p.stderr, json.loads(p.stdout)["status"]), (1, "", "invalid"))
+
+
+class ContextReadTests(unittest.TestCase):
+    def source(self, document, path="/authorized/document.json"):
+        raw = encoded(document).encode("ascii")
+        return {"path": path, "sha256": hashlib.sha256(raw).hexdigest(), "bytes": len(raw)}
+
+    def read(self, document, ref="#", **options):
+        return read_context(document, ref, self.source(document), **options)
+
+    def test_container_lists_references_without_disclosing_descendant_values(self):
+        d = {"tasks": [{"id": "A", "state": "denied", "body": "DO_NOT_DISCLOSE" * 5000}]}
+        before = copy.deepcopy(d)
+        out = self.read(d, "#/tasks")
+        self.assertEqual(out["content_mode"], "child_descriptors")
+        self.assertEqual(out["items"][0]["pointer"], "#/tasks/0")
+        self.assertEqual(out["items"][0]["type"], "object")
+        self.assertNotIn("DO_NOT_DISCLOSE", encoded(out))
+        self.assertNotIn("value", out["items"][0])
+        self.assertFalse(out["descendants_included"])
+        self.assertEqual(self.read(d, "#/tasks/0/state")["text"], "denied")
+        self.assertEqual(out["interpretation"]["receipt"], "not_recorded")
+        self.assertEqual(d, before)
+
+    def test_all_pages_are_exactly_once_with_escaped_pointers(self):
+        d = {"items": {"a/b": 1, "~x": 2, "架#%": 3}}
+        pages = []; cursor = None
+        while True:
+            out = self.read(d, "#/items", page_size=1, cursor=cursor)
+            pages.extend(out["items"])
+            cursor = out["next_cursor"]
+            if cursor is None:
+                break
+        self.assertEqual(len(pages), 3)
+        self.assertEqual([resolve(d, item["pointer"])[0] for item in pages], [1, 2, 3])
+        self.assertEqual(self.read(d, "#/items/a~1b")["value"], 1)
+
+    def test_cursor_rejects_source_change_pointer_change_and_different_file(self):
+        d = {"a": [1, 2], "b": [1, 2]}
+        cursor = self.read(d, "#/a", page_size=1)["next_cursor"]
+        changed = copy.deepcopy(d); changed["b"].append(3)
+        cases = [(changed, "#/a", self.source(changed)),
+                 (d, "#/b", self.source(d)),
+                 (d, "#/a", self.source(d, "/other/document.json"))]
+        for document, ref, source in cases:
+            with self.subTest(ref=ref, source=source), self.assertRaises(ProjectionError) as caught:
+                read_context(document, ref, source, cursor=cursor)
+            self.assertEqual(caught.exception.code, "stale_cursor")
+
+    def test_unchanged_selected_value_does_not_claim_whole_source_unchanged(self):
+        d = {"selected": {"a": 1, "b": 2}, "other": "old"}
+        first = self.read(d, "#/selected")
+        d = {"selected": {"b": 2, "a": 1}, "other": "new"}
+        second = self.read(d, "#/selected", if_value_sha256=first["value_sha256"])
+        self.assertEqual(second["status"], "unchanged")
+        self.assertNotIn("items", second)
+        self.assertNotEqual(first["source"]["sha256"], second["source"]["sha256"])
+        d["selected"]["a"] = 3
+        self.assertEqual(self.read(d, "#/selected", if_value_sha256=first["value_sha256"])["status"], "ok")
+
+    def test_text_pages_preserve_unicode_and_remain_within_output_bound(self):
+        d = {"text": ("中文😀\n" * 1001) + "tail"}
+        pieces = []; cursor = None
+        while True:
+            out = self.read(d, "#/text", cursor=cursor)
+            self.assertLessEqual(len(encoded(out).encode("ascii")) + 1, READ_OUTPUT_BYTES)
+            pieces.append(out["text"])
+            cursor = out["next_cursor"]
+            if cursor is None:
+                break
+        self.assertEqual("".join(pieces), d["text"])
+
+    def test_byte_budget_shortens_card_page_without_silently_dropping_entries(self):
+        d = {(str(i) + "键" * 200): i for i in range(40)}
+        seen = []; cursor = None
+        while True:
+            out = self.read(d, page_size=50, cursor=cursor)
+            self.assertLessEqual(len(encoded(out).encode("ascii")) + 1, READ_OUTPUT_BYTES)
+            seen.extend(resolve(d, row["pointer"])[0] for row in out["items"])
+            cursor = out["next_cursor"]
+            if cursor is None:
+                break
+        self.assertEqual(seen, list(range(40)))
+        with self.assertRaises(ProjectionError) as caught:
+            self.read({"key" * READ_OUTPUT_BYTES: 1})
+        self.assertEqual(caught.exception.code, "entry_too_large")
+
+    def test_empty_values_scalar_types_and_bad_options(self):
+        for value in (None, True, False, 3, 2.5):
+            self.assertEqual(self.read(value)["value"], value)
+        for value in ([], {}):
+            out = self.read(value)
+            self.assertEqual((out["items"], out["next_cursor"]), ([], None))
+        self.assertEqual(self.read("")["text"], "")
+        for kwargs in ({"page_size": 0}, {"page_size": 51}, {"page_size": True},
+                       {"if_value_sha256": "bad"}, {"cursor": "bad"},
+                       {"cursor": "bad", "if_value_sha256": "a" * 64}):
+            with self.subTest(kwargs=kwargs), self.assertRaises(ProjectionError):
+                self.read({}, **kwargs)
+
+    def test_cli_input_bound_and_no_mutation_or_descendant_disclosure(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "source.json"
+            raw = json.dumps({"item": {"private": "PRIVATE_MARKER" * 2000}}).encode()
+            path.write_bytes(raw)
+            command = [sys.executable, str(SCRIPTS / "obligation_projection.py"), str(path), "--read", "#"]
+            result = subprocess.run(command, capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertLessEqual(len(result.stdout), READ_OUTPUT_BYTES)
+            self.assertNotIn(b"PRIVATE_MARKER", result.stdout)
+            self.assertEqual(path.read_bytes(), raw)
+            path.write_bytes(b" " * (READ_INPUT_BYTES + 1))
+            result = subprocess.run(command, capture_output=True)
+            self.assertEqual((result.returncode, json.loads(result.stdout)["code"]), (1, "input_too_large"))
+            self.assertLessEqual(len(result.stdout), READ_OUTPUT_BYTES)
+            path.write_bytes(b'{"a":1,"a":2}')
+            result = subprocess.run(command, capture_output=True)
+            self.assertEqual((result.returncode, json.loads(result.stdout)["code"]), (1, "invalid_json"))
 
 
 if __name__ == "__main__":
