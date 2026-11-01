@@ -103,6 +103,56 @@ class UsageGuardTests(unittest.TestCase):
         got=self.check();self.assertTrue(got['allowed']);self.assertTrue(got['assessment']['unassessed'])
         self.assertFalse(got['assessment']['anomalies'])
 
+    def test_sparse_known_profile_uses_frozen_peaks_without_inventing_activity(self):
+        for i in range(2):self.event(self.days[0]+'T15:30:00+00:00','sparse-ref-'+str(i),model='sparse',cached=0)
+        self.observed_reference();original=self.policy.read_text()
+        for i in range(2):self.event('2026-11-02T09:30:00+00:00','shifted-'+str(i),model='sparse',cached=20)
+        got=self.check();self.assertTrue(got['allowed']);self.assertFalse(got['assessment']['warnings'])
+        comparisons={(r['window'],r['metric']):r for r in got['assessment']['comparisons']}
+        hour=comparisons['hour_latest','sparse/high:responses']
+        self.assertEqual(hour['comparison_basis'],'observed_hourly_peak_envelope')
+        self.assertEqual(hour['same_clock_samples'],[0,0]);self.assertEqual(hour['samples'],[2,0])
+        self.assertEqual(hour['positive_reference_days'],1);self.assertEqual(hour['threshold'],4)
+        self.assertEqual(comparisons['day','sparse/high:responses']['comparison_basis'],'observed_full_day_envelope')
+        self.assertEqual(comparisons['hour_latest','model-a/high:responses']['comparison_basis'],'same_clock')
+        self.assertIn('hour_latest:sparse/high:cached_input',got['assessment']['unassessed'])
+        self.assertEqual(self.policy.read_text(),original)
+
+    def test_sparse_profile_sustained_growth_latches_but_one_reference_stays_unknown(self):
+        for i in range(2):self.event(self.days[0]+'T08:30:00+00:00','sparse-ref-'+str(i),model='sparse')
+        self.observed_reference()
+        for hour in ('08','09'):
+            for i in range(5):self.event('2026-11-02T'+hour+':30:00+00:00',hour+'-sparse-'+str(i),model='sparse')
+        refs=self.config['change_reference_days'];self.config['change_reference_days']=refs[:1];self.save_policy()
+        got=self.check();self.assertTrue(got['allowed']);self.assertTrue(got['assessment']['unassessed'])
+        # Restoring the second reference is separately reviewed below; compare
+        # directly so a policy-change latch cannot stand in for anomaly proof.
+        self.config['change_reference_days']=refs
+        with guard.connect(self.config['state_db']) as db:
+            measured=guard.compare(db,self.config,self.now)
+        self.assertEqual(measured['status'],'ANOMALOUS')
+        self.assertEqual({r['rule'] for r in measured['anomalies']},
+                         {'SUSTAINED_OBSERVED_GROWTH','DAILY_RESPONSE_AND_TOKEN_GROWTH'})
+        self.save_policy();got=self.check()
+        self.assertEqual(got['lock']['reason'],'ANOMALOUS')
+        self.assertEqual(self.check(now=self.now+timedelta(days=1))['lock']['id'],got['lock']['id'])
+
+    def test_sparse_midnight_fallback_keeps_higher_fingerprinted_leading_usage(self):
+        for hour in ('22','23'):
+            for i in range(10):self.event('2026-10-18T'+hour+':30:00+00:00','leading-'+hour+str(i),model='sparse')
+        self.event(self.days[0]+'T15:30:00+00:00','small-day-peak',model='sparse')
+        self.observed_reference()
+        for hour in ('22','23'):
+            for i in range(5):self.event('2026-11-01T'+hour+':30:00+00:00','current-'+hour+str(i),model='sparse')
+        got=self.check(now=datetime(2026,11,2,0,15,tzinfo=timezone.utc))
+        self.assertTrue(got['allowed']);self.assertFalse(got['assessment']['warnings'])
+        rows=[r for r in got['assessment']['comparisons']
+              if r['window'].startswith('hour_') and r['metric']=='sparse/high:responses']
+        self.assertEqual(len(rows),2)
+        for row in rows:
+            self.assertEqual(row['samples'],[10,0]);self.assertEqual(row['threshold'],20)
+            self.assertEqual(row['actual'],5)
+
     def test_small_reviewed_baseline_and_observed_references_still_require_integrity(self):
         self.config['reviewed_days']=self.config['reviewed_days'][:1];self.save_policy()
         self.event(self.days[0]+'T13:00:00+00:00','late-normal')

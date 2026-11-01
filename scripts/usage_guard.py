@@ -202,9 +202,9 @@ def baseline_candidates(db, p, now, *, leading_minutes=60):
 def compare_change(db, p, now, normal_peers):
     """A frozen observed envelope detects sustained growth, not normality.
 
-    Two historical days and two completed nonoverlapping hours confirm a
-    doubling. A single burst/day increase is a warning. No online learning
-    silently raises the envelope, and unknown profiles are never zero norms.
+    Two reviewed observation days and two completed nonoverlapping hours
+    confirm a doubling. Sparse known profiles use a conservative full-day or
+    hourly-peak envelope, not a zero allowance or an invented normal sample.
     """
     zone = ZoneInfo(p["timezone"])
     local = now.astimezone(zone)
@@ -250,12 +250,21 @@ def compare_change(db, p, now, normal_peers):
         for name,(left,right) in windows.items():
             spans[(anchor,name)] = ((left+shift).timestamp(),(right+shift).timestamp())
     counts = defaultdict(lambda:defaultdict(int))
+    reference_totals = defaultdict(lambda:defaultdict(int))
+    reference_hours = defaultdict(lambda:defaultdict(int))
+    reference_dates = set(days)
     scope = set(get(db,"scope_threads") or p["roots"])
     for row in db.execute("SELECT thread,stamp,model,input,cached,output FROM responses WHERE stamp>=? AND stamp<?",
                           (min(v[0] for v in spans.values()),now.timestamp())):
         if row["thread"] not in scope:
             continue
         values = (1,row["input"]-row["cached"],row["cached"],row["output"])
+        stamp = datetime.fromtimestamp(row["stamp"],zone)
+        if stamp.date() in reference_dates:
+            for metric,value in zip(METRICS,values):
+                key = row["model"]+":"+metric
+                reference_totals[stamp.date()][key] += value
+                reference_hours[(stamp.date(),stamp.hour)][key] += value
         for key,(left,right) in spans.items():
             if left <= row["stamp"] < right:
                 for metric,value in zip(METRICS,values):
@@ -263,15 +272,32 @@ def compare_change(db, p, now, normal_peers):
     exceeded = defaultdict(dict)
     for window in windows:
         actual = counts[(day,window)]
-        metrics = set(actual).union(*(counts[(d,window)] for d in days))
+        metrics = set(actual).union(*(counts[(d,window)] for d in days), *reference_totals.values())
         for metric in sorted(metrics):
             samples = [counts[(d,window)].get(metric,0) for d in days]
-            # A sparse or unseen model/window is unknown, not a zero allowance.
-            if len(samples)<2 or any(v<=0 for v in samples):
+            clock_samples = samples
+            basis = "same_clock"
+            if len(samples)>=2 and any(v<=0 for v in samples):
+                # Reviewed complete scoped days can contain an idle profile.
+                # Its known activity at other hours is a conservative bound;
+                # a new model/category with no positive history stays unknown.
+                if window=="day":
+                    samples = [reference_totals[d].get(metric,0) for d in days]
+                    basis = "observed_full_day_envelope"
+                else:
+                    # Cross-midnight same-clock windows may lie in the
+                    # fingerprinted leading period. Never discard that higher
+                    # known observation when using the whole-day peak.
+                    samples = [max(clock, max(reference_hours[(d,h)].get(metric,0) for h in range(24)))
+                               for d,clock in zip(days,clock_samples)]
+                    basis = "observed_hourly_peak_envelope"
+            if len(samples)<2 or max(samples)<=0:
                 if actual.get(metric,0):result["unassessed"].append(window+":"+metric)
                 continue
             item = {"window":window, "metric":metric, "actual":actual.get(metric,0),
                     "samples":samples, "threshold":2*max(samples), "reference_quality":"OBSERVED_NOT_NORMAL",
+                    "comparison_basis":basis, "same_clock_samples":clock_samples,
+                    "positive_reference_days":sum(v>0 for v in samples),
                     "start":windows[window][0].isoformat(), "end":windows[window][1].isoformat()}
             result["comparisons"].append(item)
             if item["actual"]>item["threshold"]:
@@ -281,13 +307,13 @@ def compare_change(db, p, now, normal_peers):
         if {"hour_previous","hour_latest"} <= signals.keys():
             result["anomalies"].append({"rule":"SUSTAINED_OBSERVED_GROWTH", "metric":metric,
                 "evidence":[signals["hour_previous"],signals["hour_latest"]],
-                "meaning":"Two successive complete hours exceed twice each historical same-hour maximum; cause and billing impact unknown."})
+                "meaning":"Two successive complete hours exceed twice their applicable frozen observed bounds; sparse profiles use hourly peaks. Cause and billing impact unknown."})
         response_metric = metric.rsplit(":",1)[0]+":responses"
         if metric!=response_metric and "day" in signals and "day" in exceeded.get(response_metric,{}):
             for key in (response_metric,metric):
                 result["anomalies"].append({"rule":"DAILY_RESPONSE_AND_TOKEN_GROWTH", "metric":key,
                     "evidence":[exceeded[response_metric]["day"],signals["day"]],
-                    "meaning":"Same-elapsed daily response count and a token category both exceed twice their observed maxima; not a fixed daily cap."})
+                    "meaning":"Daily response count and a token category both exceed twice their observed bounds; sparse profiles use complete reference-day totals. Not a fixed daily cap."})
     if result["anomalies"]:
         result["status"] = "ANOMALOUS"
     return result
