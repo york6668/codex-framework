@@ -197,6 +197,8 @@ python3 -m unittest discover -s tests -v
 
 机器核收读取原结果，聊天 final 说明实际结果、限制和后继。原请求身份、当前输入及原生 thread/turn/item 与结果引用共同关联本次工作；格式适配不替代实质验收。缺失、冲突、截断或未核格式保持错误或 UNKNOWN；新返回不清除旧拒绝、未答义务和未知效果。
 
+执行通道失联不能推断整机断网。按[连接恢复方法](.agents/skills/york-workstation/references/local-network.md#执行连接与原任务恢复)在当前回合及已有的真实恢复机会核原操作，再接续合法后继；独立工作继续。`check` 的[断线核收投影](.agents/skills/york-task-alignment/references/execution-check.md#断线后的原操作核收)防止已提供的失联操作因结果索引缺项而被当作可重复执行，保留仍运行、成功、失败及 UNKNOWN 的不同后继。它不负责平台重连、通知或唤醒，也不修改用户网络设置；源码和云端测试不证明原工作站采用。
+
 可选的 `review_handoff.py/js` 由原调用者在已授权读取中使用，具体见[原结果交接](.agents/skills/york-task-alignment/references/result-handoff.md)。库不增加平台回调、队列或权限，也不注册全局拦截。旧 `review-return-v1` 和有限结果回执仅保留已有请求兼容；新工作不要求 final 与整段 JSON 相同。
 
 当前受管 CLI 模块由 `scripts/framework_runtime.py:MODULES` 声明，共 8 个；7、9、10、12、13 模块闭包仅用于核对已批准的历史运行包和回退。交接库不在此闭包中，CLI/正文安装不能证明调用者已加载它。节点实际采用须核对对应源码版本及真实调用；历史恢复不清除原拒绝或 UNKNOWN。

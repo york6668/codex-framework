@@ -1,5 +1,17 @@
 # 执行与修复的即时检查
 
+## 断线后的原操作核收
+
+`action` 及 `progress.steps` 可在已有 `context.tool_failure/tool_failures` 提供明确的 `kind: transport_disconnected|session_unavailable`。现有其他类型保持原意义；不解析报错关键词推断网络、VPN、拒绝或操作终态。每条关联原 `ref`（故障）、`operation_ref`、`project_id`、`task_ref`、`execution_node`、`action_kind`、`resource` 和原 `effect_key`（只读动作可为空）。这些是原记录的临时投影，不新建任务库。缺身份报输入错误，不能把当前会话或新发送者补成原身份。
+
+即使 `native_operations` 尚未来得及登记，失联写操作也按结果未知处理，阻止同效果及交叠资源的写入；改效果名、换发送者或连接不能补发。同资源只读核收和不交叠工作仍可进入原进度分区。输出 `connection_recovery` 保留原身份、`failure_layer`、`state` 和下一核收动作，不判断整机联网、不发请求也不提供执行权限。
+
+需要核收时，可在该故障的 `reconciliation_refs` 中引用实际取得的原状态读取（最多 16 项）。复用 `context.evidence/native_sources`：记录为 `kind: operation_status`、`source: codex`、`result: observed`，`related_ref` 等于原 `operation_ref`，project/task/resource 与原动作一致，`digest` 绑定完整成功读取命令的正文。正文为 JSON，明确包含上面的原操作身份字段（故障 `ref` 除外）和 `state: not_executed|running|succeeded|failed|unknown`；前三种终态 `not_executed/succeeded/failed` 的 `terminal` 必须为 true，其余必须 false，成功/失败还需原 `result_ref`。`not_executed` 仅表示原提交已终结且权威来源明确证明未执行，不能用查无记录、排队、超时或新通道上线推定。调用方负责核实原件来源与这种终态语义；自填 JSON 不认证事实。
+
+缺来源、错节点/原操作/效果、未完成读取、截断、重复 JSON 键及冲突结果保持 UNKNOWN。重复同状态/结果读取可复用；状态冲突不按输入顺序挑一个，须原任务重新核权威状态。`running` 只观察，`succeeded` 只消费原结果，`failed` 需原任务的原因/修正证据，`not_executed` 回到原动作既有前提检查。原 `native_operations` 中的在途/未知、其他操作、用户停止及拒绝不被核收投影清除；输入与原权威不一致时先更新准确原记录和当前读取，再决定接续，不能删除未知项来使检查通过。检查不写原状态，不认证结果，也不能决定市场输入是否仍适用。
+
+实际自动恢复由原调用者在已有获准执行机会按[执行连接恢复](../../york-workstation/references/local-network.md#执行连接与原任务恢复)落实；检查通过不表示原生连接已重建、原会话可读、任务已唤醒或工作站已安装。遗漏的断线记录、未使用本入口的调用和平台底层重连均不在此检查的保障范围。
+
 OpenAI 设计与能力依据按 [官方依据与能力核验](../../york-engineering/references/openai-capability-basis.md) 从完整官方体系导航。`action.capabilities/context.capabilities` 是本次提供的能力标签关系，不是官方产品目录或本机可用证明；新产品不因未列示例而排除，别产品/宿主能力也不能用同名标签代签。模型先核适用正文、当前原生入口/安装版本、来源和时效，再构造临时投影；缺失或已失效证据不签可用。检查器不查询或授权新产品，不解析 Markdown 方法为运行配置，不因 `ready` 证明实际能力、连续执行或完整研究已完成。
 
 ## 可选项目业务工件适配

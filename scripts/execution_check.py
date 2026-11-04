@@ -420,6 +420,89 @@ def tool_failures(context):
     return [obj(failure, "tool failure") for failure in failures]
 
 
+def disconnected_operations(context, evidence, project_id):
+    """Project lost replies without inferring host health or replaying an action.
+
+    Transport/session observations are not operation outcomes. A missing native
+    operation index must not turn a lost reply into permission to submit again.
+    Only a bound original-status read can reconcile this particular operation.
+    This is a stateless input check, not a reconnection client or scheduler.
+    """
+    projected = []
+    for failure in tool_failures(context):
+        if failure.get("kind") not in ("transport_disconnected", "session_unavailable"):
+            continue
+        # These fields identify the original effect, not the currently attached
+        # connection or a new sender. Do not derive them from an error string.
+        identity = {key: identifier(failure.get(key), "connection failure." + key)
+                    for key in ("ref", "operation_ref", "project_id", "task_ref",
+                                "execution_node", "action_kind")}
+        if identity["action_kind"] not in ("read", "write", "invoke", "repair", "publish"):
+            raise CheckError("connection failure.action_kind is invalid")
+        target = resource(failure.get("resource"))
+        effect_key = failure.get("effect_key")
+        if identity["action_kind"] != "read":
+            identifier(effect_key, "connection failure.effect_key")
+        refs = items(failure.get("reconciliation_refs", []), "connection failure.reconciliation_refs")
+        if len(refs) > 16:
+            raise CheckError("too many connection reconciliation references")
+        observations, gaps = [], []
+        for ref in dict.fromkeys(identifier(ref, "reconciliation reference") for ref in refs):
+            record = evidence.get(ref)
+            body = None
+            if (record is not None and record.get("kind") == "operation_status"
+                    and record.get("source") == "codex"
+                    and record.get("project_id") == identity["project_id"]
+                    and record.get("task_ref") == identity["task_ref"]
+                    and record.get("related_ref") == identity["operation_ref"]
+                    and record.get("result") == "observed"
+                    and isinstance(record.get("digest"), str)
+                    and re.fullmatch(r"[0-9a-f]{64}", record["digest"])
+                    and record.get("resource") is not None
+                    and resource(record["resource"]) == target):
+                text = source_body(context, record)
+                try:
+                    body = parse_statement(text) if text else None
+                except (ValueError, RecursionError):
+                    pass
+            fields = ("operation_ref", "project_id", "task_ref", "execution_node", "action_kind")
+            valid = (isinstance(body, dict)
+                     and all(body.get(key) == identity[key] for key in fields)
+                     and resource_scope_matches(body.get("resource"), failure["resource"])
+                     and body.get("effect_key") == effect_key
+                     and body.get("state") in ("not_executed", "running", "succeeded", "failed", "unknown"))
+            if valid:
+                state = body["state"]
+                terminal = state in ("not_executed", "succeeded", "failed")
+                valid = body.get("terminal") is terminal
+                if state in ("succeeded", "failed"):
+                    valid = valid and isinstance(body.get("result_ref"), str) and bool(body["result_ref"].strip())
+            if not valid:
+                gaps.append("original_operation_status_unverified")
+            else:
+                observations.append((state, body.get("result_ref") if terminal and state != "not_executed" else None))
+        # Conflicts have no assumed ordering. Repeated or reordered notifications
+        # cannot erase a previous outcome; a fresh authoritative read is needed.
+        unique = set(observations)
+        if len(unique) > 1:
+            gaps.append("original_operation_status_conflict")
+        state, result_ref = next(iter(unique)) if len(unique) == 1 and not gaps else ("unknown", None)
+        if not refs:
+            gaps.append("original_operation_status_required")
+        projected.append({**identity, "resource": failure["resource"], "effect_key": effect_key,
+                          "state": state, "result_ref": result_ref,
+                          "same_project": identity["project_id"] == project_id,
+                          "gaps": sorted(set(gaps)),
+                          "failure_layer": ("execution_transport" if failure["kind"] == "transport_disconnected"
+                                            else "execution_session"),
+                          "next_action": {"unknown": "reconcile_original_operation",
+                                          "running": "observe_original_operation",
+                                          "succeeded": "consume_original_result",
+                                          "failed": "diagnose_original_failure",
+                                          "not_executed": "recheck_original_action_prerequisites"}[state]})
+    return projected
+
+
 def denied_action_matches(failure, action, target, workspace):
     if (failure.get("kind") != "platform_denied"
             or failure.get("resource") is None
@@ -607,6 +690,7 @@ def evaluate(payload):
     access_route = None
     resource_route = None
     basis_review = None
+    connection_recovery = []
 
     def block(code):
         if code not in blocked:
@@ -1181,6 +1265,8 @@ def evaluate(payload):
                 decision["resource_route"] = single["resource_route"]
             if "decision_basis" in single:
                 decision["decision_basis"] = single["decision_basis"]
+            if "connection_recovery" in single:
+                decision["connection_recovery"] = single["connection_recovery"]
             decisions.append(decision)
             by_id[step_id] = decision
             entries_by_id[step_id] = entry
@@ -1742,6 +1828,41 @@ def evaluate(payload):
         for dependency in items(action.get("depends_on", []), "action.depends_on"):
             if by_ref.get(dependency, {}).get("state") != "succeeded":
                 need("dependency_unverified")
+        disconnected = disconnected_operations(context, evidence, project_id)
+        for original in disconnected:
+            same_effect = (original["same_project"] and original["effect_key"] is not None
+                           and original["effect_key"] == action.get("effect_key"))
+            affected = same_effect or overlaps(resource(original["resource"]), target)
+            if not affected:
+                continue
+            connection_recovery.append({key: value for key, value in original.items()
+                                        if key not in ("same_project", "gaps")})
+            # A read-only reconciliation remains possible. A changed effect key,
+            # sender or connection cannot evade an unresolved overlapping effect.
+            if not write or original["action_kind"] == "read":
+                continue
+            state = original["state"]
+            if state in ("unknown", "running"):
+                block("disconnected_operation_unresolved")
+                for gap in original["gaps"]:
+                    need(gap)
+            elif same_effect and state == "succeeded":
+                block("duplicate_or_uncertain_effect")
+            elif state == "failed" and not same_effect:
+                block("failed_operation_requires_original_recovery")
+            elif same_effect and state in ("failed", "not_executed"):
+                if original["task_ref"] != task_ref:
+                    block("resume_original_task_for_recovery")
+                if kind != original["action_kind"] or resource(original["resource"]) != target:
+                    block("original_operation_identity_mismatch")
+                if state == "failed":
+                    recovery = obj(action.get("recovery", {}), "action.recovery")
+                    if recovery.get("source_ref") != original["operation_ref"]:
+                        need("failed_operation_recovery")
+                    cause = linked(recovery.get("cause_ref"), "cause")
+                    correction = linked(recovery.get("correction_ref"), "correction")
+                    if cause is None or correction is None or correction.get("result") != "verified":
+                        need("verified_correction")
         if write:
             effect_key = identifier(action.get("effect_key"), "action.effect_key")
             if not context.get("native_snapshot_ref") or context.get("native_snapshot_complete") is not True:
@@ -2189,6 +2310,8 @@ def evaluate(payload):
               "meaning": "source_excerpt_and_input_consistency_only; provenance, authorization and goal semantics remain external"}
     if basis_review is not None:
         result["decision_basis"] = basis_review
+    if connection_recovery:
+        result["connection_recovery"] = connection_recovery
     if access_route is not None:
         result["access_route"] = access_route
     if resource_route is not None:
