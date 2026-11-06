@@ -217,10 +217,13 @@ class ActionChecks(unittest.TestCase):
         request["context"]["tool_failure"] = {"ref": "codex:tool:one", "kind": "context_unavailable"}
         request["action"]["assertion"] = "capability_missing"
         self.assertIn("tool_context_is_not_capability_absence", check.evaluate(request)["blocked"])
+        request["action"].pop("assertion")
         request["action"]["kind"] = "repair"
         request["action"]["defect"] = {"failure_ref": "codex:tool:one", "cause_ref": "node:fact:one",
                                          "cause_layer": "implementation"}
-        self.assertIn("tool_context_is_not_implementation_defect", check.evaluate(request)["blocked"])
+        result = check.evaluate(request)
+        self.assertIn("unresolved_cause_reference", result["missing"])
+        self.assertNotEqual(result["status"], "ready")
 
     def test_native_dedup_conflict_unknown_and_failed_recovery(self):
         request = action_case()

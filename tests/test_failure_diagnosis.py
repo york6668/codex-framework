@@ -51,6 +51,46 @@ def parent_grant_case():
 
 
 class FailureDiagnosisChecks(unittest.TestCase):
+    def implementation_repair(self):
+        request = fixtures.action_case()
+        request["action"]["kind"] = "repair"
+        request["action"]["defect"] = {
+            "failure_ref": "codex:run:failed", "cause_ref": "codex:diagnosis:implementation",
+            "cause_layer": "implementation", "authorization_ref": "codex:user:repair",
+            "affected_resources": [copy.deepcopy(request["action"]["resource"])]}
+        request["context"]["evidence"] = [
+            fixtures.fact("codex:run:failed", "failure", "failed"),
+            fixtures.fact("codex:diagnosis:implementation", "cause"),
+            fixtures.fact("codex:user:repair", "authorization", "granted")]
+        fixtures.bind_native_sources(request)
+        return request
+
+    def test_context_error_does_not_veto_a_separately_diagnosed_implementation_repair(self):
+        for failure_ref in ("codex:other:context", "codex:run:failed"):
+            with self.subTest(failure_ref=failure_ref):
+                request = self.implementation_repair()
+                request["context"]["tool_failure"] = {
+                    "ref": failure_ref, "kind": "context_unavailable"}
+                actual = subprocess.run(
+                    [sys.executable, str(SOURCE / "scripts/codex_framework.py"), "check"],
+                    input=json.dumps(request), capture_output=True, text=True, timeout=10)
+                self.assertEqual(json.loads(actual.stdout)["status"], "ready", actual.stdout)
+
+    def test_context_label_cannot_replace_diagnosis_or_clear_an_exact_denial(self):
+        request = self.implementation_repair()
+        request["context"]["tool_failure"] = {
+            "ref": "codex:run:failed", "kind": "context_unavailable"}
+        request["context"]["native_sources"][0]["turns"][0]["items"][1]["text"] = "changed claim"
+        self.assertIn("unverified_cause_source", check.evaluate(request)["missing"])
+        request = self.implementation_repair()
+        request["context"]["tool_failure"] = {
+            "ref": "codex:other:context", "kind": "context_unavailable"}
+        request["context"]["tool_failures"] = [{
+            "kind": "platform_denied", "action_kind": "repair",
+            "resource": copy.deepcopy(request["action"]["resource"]),
+            "effect_key": request["action"]["effect_key"]}]
+        self.assertIn("platform_denied_action", check.evaluate(request)["blocked"])
+
     def test_conflicting_native_observations_do_not_choose_first_success(self):
         first = command_item()
         second = copy.deepcopy(first)

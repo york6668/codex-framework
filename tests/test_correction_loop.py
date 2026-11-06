@@ -129,6 +129,10 @@ class CorrectionLoop(unittest.TestCase):
                 {**RESOURCE, "path": "other-project-file.py"}]
             self.assertIn("affected_scope_outside_task", cli(request)[1]["blocked"])
             request["action"]["defect"]["affected_resources"] = [RESOURCE]
+            # A separate unavailable review session must not prevent this
+            # diagnosed, authorised local fix and its real consumer round trip.
+            request["context"]["tool_failure"] = {
+                "ref": "codex:review:unavailable", "kind": "context_unavailable"}
             self.assertEqual(cli(request)[1]["status"], "ready")
 
             # An attempted edit that leaves the original failure unchanged is not a fix.

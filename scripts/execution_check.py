@@ -2187,10 +2187,10 @@ def evaluate(payload):
                 if (not any(covers(scope, candidate, False) for scope in project_scopes)
                         or not any(covers(scope, candidate, False) for scope in task_scopes)):
                     block("affected_scope_outside_task")
-            if (defect.get("cause_layer") == "implementation"
-                    and any(f.get("kind") == "context_unavailable"
-                            for f in tool_failures(context))):
-                block("tool_context_is_not_implementation_defect")
+            # A context error is an observation, not a veto of every implementation
+            # repair. The linked failure/cause above still need verified sources;
+            # the model judges causality. Exact denials and effect reconciliation
+            # are checked independently and are not cleared by that diagnosis.
         if kind == "publish":
             release = obj(action.get("release", {}), "action.release")
             release_goal = check_current_goal(release.get("goal_ref"), required=True)
