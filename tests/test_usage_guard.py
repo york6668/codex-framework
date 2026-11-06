@@ -2,11 +2,13 @@ import concurrent.futures
 from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
+import shutil
 import sqlite3
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 import usage_guard as guard
@@ -355,6 +357,137 @@ class UsageGuardTests(unittest.TestCase):
         self.assertEqual(locks[0], locks[1])
         with sqlite3.connect(self.config["state_db"]) as db:
             self.assertEqual(db.execute("SELECT COUNT(*) FROM history WHERE action='LOCK'").fetchone()[0], 1)
+
+
+@unittest.skipUnless(shutil.which("zstd"), "compressed native sources require zstd")
+class CompressedUsageGuardTests(unittest.TestCase):
+    setUp = UsageGuardTests.setUp
+    seal_baseline = UsageGuardTests.seal_baseline
+    save_policy = UsageGuardTests.save_policy
+    event = UsageGuardTests.event
+    check = UsageGuardTests.check
+
+    def compressed(self, data):
+        return subprocess.run(["zstd", "-q", "-c"], input=data,
+                              capture_output=True, check=True).stdout
+
+    def compress_log(self, path=None):
+        path = path or self.log
+        target = Path(str(path) + ".zst")
+        target.write_bytes(self.compressed(path.read_bytes()))
+        path.unlink()
+        return target
+
+    def test_compressed_transition_replays_without_double_counting_or_unlocking(self):
+        before = self.check(history=True)
+        self.event("2026-11-02T09:30:00+00:00", "new-before-compression")
+        target = self.compress_log()
+        original = target.read_bytes()
+        with patch.object(guard.subprocess, "Popen", side_effect=FileNotFoundError("zstd unavailable")):
+            failed = self.check()
+        got = self.check(history=True)
+        self.assertEqual(got["source"]["records"], 22)
+        self.assertEqual(got["assessment"]["status"], "NORMAL")
+        self.assertFalse(got["allowed"])
+        self.assertEqual(got["lock"]["id"], failed["lock"]["id"])
+        self.assertEqual(got["baseline_candidates"], before["baseline_candidates"])
+        self.assertEqual(self.check()["source"]["records"], 22)
+        self.assertEqual(target.read_bytes(), original)
+        release = {"lock_id": got["lock"]["id"], "evidence": "verified compression-only fixture recovery",
+                   "policy_sha256": got["policy_sha256"], "reviewed_reasons": list(got["lock_findings"])}
+        self.assertTrue(self.check(release=release)["allowed"])
+
+    def test_plain_form_has_native_precedence_even_if_index_names_compressed(self):
+        target = Path(str(self.log) + ".zst")
+        target.write_bytes(b"invalid compressed sibling")
+        with sqlite3.connect(self.source) as db:
+            db.execute("UPDATE threads SET rollout_path=? WHERE id='root'", (str(target),))
+        self.event("2026-11-02T09:30:00+00:00", "plain-current")
+        self.assertEqual(self.check()["source"]["records"], 22)
+
+    def test_native_materialization_rescans_and_counts_only_new_responses(self):
+        data = self.log.read_bytes()
+        target = self.compress_log()
+        self.assertEqual(self.check()["source"]["records"], 21)
+        self.log.write_bytes(data)
+        self.event("2026-11-02T09:30:00+00:00", "after-materialization")
+        self.assertEqual(self.check()["source"]["records"], 22)
+        self.assertTrue(target.exists())
+
+    def test_damaged_multiframe_scan_cannot_commit_partial_usage(self):
+        self.event("2026-11-02T09:30:00+00:00", "unverified-new")
+        data = self.log.read_bytes()
+        target = self.compress_log()
+        # The first frame emits valid records before the second frame fails.
+        target.write_bytes(self.compressed(data) + self.compressed(b"{}\n")[:-2])
+        got = self.check()
+        self.assertEqual(got["assessment"]["status"], "MEASUREMENT_UNAVAILABLE")
+        with guard.connect(self.config["state_db"]) as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM responses").fetchone()[0], 21)
+        target.write_bytes(self.compressed(data))
+        repaired = self.check()
+        self.assertEqual(repaired["source"]["records"], 22)
+        self.assertEqual(repaired["lock"]["id"], got["lock"]["id"])
+
+    def test_compressed_partial_record_and_oversized_line_fail_closed(self):
+        target = self.compress_log()
+        for data in (b'{"type":"turn_context"}', b"x" * (16 * 1024 * 1024 + 1) + b"\n"):
+            target.write_bytes(self.compressed(data))
+            got = self.check()
+            self.assertFalse(got["allowed"])
+            self.assertEqual(got["assessment"]["status"], "MEASUREMENT_UNAVAILABLE")
+
+    def test_compressed_descendant_keeps_original_event_ownership(self):
+        child = self.root / "child.jsonl"
+        child.write_bytes(self.log.read_bytes())
+        self.event("2026-11-02T09:30:00+00:00", "child-own", path=child, thread="child")
+        self.compress_log(child)
+        with sqlite3.connect(self.source) as db:
+            db.execute("INSERT INTO threads VALUES (?,?,?)", ("child", str(child), "vscode"))
+            db.execute("INSERT INTO thread_spawn_edges VALUES (?,?)", ("root", "child"))
+        got = self.check()
+        self.assertEqual(got["source"]["records"], 22)
+        self.assertEqual(got["source"]["threads"], 2)
+        self.assertEqual(self.check()["source"]["records"], 22)
+
+    def test_representation_change_between_resolve_and_open_does_not_latch(self):
+        resolve = guard.rollout_source
+        data = self.log.read_bytes()
+        switched = []
+
+        def compress_after_resolve(value):
+            result = resolve(value)
+            if not switched:
+                self.compress_log()
+                switched.append(True)
+            return result
+
+        with patch.object(guard, "rollout_source", side_effect=compress_after_resolve):
+            got = self.check()
+        self.assertTrue(got["allowed"])
+        self.assertEqual(got["source"]["records"], 21)
+        switched.clear()
+
+        def materialize_after_resolve(value):
+            result = resolve(value)
+            if not switched:
+                self.log.write_bytes(data)
+                Path(str(self.log) + ".zst").unlink()
+                switched.append(True)
+            return result
+
+        with patch.object(guard, "rollout_source", side_effect=materialize_after_resolve):
+            got = self.check()
+        self.assertTrue(got["allowed"])
+        self.assertEqual(got["source"]["records"], 21)
+
+    def test_persistent_missing_representation_retries_are_bounded(self):
+        self.log.unlink()
+        with patch.object(guard.time, "sleep") as sleep:
+            got = self.check()
+        self.assertEqual(sleep.call_count, 3)
+        self.assertEqual(got["assessment"]["status"], "MEASUREMENT_UNAVAILABLE")
+        self.assertFalse(got["allowed"])
 
 
 if __name__ == "__main__":

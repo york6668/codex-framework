@@ -4,11 +4,15 @@ Tokens/responses are separate proxy measures, never credits or a billing cap.
 No scheduler, model call, account request, or automatic unlock is performed.
 """
 import hashlib
+from contextlib import contextmanager
 import json
 import math
+import os
 import re
 import sqlite3
+import subprocess
 import sys
+import time
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -105,6 +109,53 @@ def put(db, key, value):
     db.execute("INSERT OR REPLACE INTO meta VALUES (?,?)", (key, encoded(value)))
 
 
+def rollout_source(value):
+    """Resolve the native logical path, preferring plain JSONL as Codex does."""
+    plain = Path(value)
+    if plain.name.endswith(".jsonl.zst"):
+        plain = plain.with_suffix("")
+    try:
+        return plain.resolve(strict=True), False
+    except FileNotFoundError:
+        if not plain.name.endswith(".jsonl"):
+            raise
+        return Path(str(plain) + ".zst").resolve(strict=True), True
+
+
+@contextmanager
+def rollout_stream(value):
+    # Native compression/materialization can replace the representation between
+    # resolution and open. Retry only this same logical source, never a scan or
+    # failed decode; a persistent missing source still fails closed.
+    for attempt in range(4):
+        try:
+            path, compressed = rollout_source(value)
+            source = path.open("rb")
+            break
+        except FileNotFoundError:
+            if attempt == 3:
+                raise
+            time.sleep(0.05)
+    with source:
+        stat = os.fstat(source.fileno())
+        if not compressed:
+            yield path, compressed, stat, source
+            return
+        # Keep the original file open across representation changes. Decode
+        # only in memory; never materialize or alter the native session file.
+        process = subprocess.Popen(["zstd", "-q", "-d", "-c"], stdin=source,
+                                   stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        try:
+            yield path, compressed, stat, process.stdout
+            if process.wait() != 0:
+                raise ValueError("native compressed rollout decoding failed")
+        finally:
+            if process.poll() is None:
+                process.kill()
+            process.wait()
+            process.stdout.close()
+
+
 def scan(db, p, now):
     """Incremental bounded-memory reads; one globally unique response per event."""
     with source_connection(p["source_db"]) as source:
@@ -129,13 +180,12 @@ def scan(db, p, now):
     if not selected <= threads.keys():
         raise ValueError("native descendant metadata missing")
     for tid in sorted(selected):
-        path = Path(threads[tid]["rollout_path"]).resolve(strict=True)
-        stat = path.stat()
-        old = db.execute("SELECT * FROM cursors WHERE path=?", (str(path),)).fetchone()
-        same = old and (old["device"], old["inode"]) == (stat.st_dev, stat.st_ino) and old["offset"] <= stat.st_size
-        offset, model = (old["offset"], old["model"]) if same else (0, "UNKNOWN")
-        with path.open("rb") as stream:
-            stream.seek(offset)
+        with rollout_stream(threads[tid]["rollout_path"]) as (path, compressed, stat, stream):
+            old = db.execute("SELECT * FROM cursors WHERE path=?", (str(path),)).fetchone()
+            same = not compressed and old and (old["device"], old["inode"]) == (stat.st_dev, stat.st_ino) and old["offset"] <= stat.st_size
+            offset, model = (old["offset"], old["model"]) if same else (0, "UNKNOWN")
+            if not compressed:
+                stream.seek(offset)
             while True:
                 line = stream.readline(16 * 1024 * 1024 + 1)
                 if not line:
@@ -143,6 +193,8 @@ def scan(db, p, now):
                 if len(line) > 16 * 1024 * 1024:
                     raise ValueError("native record exceeds bounded reader")
                 if not line.endswith(b"\n"):
+                    if compressed:
+                        raise ValueError("incomplete compressed native record")
                     break  # Do not consume a partially written final record.
                 event = json.loads(line)
                 v = event.get("payload", {})
@@ -163,8 +215,15 @@ def scan(db, p, now):
                     if prior and tuple(prior) != record:
                         raise ValueError("conflicting native response identity")
                     db.execute("INSERT OR IGNORE INTO responses VALUES (?,?,?,?,?,?,?)", (rid, *record))
-                offset = stream.tell()
-        db.execute("INSERT OR REPLACE INTO cursors VALUES (?,?,?,?,?)", (str(path), stat.st_dev, stat.st_ino, offset, model))
+                if not compressed:
+                    offset = stream.tell()
+        if compressed:
+            # Compression is a cold-file representation, not a new source.
+            # Replay fully to verify its frames; response identities dedupe it.
+            # A later native materialization must not reuse a stale plain offset.
+            db.execute("DELETE FROM cursors WHERE path=?", (str(path.with_suffix("")),))
+        else:
+            db.execute("INSERT OR REPLACE INTO cursors VALUES (?,?,?,?,?)", (str(path), stat.st_dev, stat.st_ino, offset, model))
     put(db, "scope_threads", sorted(selected))
     return {"threads": len(selected), "records": db.execute("SELECT COUNT(*) FROM responses").fetchone()[0], "observed_at": now.isoformat()}
 
@@ -404,14 +463,20 @@ def evaluate(policy_path, *, now=None, release=None, history=False):
         db.execute("BEGIN IMMEDIATE")
         old_lock, old_policy = get(db, "lock"), get(db, "policy")
         previous_time = get(db, "last_checked")
+        db.execute("SAVEPOINT native_scan")
         try:
             if previous_time and now.timestamp() < previous_time:
                 raise ValueError("clock moved backwards")
             source = scan(db, p, now)
             assessment = compare(db, p, now)
         except (OSError, ValueError, KeyError, TypeError, sqlite3.Error) as exc:
+            # A decoder can emit records before discovering a damaged frame.
+            # Keep prior verified measurements, but never commit that partial scan.
+            db.execute("ROLLBACK TO native_scan")
             source = {"status": "UNAVAILABLE", "error": type(exc).__name__, "reason": str(exc)[:240]}
             assessment = {"status": "MEASUREMENT_UNAVAILABLE"}
+        finally:
+            db.execute("RELEASE native_scan")
         changed = old_policy is not None and old_policy != digest(p)
         scope = {k:p[k] for k in ("source_db","state_db","timezone","workload")}
         scope["roots"] = sorted(p["roots"])
