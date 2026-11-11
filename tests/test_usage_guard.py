@@ -359,6 +359,202 @@ class UsageGuardTests(unittest.TestCase):
             self.assertEqual(db.execute("SELECT COUNT(*) FROM history WHERE action='LOCK'").fetchone()[0], 1)
 
 
+class AutomationUsageGuardTests(unittest.TestCase):
+    seal_baseline = UsageGuardTests.seal_baseline
+    save_policy = UsageGuardTests.save_policy
+    event = UsageGuardTests.event
+    check = UsageGuardTests.check
+
+    def setUp(self):
+        UsageGuardTests.setUp(self)
+        self.registry = self.root / "automations.sqlite"
+        with sqlite3.connect(self.registry) as db:
+            # Omit constraints deliberately: malformed imports must fail too.
+            db.execute("CREATE TABLE automations(id TEXT)")
+            db.execute("CREATE TABLE automation_runs(thread_id TEXT, automation_id TEXT, status TEXT, created_at INTEGER, updated_at INTEGER)")
+            db.executemany("INSERT INTO automations VALUES (?)", [("scheduled",), ("other",)])
+        self.config["automation_selectors"] = [{"automation_id": "scheduled", "codex_automations_db": str(self.registry)}]
+        self.save_policy()
+
+    def run_root(self, tid, *, automation="scheduled", status="RUNNING", usage=True):
+        log = self.root / (tid + ".jsonl")
+        log.write_text("")
+        with sqlite3.connect(self.source) as db:
+            db.execute("INSERT INTO threads VALUES (?,?,?)", (tid, str(log), "vscode"))
+        stamp = int((self.now - timedelta(minutes=30)).timestamp() * 1000)
+        with sqlite3.connect(self.registry) as db:
+            db.execute("INSERT INTO automation_runs VALUES (?,?,?,?,?)", (tid, automation, status, stamp, stamp))
+        if usage:
+            self.event("2026-11-02T09:30:00+00:00", tid + "-response", path=log, thread=tid)
+        return log
+
+    def test_dynamic_roots_cover_failed_unfinished_and_descendants_not_other_automations(self):
+        self.run_root("failed", status="FAILED")
+        self.run_root("running", status="IN_PROGRESS")
+        self.run_root("unrelated", automation="other")
+        child = self.root / "child.jsonl"
+        child.write_text("")
+        with sqlite3.connect(self.source) as db:
+            db.execute("INSERT INTO threads VALUES (?,?,?)", ("child", str(child), "vscode"))
+            db.execute("INSERT INTO thread_spawn_edges VALUES (?,?)", ("failed", "child"))
+        self.event("2026-11-02T09:31:00+00:00", "child-response", path=child, thread="child")
+        got = self.check()
+        self.assertTrue(got["allowed"])
+        self.assertEqual(got["source"]["root_thread_ids"], ["failed", "root", "running"])
+        self.assertEqual(got["source"]["threads"], 4)
+        self.assertEqual(got["source"]["records"], 24)
+        self.assertEqual(got["source"]["automation_scopes"][0]["run_count"], 2)
+        self.assertEqual(self.check()["source"]["records"], 24)
+
+    def test_empty_registry_is_unassessed_not_normal_and_next_root_needs_no_policy_change(self):
+        first = self.check()
+        self.assertTrue(first["allowed"])
+        self.assertEqual(first["assessment"]["status"], guard.MONITORED)
+        self.assertIn("automation:scheduled:AWAITING_NATIVE_RUN", first["assessment"]["unassessed"])
+        self.assertEqual(first["source"]["automation_scopes"][0]["root_thread_ids"], [])
+        self.run_root("first-run")
+        next_run = self.check()
+        self.assertTrue(next_run["allowed"])
+        self.assertEqual(first["policy_sha256"], next_run["policy_sha256"])
+        self.assertEqual(next_run["source"]["root_thread_ids"], ["first-run", "root"])
+
+    def test_policy_migration_uses_existing_exact_review_without_erasing_state(self):
+        selectors = self.config.pop("automation_selectors")
+        self.save_policy()
+        old = self.check()
+        self.config["automation_selectors"] = selectors
+        self.save_policy()
+        changed = self.check()
+        self.assertEqual(changed["lock"]["reason"], "POLICY_CHANGED")
+        self.assertEqual(changed["lock_findings"]["POLICY_CHANGED"]["detail"],
+                         {"old_policy": old["policy_sha256"], "new_policy": changed["policy_sha256"]})
+        self.assertEqual(self.check()["lock"]["id"], changed["lock"]["id"])
+        with self.assertRaises(ValueError):
+            self.check(release={"lock_id": changed["lock"]["id"], "evidence": "incomplete"})
+        released = self.check(release={"lock_id": changed["lock"]["id"], "evidence": "reviewed additive selector, unchanged roots and comparisons",
+                                      "policy_sha256": changed["policy_sha256"], "reviewed_reasons": ["POLICY_CHANGED"]})
+        self.assertTrue(released["allowed"])
+        self.assertEqual(released["source"]["records"], old["source"]["records"])
+        self.assertEqual(released["assessment"]["status"], guard.MONITORED)
+        with guard.connect(self.config["state_db"]) as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM history WHERE action='MANUAL_RELEASE'").fetchone()[0], 1)
+
+    def test_selector_change_cannot_release_a_preexisting_lock_with_different_scope(self):
+        self.run_root("scheduled-root")
+        self.registry.rename(self.root / "absent.sqlite")
+        original = self.check()
+        (self.root / "absent.sqlite").rename(self.registry)
+        self.config.pop("automation_selectors")
+        self.save_policy()
+        got = self.check()
+        with self.assertRaises(ValueError):
+            self.check(release={"lock_id": original["lock"]["id"], "evidence": "cannot drop the locked selector",
+                                "policy_sha256": got["policy_sha256"], "reviewed_reasons": list(got["lock_findings"])})
+
+    def test_missing_registry_schema_or_identity_is_unavailable_not_old_root_fallback(self):
+        for mutation in ("DROP TABLE automation_runs", "DELETE FROM automations WHERE id='scheduled'",
+                         "INSERT INTO automations VALUES ('scheduled')"):
+            with self.subTest(mutation=mutation):
+                with sqlite3.connect(self.registry) as db:
+                    db.execute("BEGIN")
+                    db.execute(mutation)
+                    db.commit()
+                got = self.check()
+                self.assertFalse(got["allowed"])
+                self.assertEqual(got["source"]["status"], "UNAVAILABLE")
+                self.assertNotIn("root_thread_ids", got["source"])
+                with sqlite3.connect(self.registry) as db:
+                    if mutation.startswith("DROP"):
+                        db.execute("CREATE TABLE automation_runs(thread_id TEXT, automation_id TEXT, status TEXT, created_at INTEGER, updated_at INTEGER)")
+                    else:
+                        db.execute("DELETE FROM automations WHERE id='scheduled'")
+                        db.execute("INSERT INTO automations VALUES ('scheduled')")
+        self.registry.rename(self.root / "absent.sqlite")
+        self.assertEqual(self.check()["assessment"]["status"], "MEASUREMENT_UNAVAILABLE")
+        self.assertFalse(self.registry.exists())
+
+    def test_missing_native_root_and_conflicting_parent_fail_closed(self):
+        self.run_root("scheduled-root")
+        with sqlite3.connect(self.source) as db:
+            db.execute("UPDATE threads SET id='not-the-registered-root' WHERE id='scheduled-root'")
+        got = self.check()
+        self.assertEqual(got["assessment"]["status"], "MEASUREMENT_UNAVAILABLE")
+        with sqlite3.connect(self.source) as db:
+            db.execute("UPDATE threads SET id='scheduled-root' WHERE id='not-the-registered-root'")
+            db.execute("INSERT INTO thread_spawn_edges VALUES ('root','scheduled-root')")
+        self.assertIn("not a root thread", self.check()["source"]["reason"])
+
+    def test_duplicate_and_malformed_registry_rows_fail_and_do_not_commit_partial_scan(self):
+        self.run_root("scheduled-root")
+        first = self.check()
+        with sqlite3.connect(self.registry) as db:
+            db.execute("INSERT INTO automation_runs SELECT thread_id,'other',status,created_at,updated_at FROM automation_runs")
+        got = self.check()
+        self.assertIn("ambiguous native automation", got["source"]["reason"])
+        with guard.connect(self.config["state_db"]) as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM responses").fetchone()[0], first["source"]["records"])
+        with sqlite3.connect(self.registry) as db:
+            db.execute("DELETE FROM automation_runs WHERE automation_id='other'")
+            db.execute("UPDATE automation_runs SET updated_at=-1")
+        self.assertIn("invalid native automation", self.check()["source"]["reason"])
+
+    def test_deleted_run_cannot_silently_shrink_previously_measured_scope(self):
+        self.run_root("scheduled-root", status="FAILED")
+        first = self.check()
+        with sqlite3.connect(self.registry) as db:
+            db.execute("DELETE FROM automation_runs")
+        got = self.check()
+        self.assertFalse(got["allowed"])
+        self.assertIn("previously measured", got["source"]["reason"])
+        self.assertNotEqual(got["assessment"]["status"], guard.MONITORED)
+        with guard.connect(self.config["state_db"]) as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM responses").fetchone()[0], first["source"]["records"])
+
+    def test_wal_registry_is_read_including_committed_uncheckpointed_runs(self):
+        with sqlite3.connect(self.registry) as writer:
+            writer.execute("PRAGMA journal_mode=WAL")
+            writer.execute("PRAGMA wal_autocheckpoint=0")
+            self.run_root("wal-root")
+            self.assertTrue(Path(str(self.registry) + "-wal").exists())
+            self.assertIn("wal-root", self.check()["source"]["root_thread_ids"])
+
+    def test_duplicate_identity_across_explicit_registries_is_not_scope_expansion(self):
+        self.run_root("scheduled-root")
+        second = self.root / "second-registry.sqlite"
+        with sqlite3.connect(self.registry) as source, sqlite3.connect(second) as target:
+            source.backup(target)
+            target.execute("UPDATE automation_runs SET automation_id='other'")
+        self.config["automation_selectors"].append({"automation_id": "other", "codex_automations_db": str(second)})
+        self.save_policy()
+        got = self.check()
+        self.assertFalse(got["allowed"])
+        self.assertIn("duplicate native automation", got["source"]["reason"])
+
+    def test_parent_metadata_conflict_cannot_reassign_a_descendant(self):
+        self.run_root("scheduled-root")
+        child = self.root / "child.jsonl"
+        child.write_text("")
+        with sqlite3.connect(self.source) as db:
+            db.execute("INSERT INTO threads VALUES (?,?,?)", ("child", str(child), json.dumps({
+                "subagent": {"thread_spawn": {"parent_thread_id": "outside-scope"}}})))
+            db.execute("INSERT INTO thread_spawn_edges VALUES ('scheduled-root','child')")
+        got = self.check()
+        self.assertFalse(got["allowed"])
+        self.assertIn("conflicting native parent", got["source"]["reason"])
+
+    def test_invalid_selector_configuration_never_aliases_meter_or_uses_implicit_database(self):
+        valid = self.config["automation_selectors"][0]
+        for selectors in ([valid, valid], [{"automation_id": "scheduled"}],
+                          [{**valid, "codex_automations_db": "relative.sqlite"}],
+                          [{**valid, "codex_automations_db": self.config["state_db"]}],
+                          [{**valid, "project_id": "do-not-infer"}]):
+            with self.subTest(selectors=selectors):
+                self.config["automation_selectors"] = selectors
+                self.save_policy()
+                with self.assertRaises(ValueError):
+                    self.check()
+
+
 @unittest.skipUnless(shutil.which("zstd"), "compressed native sources require zstd")
 class CompressedUsageGuardTests(unittest.TestCase):
     setUp = UsageGuardTests.setUp

@@ -4,7 +4,7 @@ Tokens/responses are separate proxy measures, never credits or a billing cap.
 No scheduler, model call, account request, or automatic unlock is performed.
 """
 import hashlib
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 import json
 import math
 import os
@@ -41,7 +41,7 @@ def source_connection(path):
     # Immutable is safe only when no WAL exists; never use it to hide a WAL.
     if not Path(str(path) + "-wal").exists():
         uri += "&immutable=1"
-    return sqlite3.connect(uri, uri=True, timeout=5)
+    return closing(sqlite3.connect(uri, uri=True, timeout=5))
 
 
 def policy(path):
@@ -57,6 +57,23 @@ def policy(path):
         raise ValueError("duplicate native roots")
     if Path(p["source_db"]).resolve() == Path(p["state_db"]).resolve():
         raise ValueError("meter state must not overwrite native source")
+    selectors = p.get("automation_selectors", [])
+    if not isinstance(selectors, list):
+        raise ValueError("automation_selectors must be a list")
+    identities = set()
+    for selector in selectors:
+        if not isinstance(selector, dict) or set(selector) != {"automation_id", "codex_automations_db"}:
+            raise ValueError("automation selector requires only automation_id and codex_automations_db")
+        aid, path = selector["automation_id"], selector["codex_automations_db"]
+        if not isinstance(aid, str) or not aid.strip() or aid != aid.strip():
+            raise ValueError("explicit native automation identity required")
+        if not isinstance(path, str) or not Path(path).is_absolute():
+            raise ValueError("explicit absolute native automation database required")
+        if aid in identities:
+            raise ValueError("duplicate native automation selector")
+        identities.add(aid)
+        if Path(path).resolve() in {Path(p["source_db"]).resolve(), Path(p["state_db"]).resolve()}:
+            raise ValueError("native automation database must be distinct from telemetry and meter state")
     ZoneInfo(p["timezone"])
     if not isinstance(p["workload"], str) or not p["workload"]:
         raise ValueError("fixed comparable workload required")
@@ -156,22 +173,80 @@ def rollout_stream(value):
             process.stdout.close()
 
 
-def scan(db, p, now):
-    """Incremental bounded-memory reads; one globally unique response per event."""
+def automation_scope(p, now):
+    """Read only native identity metadata, including failed and unfinished runs."""
+    scopes, owners = [], {}
+    for selector in p.get("automation_selectors", []):
+        aid = selector["automation_id"]
+        roots = set()
+        with source_connection(selector["codex_automations_db"]) as source:
+            source.execute("BEGIN")  # One registry snapshot, including a live WAL.
+            for table, required in (("automations", {"id"}),
+                                    ("automation_runs", {"thread_id", "automation_id", "status", "created_at", "updated_at"})):
+                kind = source.execute("SELECT type FROM sqlite_master WHERE name=?", (table,)).fetchone()
+                columns = {row[1] for row in source.execute("PRAGMA table_info(" + table + ")")}
+                if not kind or kind[0] != "table" or not required <= columns:
+                    raise ValueError("native automation schema unavailable: " + table)
+            if len(source.execute("SELECT id FROM automations WHERE id=?", (aid,)).fetchall()) != 1:
+                raise ValueError("native automation identity missing or duplicate: " + aid)
+            rows = source.execute("SELECT thread_id,status,created_at,updated_at FROM automation_runs WHERE automation_id=?", (aid,))
+            for tid, status, created, updated in rows:
+                if (not isinstance(tid, str) or not tid.strip() or tid != tid.strip()
+                        or not isinstance(status, str) or not status.strip()
+                        or type(created) is not int or type(updated) is not int
+                        or created < 0 or updated < created or updated > (now.timestamp() + 60) * 1000):
+                    raise ValueError("invalid native automation run metadata: " + aid)
+                if tid in roots or tid in owners:
+                    raise ValueError("duplicate native automation run identity")
+                # Even an incompatible DB without its native uniqueness constraint
+                # must not assign this root to a second automation.
+                if source.execute("SELECT COUNT(*) FROM automation_runs WHERE thread_id=?", (tid,)).fetchone()[0] != 1:
+                    raise ValueError("ambiguous native automation run identity")
+                roots.add(tid)
+                owners[tid] = aid
+        scopes.append({**selector, "codex_automations_db": str(Path(selector["codex_automations_db"]).resolve()),
+                       "root_thread_ids": sorted(roots), "run_count": len(roots),
+                       "coverage": "REGISTERED_ROOTS" if roots else "AWAITING_NATIVE_RUN"})
+    return scopes
+
+
+def native_scope(p, now):
+    """Resolve explicit roots and native registry roots without reading messages."""
+    automation_scopes = automation_scope(p, now)
     with source_connection(p["source_db"]) as source:
+        source.execute("BEGIN")
         source.row_factory = sqlite3.Row
-        threads = {r["id"]: dict(r) for r in source.execute("SELECT id,rollout_path,source FROM threads")}
-        if not set(p["roots"]) <= threads.keys():
+        threads = {}
+        for row in source.execute("SELECT id,rollout_path,source FROM threads"):
+            if row["id"] in threads:
+                raise ValueError("duplicate native thread identity")
+            threads[row["id"]] = dict(row)
+        roots = set(p["roots"]) | {tid for scope in automation_scopes for tid in scope["root_thread_ids"]}
+        if not roots <= threads.keys():
             raise ValueError("a configured native root is missing")
         parents = {}
+        def parent(child, ancestor):
+            if not isinstance(ancestor, str) or not ancestor or child == ancestor:
+                raise ValueError("invalid native parent identity")
+            if child in parents and parents[child] != ancestor:
+                raise ValueError("conflicting native parent identities")
+            parents[child] = ancestor
         if source.execute("SELECT 1 FROM sqlite_master WHERE name='thread_spawn_edges'").fetchone():
-            parents.update((r[1], r[0]) for r in source.execute("SELECT parent_thread_id,child_thread_id FROM thread_spawn_edges"))
+            edge_children = set()
+            for ancestor, child in source.execute("SELECT parent_thread_id,child_thread_id FROM thread_spawn_edges"):
+                if child in edge_children:
+                    raise ValueError("duplicate native parent edge")
+                edge_children.add(child)
+                parent(child, ancestor)
         for tid, row in threads.items():
             try:
-                parents[tid] = json.loads(row["source"])["subagent"]["thread_spawn"]["parent_thread_id"]
+                ancestor = json.loads(row["source"])["subagent"]["thread_spawn"]["parent_thread_id"]
             except (KeyError, ValueError, TypeError):
-                pass
-    selected = set(p["roots"])
+                continue
+            parent(tid, ancestor)
+    if any(tid in parents for scope in automation_scopes for tid in scope["root_thread_ids"]):
+        raise ValueError("native automation run is not a root thread")
+    selected = set(roots)
     while True:
         children = {tid for tid, parent in parents.items() if parent in selected}
         if children <= selected:
@@ -179,6 +254,18 @@ def scan(db, p, now):
         selected |= children
     if not selected <= threads.keys():
         raise ValueError("native descendant metadata missing")
+    return threads, selected, sorted(roots), automation_scopes
+
+
+def scan(db, p, now):
+    """Incremental bounded-memory reads; one globally unique response per event."""
+    threads, selected, roots, automation_scopes = native_scope(p, now)
+    prior_scopes = get(db, "automation_scopes") or {}
+    for scope in automation_scopes:
+        key = digest({k: scope[k] for k in ("automation_id", "codex_automations_db")})
+        if not set(prior_scopes.get(key, [])) <= set(scope["root_thread_ids"]):
+            raise ValueError("previously measured native automation roots are missing")
+        prior_scopes[key] = scope["root_thread_ids"]
     for tid in sorted(selected):
         with rollout_stream(threads[tid]["rollout_path"]) as (path, compressed, stat, stream):
             old = db.execute("SELECT * FROM cursors WHERE path=?", (str(path),)).fetchone()
@@ -225,7 +312,10 @@ def scan(db, p, now):
         else:
             db.execute("INSERT OR REPLACE INTO cursors VALUES (?,?,?,?,?)", (str(path), stat.st_dev, stat.st_ino, offset, model))
     put(db, "scope_threads", sorted(selected))
-    return {"threads": len(selected), "records": db.execute("SELECT COUNT(*) FROM responses").fetchone()[0], "observed_at": now.isoformat()}
+    if automation_scopes:
+        put(db, "automation_scopes", prior_scopes)
+    return {"threads": len(selected), "records": db.execute("SELECT COUNT(*) FROM responses").fetchone()[0],
+            "root_thread_ids": roots, "automation_scopes": automation_scopes, "observed_at": now.isoformat()}
 
 
 def day_class(day, p):
@@ -469,6 +559,11 @@ def evaluate(policy_path, *, now=None, release=None, history=False):
                 raise ValueError("clock moved backwards")
             source = scan(db, p, now)
             assessment = compare(db, p, now)
+            pending = [scope["automation_id"] for scope in source["automation_scopes"]
+                       if scope["coverage"] == "AWAITING_NATIVE_RUN"]
+            if pending and assessment["status"] in ADMISSIBLE:
+                assessment["status"] = MONITORED
+                assessment.setdefault("unassessed", []).extend("automation:" + aid + ":AWAITING_NATIVE_RUN" for aid in pending)
         except (OSError, ValueError, KeyError, TypeError, sqlite3.Error) as exc:
             # A decoder can emit records before discovering a damaged frame.
             # Keep prior verified measurements, but never commit that partial scan.
@@ -480,6 +575,8 @@ def evaluate(policy_path, *, now=None, release=None, history=False):
         changed = old_policy is not None and old_policy != digest(p)
         scope = {k:p[k] for k in ("source_db","state_db","timezone","workload")}
         scope["roots"] = sorted(p["roots"])
+        if p.get("automation_selectors"):
+            scope["automation_selectors"] = sorted(p["automation_selectors"], key=lambda row: row["automation_id"])
         reasons = ([assessment["status"]] if assessment["status"] not in ADMISSIBLE else [])
         if changed:reasons.append("POLICY_CHANGED")
         lock = old_lock
@@ -501,7 +598,8 @@ def evaluate(policy_path, *, now=None, release=None, history=False):
                 if lock["id"]==original_identity:
                     put(db,"locked_scope",scope);put(db,"locked_policy",digest(p))
             for reason in set(reasons+[lock["reason"]]):
-                detail = assessment if reason in reasons and reason != "POLICY_CHANGED" else lock.get("assessment",{}) if reason==lock["reason"] else {"old_policy":old_policy,"new_policy":digest(p)}
+                detail = ({"old_policy":old_policy,"new_policy":digest(p)} if reason == "POLICY_CHANGED"
+                          else assessment if reason in reasons else lock.get("assessment",{}))
                 if reason not in findings:
                     findings[reason] = {"first_at":now.isoformat(), "detail":detail}
                     db.execute("INSERT INTO history(at,action,detail) VALUES (?,?,?)",
@@ -537,7 +635,7 @@ def evaluate(policy_path, *, now=None, release=None, history=False):
             put(db,"lock",None);put(db,"lock_findings",{});put(db,"locked_scope",None);put(db,"locked_policy",None)
         result = {"schema": SCHEMA, "allowed": lock is None, "lock": lock, "assessment": assessment,
                   "source": source, "measurement": "native responses and token categories; not account credits",
-                  "scope": "configured local native roots and descendants; checked admission boundaries only",
+                  "scope": "configured local native roots, selected native automation runs and descendants; checked admission boundaries only",
                   "policy_sha256":digest(p), "lock_findings":findings,
                   "lock_scope_verified":bool(lock and get(db,"locked_scope")),
                   "hard_account_spending_cap": False,

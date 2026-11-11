@@ -112,6 +112,18 @@ python3 /path/to/codex-framework/scripts/codex_framework.py install \
 
 回退一起恢复相容的正文、工具和契约，保留已知远端版本与明确的 `rolled-back` 状态；本地有效修订继续保护。运行中、冻结复现或未决恢复可能引用的旧目录和失败准备内容不自动删除，退出引用后再按明确范围清理；它们不是另一套活动实现。失败入口诊断保留在运行目录的 `failures/`，不进入源码仓库。
 
+## 原生定时任务的用量范围
+
+`codex-framework usage-check` 从标准输入接收 `{"policy":"<节点策略绝对路径>","action":"check"}`，沿原计量状态、比较阈值和持久锁工作。它只读本机原生来源并维护自己的 meter，不创建或启停调度、不写 App 数据库，也不把 token 代理指标称为账户额度。`history` 只增加待复核的历史候选；检查本身仍更新原 meter。
+
+原 `roots` 保留固定主线程及其原生后代。从 0.7.3 起，独立 cron 每次生成不同根时，可在同一节点策略增加 `automation_selectors`，每项只含明确的 `automation_id` 与绝对路径 `codex_automations_db`。绑定来自节点真实配置，不按项目名、标题、目录或时间猜任务。该来源须有原生 `automations.id` 和 `automation_runs` 的 `automation_id/thread_id/status/created_at/updated_at` 字段；只读身份、状态及毫秒时间，不读取任务提示或消息正文。
+
+每次检查从原生登记选择该 automation 的全部运行根，包含失败、取消及尚未完成的运行，再按原生父子关系展开；不会把新根逐次写回策略。成功结果的 `source.root_thread_ids` 是本轮实际解析的静态根与登记根并集，`source.automation_scopes` 逐项返回绑定、`run_count`、`root_thread_ids` 和 `coverage`。无登记时明确为 `AWAITING_NATIVE_RUN`，评估最多为 `MONITORED_LIMITED_BASELINE` 并列出未评估范围，不能作为新任务已运行、身份已覆盖或零消耗正常的证据。调用方仍须用当前原生 thread 身份核对所属登记根，并核对守卫实际返回范围；配置预检不代替业务准入。
+
+缺数据库、缺 schema、重复或异常登记、登记根缺原生 metadata、父关系冲突或已经计量的根从登记消失时，按原 `MEASUREMENT_UNAVAILABLE` 持久锁处理，不静默退回旧根；失败结果不返回未经核验的根集合。使用真实 WAL 只读快照，不制造替代表、复制任务库或滤掉失败开销。
+
+增加 selector 是一次策略变化，仍触发 `POLICY_CHANGED`。正式迁移使用既有入口：先核旧策略和原锁，已有故障先在原范围修复并复核；保留原 roots、阈值、历史引用和同一 meter，只加入已核绑定；运行 `check` 保存实际返回的锁及所有原因；核验完整来源、保持的比较和 selector 结果后，发送 `{"policy":"<同一策略>","action":"release","release":{"lock_id":"<确切锁>","policy_sha256":"<当前摘要>","reviewed_reasons":["<全部实际原因>"],"evidence":"<本次真实复核依据>"}}`。`release` 重新计量，仅在当前无故障、原锁范围匹配且全部原因均已复核时记录 `MANUAL_RELEASE`。不删除锁、清 meter、改摘要或把未执行的验收写作通过；旧锁范围改变时该释放仍拒绝。动态新增登记根不改策略摘要，但新增历史若改变已复核基线仍照常阻断。
+
 ## 任务启动与变更刷新
 
 完成首次兼容迁移后，核对本机正常 Codex CLI，运行 `"$HOME/.local/bin/codex-framework" install-hook --native-cli <Codex绝对路径>`。处理器在启动、恢复及清空时直接读取发布版本、核对部署与运行版本，并复用现有同步器兼容刷新规则。它通过原生 `app-server` 的临时工具上下文读取已有 GitHub 连接，不启动模型回合、不保存聊天、不建立后台调度。无配置时发布结果为 UNKNOWN。全局已由原生指令链装入且未变化时不重复注入；本次更新正文有界进入当前上下文，超过范围仍明确未注入。程序检查完成、模型取得正文与实际采用分别验证。
