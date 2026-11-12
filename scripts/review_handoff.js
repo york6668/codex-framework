@@ -412,6 +412,11 @@ function createReviewHandoff(sha256Utf8, receiveKnownFinal=null) {
     need(same(record.dispatch.contract.request,selectedRequest),"original continuation record mismatch");
     need(["started","returned","unknown"].includes(record.attempt),"original send has not started");
     need(object(io) && typeof io.retain==="function" && typeof io.consume==="function","original retain/consume callbacks required");
+    // A rejected or lost acknowledgement cannot make an in-memory completion
+    // authoritative. Keep the original attempt until retention is confirmed.
+    const retain=async snapshot=>{
+      try {return await io.retain(canon(snapshot))===true;} catch(e) {return false;}
+    };
     const got=await readReview(dispatches,selectedRequest,io);
     const bound=got.evaluation;
     const answer=(state,reason,extra={})=>({state,reason,binding:bound,
@@ -426,29 +431,35 @@ function createReviewHandoff(sha256Utf8, receiveKnownFinal=null) {
         ["started","returned","unknown"].includes(prior.state),"original consumption identity/state mismatch");
       if(prior.state==="returned") {need(text(prior.receipt_ref),"original consumer receipt missing");return answer("consumed","reuse original consumer receipt",{receipt_ref:prior.receipt_ref});}
       if(typeof io.inspectConsumption!=="function") return answer("unknown","inspect original consumer effect before continuation");
-      let observed;
-      try {observed=await io.inspectConsumption(identity);} catch(e) {return answer("unknown","original consumer effect unavailable");}
+      let observed, established=false;
+      try {
+        observed=await io.inspectConsumption(identity);
+        established=object(observed) && same(observed.identity,identity) &&
+          observed.status==="committed" && text(observed.receipt_ref);
+      } catch(e) {return answer("unknown","original consumer effect unavailable");}
       // A receipt is an explicit readback in the original caller, not permission
       // to start again. NOT_EXECUTED requires the original budget decision.
-      if(!object(observed) || !same(observed.identity,identity) || observed.status!=="committed" || !text(observed.receipt_ref))
+      if(!established)
         return answer("unknown","original consumer effect not established; preserve original attempt");
-      prior.state="returned";prior.receipt_ref=observed.receipt_ref;
-      if(await io.retain(canon(record))!==true) return answer("unknown","consumer receipt not retained");
-      return answer("consumed","original effect recovered without repetition",{receipt_ref:prior.receipt_ref});
+      const returned={identity,state:"returned",receipt_ref:observed.receipt_ref};
+      if(!await retain({...record,consumption:returned})) return answer("unknown","consumer receipt not retained");
+      record.consumption=returned;
+      return answer("consumed","original effect recovered without repetition",{receipt_ref:returned.receipt_ref});
     }
     record.consumption={identity,state:"started",receipt_ref:null};
-    if(await io.retain(canon(record))!==true) return answer("unknown","consumption intent not retained; no effect");
+    if(!await retain(record)) return answer("unknown","consumption intent not retained; no effect");
     let receipt;
     try {receipt=await io.consume(bound);} catch(e) {
-      record.consumption.state="unknown";await io.retain(canon(record));
+      record.consumption.state="unknown";await retain(record);
       return answer("unknown","consumer outcome unknown; inspect original effect");
     }
     if(!object(receipt) || receipt.status!=="committed" || !text(receipt.receipt_ref)) {
-      record.consumption.state="unknown";await io.retain(canon(record));
+      record.consumption.state="unknown";await retain(record);
       return answer("unknown","consumer has no committed readback; do not repeat");
     }
-    record.consumption.state="returned";record.consumption.receipt_ref=receipt.receipt_ref;
-    if(await io.retain(canon(record))!==true) return answer("unknown","consumer receipt not retained; inspect original effect");
+    const returned={identity,state:"returned",receipt_ref:receipt.receipt_ref};
+    if(!await retain({...record,consumption:returned})) return answer("unknown","consumer receipt not retained; inspect original effect");
+    record.consumption=returned;
     return answer("consumed","actual original consumer returned; original goal still reviewed separately",{receipt_ref:receipt.receipt_ref});
   }
   return {continueReview,makeReviewDispatch,parseReviewDispatch,sendReview,recoverDispatch,recoverNativeDispatch,observeReview,receiveReview,readReview,decideReview};

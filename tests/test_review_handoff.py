@@ -42,7 +42,7 @@ class ReviewHandoffTests(unittest.TestCase):
         self.native = self.native_read(self.dispatch, self.body)
 
     def js(self, op, **args):
-        source = """
+        source = r"""
 const fs=require('fs');
 const old=require(process.argv[1]+'/scripts/return_receipt_receiver.js');
 const api=require(process.argv[1]+'/scripts/review_handoff.js').createReviewHandoff(old.sha256Utf8,old.receiveFinal);
@@ -63,11 +63,39 @@ const d=JSON.parse(fs.readFileSync(0,'utf8'));
  }
  else if(d.op==='decide') r=api.decideReview(d.bound,d.decision);
  else if(d.op==='continue') {
-   const calls=[], retained=[]; const record=d.record;
+   const calls=[], retained=[];
+   const record=d.loadFromRetained?JSON.parse(fs.readFileSync(d.retainedPath,'utf8')):d.record;
+   const persist=(path,raw)=>{
+     const fd=fs.openSync(path,'w');
+     try {fs.writeFileSync(fd,raw);fs.fsyncSync(fd);} finally {fs.closeSync(fd);}
+   };
    const io={source:d.source,readNative:async target=>{calls.push('read');return d.native;},
-     readReport:async ref=>d.readback,
-     retain:async raw=>{retained.push(JSON.parse(raw));return d.retain!==false;},
-     consume:async bound=>{calls.push('consume');if(d.consumeThrows)throw Error('lost consumer ack');
+     readReport:async ref=>{
+       if(!d.readReportFromDisk)return d.readback;
+       calls.push('readReportFile');
+       if(ref!==d.readback.ref)throw Error('unexpected report path');
+       return {ref,text:fs.readFileSync(ref,'utf8'),truncated:false,
+         evidence:Object.entries(d.evidencePaths).map(([ref,path])=>
+           ({ref,text:fs.readFileSync(path,'utf8'),truncated:false}))};
+     },
+     retain:async raw=>{
+       retained.push(JSON.parse(raw));
+       const fails=(d.retainFailAt||[]).includes(retained.length);
+       if(d.retainedPath && d.retain!==false && (!fails || d.retainFailure==='write-then-throw'))
+         persist(d.retainedPath,raw);
+       if(fails && ['throw','write-then-throw'].includes(d.retainFailure))throw Error('retention acknowledgement unavailable');
+       return d.retain!==false && !fails;
+     },
+     consume:async bound=>{calls.push('consume');
+       if(d.effectsPath) {
+         const effect={identity:{request:d.selected,final_ref:bound.native_final_ref,
+           final_utf8_sha256:bound.final_utf8_sha256,report_sha256:bound.report_sha256},
+           receipt_ref:d.effectsPath+'#committed'};
+         const fd=fs.openSync(d.effectsPath,'a');
+         try {fs.writeFileSync(fd,JSON.stringify(effect)+'\n');fs.fsyncSync(fd);} finally {fs.closeSync(fd);}
+         if(d.crashAfterEffect)process.exit(79);
+       }
+       if(d.consumeThrows)throw Error('lost consumer ack');
        if(d.consumerCli) {
          const report={...d.consumerTemplate,native_result:{thread_id:d.selected.target_thread,
            turn_id:bound.native_turn_id,final_ref:bound.native_final_ref,final_sha256:bound.final_utf8_sha256}};
@@ -78,11 +106,22 @@ const d=JSON.parse(fs.readFileSync(0,'utf8'));
          const actual=JSON.parse(r.stdout);if(actual.result_state.result.sha256!==request.sha256)throw Error('consumer readback mismatch');
          return {status:'committed',receipt_ref:actual.task_id+'/revision/'+actual.revision};
        }
-       return {status:'committed',receipt_ref:'original-consumer-receipt'};}};
+       return {status:'committed',receipt_ref:d.effectsPath?d.effectsPath+'#committed':'original-consumer-receipt'};}};
    if(d.inspect)io.inspectConsumption=async identity=>{calls.push('inspect');return {identity,status:d.inspect,receipt_ref:'original-consumer-receipt'};};
+   if(d.inspectFromEffect)io.inspectConsumption=async identity=>{
+     calls.push('inspect');
+     const rows=fs.existsSync(d.effectsPath)?fs.readFileSync(d.effectsPath,'utf8').trim().split('\n').filter(Boolean).map(JSON.parse):[];
+     const found=rows.find(row=>require('util').isDeepStrictEqual(row.identity,identity));
+     return {identity,status:found?'committed':'unknown',receipt_ref:found?found.receipt_ref:null};
+   };
+   if(d.inspectionPath)io.inspectConsumption=async()=>{
+     calls.push('inspect');
+     return JSON.parse(fs.readFileSync(d.inspectionPath,'utf8'));
+   };
    const outputs=[];
    for(let i=0;i<(d.repeat||1);i++)outputs.push(await api.continueReview(record,d.dispatches,d.selected,io));
-   r={outputs,record,calls,retained};
+   r={outputs,record,calls,retained,
+      stored:d.retainedPath && fs.existsSync(d.retainedPath)?JSON.parse(fs.readFileSync(d.retainedPath,'utf8')):null};
  }
  else if(d.op==='io') {
    const calls=[], record=d.record;
@@ -99,8 +138,11 @@ const d=JSON.parse(fs.readFileSync(0,'utf8'));
 })().catch(e=>{process.stdout.write(JSON.stringify({error:e.message,errorName:e.name}));});
 """
         run = subprocess.run(["node", "-e", source, str(ROOT)], input=json.dumps(dict(op=op, **args)),
-                             capture_output=True, text=True, check=True)
+                             capture_output=True, text=True)
+        self.assertEqual(run.returncode, args.get("expectedExit", 0), run.stderr)
         self.assertEqual(run.stderr, "")
+        if args.get("expectedExit"):
+            return {"exit_code": run.returncode, "stdout": run.stdout}
         return json.loads(run.stdout)
 
     def make(self, sender="parent", request_id="new-review", supersedes=None):
@@ -222,6 +264,192 @@ const d=JSON.parse(fs.readFileSync(0,'utf8'));
         resumed = self.js("continue", record=lost["record"], inspect="committed", **arguments)
         self.assertNotIn("consume", resumed["calls"])
         self.assertEqual(resumed["outputs"][0]["state"], "consumed")
+
+    def continuation_case(self):
+        source = self.result_source()
+        return dict(record={"dispatch": self.dispatch, "attempt": "returned", "native_receipt": None},
+                    dispatches=[self.dispatch], selected=source["request"], source=source,
+                    native=self.native_read(self.dispatch, "Original result ready for owner review"),
+                    readback=self.rb, retainedPath=str(self.root / "original-continuation.json"))
+
+    def test_failed_receipt_retention_never_becomes_consumed_from_mutated_memory(self):
+        args = self.continuation_case()
+        got = self.js("continue", repeat=2, retainFailAt=[2], **args)
+        self.assertEqual([row["state"] for row in got["outputs"]], ["unknown", "unknown"])
+        self.assertEqual(got["calls"].count("consume"), 1)
+        self.assertEqual(got["stored"]["consumption"]["state"], "started")
+        self.assertNotEqual(got["record"]["consumption"]["state"], "returned")
+        # Once the original effect is read back, only the record is repaired.
+        resumed = self.js("continue", inspect="committed", **dict(args, record=got["record"]))
+        self.assertEqual(resumed["outputs"][0]["state"], "consumed")
+        self.assertEqual(resumed["calls"].count("consume"), 0)
+        self.assertEqual(resumed["calls"].count("inspect"), 1)
+        self.assertEqual(resumed["record"], resumed["stored"])
+
+    def test_recovery_receipt_is_not_completed_before_retention_acknowledgement(self):
+        args = self.continuation_case()
+        lost = self.js("continue", consumeThrows=True, **args)
+        got = self.js("continue", repeat=2, inspect="committed", retainFailAt=[1],
+                      **dict(args, record=lost["record"]))
+        self.assertEqual([row["state"] for row in got["outputs"]], ["unknown", "consumed"])
+        self.assertEqual(got["calls"].count("consume"), 0)
+        self.assertEqual(got["calls"].count("inspect"), 2)
+        self.assertEqual(got["stored"]["consumption"]["state"], "returned")
+        self.assertEqual(got["record"], got["stored"])
+
+    def test_retention_exceptions_preserve_unknown_and_never_replay_effect(self):
+        for failure, at, consumer_throws in (("throw", 1, False), ("throw", 2, False),
+                                             ("write-then-throw", 2, False), ("throw", 2, True)):
+            with self.subTest(failure=failure, at=at, consumer_throws=consumer_throws):
+                args = self.continuation_case()
+                Path(args["retainedPath"]).unlink(missing_ok=True)
+                got = self.js("continue", repeat=2, retainFailAt=[at], retainFailure=failure,
+                              consumeThrows=consumer_throws, **args)
+                self.assertNotIn("error", got)
+                self.assertEqual([row["state"] for row in got["outputs"]], ["unknown", "unknown"])
+                self.assertEqual(got["calls"].count("consume"), 0 if at == 1 else 1)
+                self.assertNotEqual(got["record"]["consumption"]["state"], "returned")
+
+    def durable_continuation_case(self):
+        args = self.continuation_case()
+        Path(args["retainedPath"]).write_text(json.dumps(args["record"]))
+        return dict(args, loadFromRetained=True, effectsPath=str(self.root / "effects.jsonl"))
+
+    def persisted_effects(self, args):
+        path = Path(args["effectsPath"])
+        return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+
+    def test_restart_after_failed_receipt_recovers_actual_file_effect_once(self):
+        args = self.durable_continuation_case()
+        first = self.js("continue", repeat=2, retainFailAt=[2], **args)
+        self.assertEqual([r["state"] for r in first["outputs"]], ["unknown", "unknown"])
+        self.assertEqual(first["stored"]["consumption"]["state"], "started")
+        self.assertEqual(len(self.persisted_effects(args)), 1)
+        restarted = self.js("continue", inspectFromEffect=True, **args)
+        self.assertEqual(restarted["outputs"][0]["state"], "consumed")
+        self.assertNotIn("consume", restarted["calls"])
+        self.assertEqual(restarted["stored"], restarted["record"])
+        duplicate = self.js("continue", **args)
+        self.assertEqual(duplicate["outputs"][0]["state"], "consumed")
+        self.assertNotIn("consume", duplicate["calls"])
+        self.assertEqual(len(self.persisted_effects(args)), 1)
+
+    def test_restart_reads_written_receipt_after_lost_retention_ack(self):
+        args = self.durable_continuation_case()
+        first = self.js("continue", retainFailAt=[2], retainFailure="write-then-throw", **args)
+        self.assertEqual(first["outputs"][0]["state"], "unknown")
+        self.assertEqual(first["stored"]["consumption"]["state"], "returned")
+        self.assertNotEqual(first["record"]["consumption"]["state"], "returned")
+        restarted = self.js("continue", **args)
+        self.assertEqual(restarted["outputs"][0]["state"], "consumed")
+        self.assertNotIn("consume", restarted["calls"])
+        self.assertEqual(len(self.persisted_effects(args)), 1)
+
+    def test_process_exit_after_effect_requires_inspection_without_replay(self):
+        args = self.durable_continuation_case()
+        first = self.js("continue", crashAfterEffect=True, expectedExit=79, **args)
+        self.assertEqual(first["stdout"], "")
+        self.assertEqual(json.loads(Path(args["retainedPath"]).read_text())["consumption"]["state"], "started")
+        waiting = self.js("continue", **args)
+        self.assertEqual(waiting["outputs"][0]["state"], "unknown")
+        self.assertNotIn("consume", waiting["calls"])
+        recovered = self.js("continue", inspectFromEffect=True, **args)
+        self.assertEqual(recovered["outputs"][0]["state"], "consumed")
+        self.assertNotIn("consume", recovered["calls"])
+        self.assertEqual(recovered["stored"]["consumption"]["receipt_ref"], self.persisted_effects(args)[0]["receipt_ref"])
+        self.assertEqual(len(self.persisted_effects(args)), 1)
+
+    def test_restart_after_intent_failure_never_duplicates_an_effect(self):
+        for failure in (None, "throw", "write-then-throw"):
+            with self.subTest(failure=failure):
+                args = self.durable_continuation_case()
+                Path(args["effectsPath"]).unlink(missing_ok=True)
+                first = self.js("continue", retainFailAt=[1], retainFailure=failure, **args)
+                self.assertEqual(first["outputs"][0]["state"], "unknown")
+                self.assertEqual(self.persisted_effects(args), [])
+                restarted = self.js("continue", inspectFromEffect=True, **args)
+                if failure == "write-then-throw":
+                    self.assertEqual(restarted["outputs"][0]["state"], "unknown")
+                    self.assertNotIn("consume", restarted["calls"])
+                    self.assertEqual(self.persisted_effects(args), [])
+                else:
+                    self.assertEqual(restarted["outputs"][0]["state"], "consumed")
+                    self.assertEqual(len(self.persisted_effects(args)), 1)
+
+    def test_recovery_retention_failure_keeps_disk_state_unfinished(self):
+        args = self.durable_continuation_case()
+        self.js("continue", crashAfterEffect=True, expectedExit=79, **args)
+        failed = self.js("continue", inspectFromEffect=True, retainFailAt=[1], retainFailure="throw", **args)
+        self.assertEqual(failed["outputs"][0]["state"], "unknown")
+        self.assertEqual(failed["stored"]["consumption"]["state"], "started")
+        self.assertEqual(failed["record"], failed["stored"])
+        recovered = self.js("continue", inspectFromEffect=True, **args)
+        self.assertEqual(recovered["outputs"][0]["state"], "consumed")
+        self.assertNotIn("consume", recovered["calls"])
+        self.assertEqual(recovered["record"], recovered["stored"])
+        self.assertEqual(len(self.persisted_effects(args)), 1)
+
+    def live_file_continuation_case(self):
+        args = self.durable_continuation_case()
+        evidence_path = self.root / "probe.json"
+        evidence_path.write_text(self.evidence_text)
+        return dict(args, readReportFromDisk=True, evidencePaths={"probe.json": str(evidence_path)})
+
+    def test_malformed_original_effect_file_preserves_unknown_then_recovers(self):
+        args = self.live_file_continuation_case()
+        first = self.js("continue", retainFailAt=[2], **args)
+        self.assertEqual(first["outputs"][0]["state"], "unknown")
+        self.assertIn("readReportFile", first["calls"])
+        effects = self.persisted_effects(args)
+        self.assertEqual(len(effects), 1)
+        receipt = dict(effects[0], status="committed")
+        inspection = self.root / "original-effect-readback.json"
+        missing = {k: v for k, v in receipt.items() if k != "identity"}
+        wrong = copy.deepcopy(receipt)
+        wrong["identity"]["final_utf8_sha256"] = "0" * 64
+        deep = None
+        for _ in range(25):
+            deep = [deep]
+        for raw in (json.dumps(missing), json.dumps(dict(receipt, identity=None)),
+                    json.dumps(wrong), json.dumps(dict(receipt, identity=deep)), "{broken"):
+            with self.subTest(readback=raw):
+                inspection.write_text(raw)
+                got = self.js("continue", inspectionPath=str(inspection), **args)
+                self.assertNotIn("error", got)
+                self.assertEqual(got["outputs"][0]["state"], "unknown")
+                self.assertNotIn("consume", got["calls"])
+                self.assertEqual(got["record"], got["stored"])
+                self.assertEqual(got["stored"]["consumption"]["state"], "started")
+                self.assertEqual(self.persisted_effects(args), effects)
+        inspection.write_text(json.dumps(receipt))
+        recovered = self.js("continue", inspectionPath=str(inspection), **args)
+        self.assertEqual(recovered["outputs"][0]["state"], "consumed")
+        self.assertNotIn("consume", recovered["calls"])
+        self.assertEqual(recovered["stored"]["consumption"]["receipt_ref"], receipt["receipt_ref"])
+        duplicate = self.js("continue", **args)
+        self.assertEqual(duplicate["outputs"][0]["state"], "consumed")
+        self.assertNotIn("consume", duplicate["calls"])
+        self.assertEqual(self.persisted_effects(args), effects)
+
+    def test_live_report_and_evidence_changes_block_consumption(self):
+        args = self.live_file_continuation_case()
+        report_path = Path(self.rb["ref"])
+        evidence_path = Path(args["evidencePaths"]["probe.json"])
+        for path in (report_path, evidence_path):
+            with self.subTest(changed_file=path.name):
+                original = path.read_bytes()
+                path.write_bytes(original + b"\n")
+                got = self.js("continue", **args)
+                self.assertEqual(got["outputs"][0]["state"], "unknown")
+                self.assertEqual(got["outputs"][0]["binding"]["binding"], "rejected")
+                self.assertIn("readReportFile", got["calls"])
+                self.assertNotIn("consume", got["calls"])
+                self.assertEqual(got["record"], got["stored"])
+                self.assertEqual(self.persisted_effects(args), [])
+                path.write_bytes(original)
+        restored = self.js("continue", **args)
+        self.assertEqual(restored["outputs"][0]["state"], "consumed")
+        self.assertEqual(len(self.persisted_effects(args)), 1)
 
     def test_cloud_actual_projection_is_recognized_but_not_a_fabricated_native_final(self):
         raw = self.cloud_projection()
