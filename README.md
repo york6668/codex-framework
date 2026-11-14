@@ -21,7 +21,7 @@
 
 本文的“GitHub 项目”指源码与规范来源，“Codex 云端执行环境”指任务运行位置。执行节点直接通过当前可用的仓库连接或 Git 访问 GitHub，读取规范不要求中转到另一个 Codex 任务。本框架以本项目发布内容为准；具体组织与项目的来源选择、旧配置迁移和历史状态由助手及工作站在原任务维护，不作为其他机器的默认事实。
 
-历史记忆、任务记录、业务代码/数据、会话、认证、工具授权规则、插件包和运行缓存不在本框架同步范围内。各项目源码、契约与长期测试由其已确认的权威来源维护，本地检出负责实现与测试，不将其他项目原件迁入共享框架；运行材料、实际机器配置与数据留在执行节点。获准文档、页面运行资源和效果图按项目交付范围导出。
+历史记忆、任务记录、业务代码/数据、会话、认证、工具授权规则、插件包和运行缓存不在本框架同步范围内。各项目源码与契约由其已确认的权威来源维护，本地检出负责实现，测试案例仅在临时位置验证，不将其他项目原件迁入共享框架；运行材料、实际机器配置与数据留在执行节点。获准文档、页面运行资源和效果图按项目交付范围导出。
 
 ## 任务如何使用框架
 
@@ -38,7 +38,7 @@
 |---|---|
 | `.codex/AGENTS.md` | 稳定偏好、授权与拒绝、来源/数据/额度保护及方法发现指针。 |
 | [需求到交付](.agents/skills/york-task-alignment/SKILL.md) | 首次复杂工作、纵向切片、实际依赖、授权交接、结果回收及父目标接续；简单任务直接完成。模型执行方法，非自动调度程序。 |
-| [业务需求承接与项目复测](.agents/skills/york-engineering/references/business-workflow.md) | 业务系统持有需求、规范/执行要求、验收方法、交付标准和实际效果，承接核心能力并核项目落实；本方法只供工程复测建议。本地项目自持源码/tests/工程原件，反馈对应需求结果。明确要求前后台远端效果时，完整说明、两端效果和统一入口仍适用。 |
+| [业务需求承接与项目复测](.agents/skills/york-engineering/references/business-workflow.md) | 业务系统持有需求、规范/执行要求、验收方法、交付标准和实际效果，承接核心能力并核项目落实；本方法只供工程复测建议。本地项目持有源码与工程原件，临时验证反馈对应需求结果。明确要求前后台远端效果时，完整说明、两端效果和统一入口仍适用。 |
 | [通用工程](.agents/skills/york-engineering/SKILL.md) | 任意语言的需求理解、职责/接口设计、缺陷反馈、验证及两轴审查；[Java](.agents/skills/york-java-test/SKILL.md) 负责 JDK/Maven/JUnit 等执行适配。 |
 | [跨仓契约](.agents/skills/york-cross-repo-change/SKILL.md)、[资料](.agents/skills/york-provider-docs/SKILL.md) | 生产消费边界、语义与 mapping；不反向定义用户新目标。 |
 | [日志](.agents/skills/york-log-query/SKILL.md)、[本地数据](.agents/skills/york-local-data/SKILL.md)、[工作站](.agents/skills/york-workstation/SKILL.md) | 按疑点取证、隔离数据及节点资源方法；真实系统操作仍按原授权。 |
@@ -132,7 +132,7 @@ python3 /path/to/codex-framework/scripts/codex_framework.py install \
 
 先复用当前任务可用的 Codex 仓库能力或 GitHub 原生连接，当前入口不可用时回退到本机已有 Git 配置；两边失败标记待用户处理并保留现用规范。不同入口访问的是同一 GitHub 项目，Codex 云端执行环境不是必经中转。具体命令、快照格式、冲突处理与当前任务重读动作见 [同步方法](.agents/skills/york-codex-policy-maintenance/references/framework-sync.md)。普通追加消息和上下文压缩不联网；后续仅明确已发布的规范变化、当前任务完成长期规范发布或用户要求时刷新，不注册每轮 Hook、后台轮询或跨任务通知。
 
-`sync-status` 返回当前已观察与已应用版本；`refresh` 统一接收原生连接内容或本机 Git 内容。默认 `status` / `apply` 使用最后取得的发布内容缓存，避免维护检出较旧时意外退回旧规范；维护本地源码时显式使用 `--repo <路径>`，这只是开发验证，不代表已经发布。同步器运行代码只由上述明确的版本化 `install` 更新，不当成普通共享正文快照自动执行；测试及云端 bootstrap 脚本留在维护仓库。
+`sync-status` 返回当前已观察与已应用版本；`refresh` 统一接收原生连接内容或本机 Git 内容。默认 `status` / `apply` 使用最后取得的发布内容缓存，避免维护检出较旧时意外退回旧规范；维护本地源码时显式使用 `--repo <路径>`，这只是开发验证，不代表已经发布。同步器运行代码只由上述明确的版本化 `install` 更新，不当成普通共享正文快照自动执行；云端 bootstrap 脚本由维护仓库持有，测试案例及构造逻辑仅在临时位置使用。
 
 ## 手动维护与同步
 
@@ -189,9 +189,7 @@ sh scripts/cloud-install.sh --codex-home "$HOME/.codex"
 
 `python3 scripts/codex_framework.py check < "$CHECK_INPUT"` 提供无持久台账的原任务接续、项目/任务范围、原生副作用去重、依赖、预算、节点能力、偏差反馈、失败恢复及后续纠正接续检查。`CHECK_INPUT` 是调用者已生成的本次短时输入文件，不是固定目录或新增认证配置。反馈和缺陷关闭会核对临时输入中的 Codex `read_thread` 原生 item 或节点文件原件；缺少来源、输出截断、命令失败和局部烟测均不能当作目标完成。它不读写另一套任务状态或同步状态；用法与覆盖边界见[执行与修复的即时检查](.agents/skills/york-task-alignment/references/execution-check.md)。检查结果不能代替平台实际权限、来源真实性核对或运行效果解释。
 
-```sh
-python3 -m unittest discover -s tests -v
-```
+依据当前有效需求及受影响行为，在仓库外或明确忽略的临时位置准备并执行验证；已有仓库测试目录不作为默认入口或新增案例的收录授权。临时构建接入在提交前恢复，推送后的案例处理遵循全局规则。
 
 测试使用独立临时用户目录和本地 Git 远端，不访问业务服务或修改真实 Codex home。可用 `--home "$TEST_HOME"` 和 `--codex-home "$TEST_CODEX_HOME"` 指定测试目标；两个变量由本次隔离工作区创建并填写，不能指向实际用户配置。显式 `--home` 会忽略环境中的 `CODEX_HOME`，避免误触真实目录。
 

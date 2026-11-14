@@ -80,7 +80,7 @@ python3 scripts/codex_framework.py check < "$CHECK_INPUT"
 
 发现偏差时用 `phase: feedback`：`feedback.resource` 是观察对象，`expected_ref` 与 `observed_ref` 指向 `context.evidence` 中同一资源的 `expectation` 与 `observation`。两份记录的 SHA-256 摘要须与提供的原生 item 文本或节点文件内容一致，程序比较后输出 `deviation`。期望标准应在观察前形成；摘要差异是诊断入口，不自动确定根因或许可重试。已有修正无效或复发时给 `prior_correction_ref`，仍返回偏差并标记需重新处理。模型沿原失败、实际路径和影响对象确认原因。`repair` 动作需给出失败与根因引用、原因层、受影响资源及原任务 `authorization_ref`；它可指向已有用户授权，不要求每次常规修复重新请示。平台权限仍由平台执行。
 
-项目原有契约、修正代码及回归测试是后续接续的来源；不另建纠正台账。下一轮从这些来源和原生任务记录读出适用纠正，在本次输入的 `project.accepted_corrections` 放入其引用、资源、版本，并以 `project.corrections_source_ref` 指向所核对来源。`resume` 或 `action` 的 `accepted_corrections` 应包含同一资源的纠正及同版依据；程序会要求临时证据中有可核验的旧修正原件，遗漏、旧版或来源缺失不会得到 `ready`。空数组本身不证明没有历史偏差。
+项目有效契约、修正代码与原生任务记录用于接续；临时回归结果只说明其输入、版本和条件下的观察，不生成业务契约或字段必要性，也不要求保留测试源码。不另建纠正台账。下一轮从这些来源读出适用纠正，在本次输入的 `project.accepted_corrections` 放入其引用、资源、版本，并以 `project.corrections_source_ref` 指向所核对来源。`resume` 或 `action` 的 `accepted_corrections` 应包含同一资源的纠正及同版依据；程序会要求临时证据中有可核验的旧修正原件，遗漏、旧版或来源缺失不会得到 `ready`。空数组本身不证明没有历史偏差。
 
 缺陷修复后用 `phase: close_issue` 核对本地准入、原目标、原失败、根因、修正、原场景及受影响路径复测、独立目标验收、正式采用版本、实际效果与后续接续。`issue.goal_ref` 和 `acceptance_ref` 必须关联；目标验收不能复用局部回归命令。原场景复测的 `related_ref` 指向原失败，目标验收指向原目标，后续接续指向修正；本地验证、回归、验收、采用、效果及接续版本须一致。原场景与受影响回归、目标验收、采用、效果和后续接续的证据还须给出与问题相同的 `resource`；缺范围为待证，明确异域证据阻断，不能用同版本命令退出 0 接受另一对象。仅命令退出 0 不证明业务目标完成，执行者须核对实际输出和目标语义。修后尚未正式采用、没有效果或没有后续使用证据时为 `needs_evidence`，但不得把可本地复测的部分推迟到后续任务。
 
@@ -94,7 +94,7 @@ python3 scripts/codex_framework.py check < "$CHECK_INPUT"
 
 反馈、恢复入口和缺陷关闭的来源核验：`context.native_sources` 可临时放 Codex `read_thread` 的原始 JSON 响应；Codex 证据用 `native_item_id` 指向其中 item，非命令文本以 `digest` 绑定。成功证据要求原生命令 `completed`、退出码 0、输出未截断，带版本的结果还须在命令或输出出现该版本。节点文件证据用 `project.root`、相对 `node_path` 和 `digest` 核对当前文件；`passed/applied/observed/used_correction` 还须由 JSON 文件同时给出相同 `result/version`。临时输入可含原生响应以供本次比对，不能提交到框架仓库或复制成长期日志；取不到完整原件时保留 `needs_evidence`。来源由当前任务的受支持接口取得，检查器不能认证任意调用者提供的 JSON 未被伪造。
 
-分工：程序比对来源片段、摘要、范围、版本、依赖和证据关联；模型负责目标语义、原件来源、根因、影响范围、修正与复测解释；用户、业务系统或节点提供真实期望、运行反馈和平台授权结果。没有后续观察时保持待跟踪。仓库 `tests/test_correction_loop.py` 是隔离程序边界测试；真实任务链需另用原生记录和节点原件复测，不能把夹具结果当实际项目效果。
+分工：程序比对来源片段、摘要、范围、版本、依赖和证据关联；模型负责目标语义、原件来源、根因、影响范围、修正与复测解释；用户、业务系统或节点提供真实期望、运行反馈和平台授权结果。没有后续观察时保持待跟踪。程序边界按当前需求使用临时案例验证；真实任务链需另用原生记录和节点原件复测，不能把夹具结果当实际项目效果。
 
 输出 `blocked` 表示输入中的已知冲突，`deviation` 表示观察值与既有期望不符，`needs_evidence` 表示缺少决定所需事实，`ready` 仅表示这份输入内部一致。退出码分别是 2、2、2、0；格式错误为 1。检查器无法自行证明调用者提供的原始记录是否真实或完整，也不能拦截未经过它的工具调用；执行者仍须核对原件、遵守平台权限和业务授权。结果不明时先查询原动作，不能把一次新的检查当作重试许可。修订规则后用原失败输入和受影响行为复测；代码测试、文件安装和实际运行效果分别报告。
 
@@ -102,7 +102,7 @@ python3 scripts/codex_framework.py check < "$CHECK_INPUT"
 
 ## 可选认证与维护分流
 
-`phase: action` 可附 `action.access` 对照[认证与操作能力](../../york-workstation/references/environment-sync.md#入口、认证与操作能力)，无需为旧输入补填；不提供时保持原检查和退出语义。六项分类分别为 `resource_owner: managed_workstation|external_business|unknown`、`identity_role: maintenance|business|test|unknown`、`authentication_path: existing_session|managed_provider|missing|unknown|failed|new_credentials|native_authentication`、`permission_change: none|persistent`、`secret_handling: provider_only|expose|transfer`、`platform_requirement: none|confirmation|denied|trust_record_edit`。不接受秘密值、账号名或 `internal:true` 作为授权依据。
+`phase: action` 可附 `action.access` 对照[认证与操作能力](../../york-workstation/references/environment-sync.md#入口认证与操作能力)，无需为旧输入补填；不提供时保持原检查和退出语义。六项分类分别为 `resource_owner: managed_workstation|external_business|unknown`、`identity_role: maintenance|business|test|unknown`、`authentication_path: existing_session|managed_provider|missing|unknown|failed|new_credentials|native_authentication`、`permission_change: none|persistent`、`secret_handling: provider_only|expose|transfer`、`platform_requirement: none|confirmation|denied|trust_record_edit`。不接受秘密值、账号名或 `internal:true` 作为授权依据。
 
 既有会话或提供方且范围匹配时建议 `reuse_existing_authentication`；内部和外部身份都受原项目、任务、workspace 及平台拒绝检查，身份分类不创造权限。路径缺失/未知返回 `needs_evidence` 与 `discover_existing_authentication`，缺的是有界路径证据，不是重新申请维护权。失败路径或仍有效的 `context.tool_failures.kind: authentication_failed` 对同资源的认证重试返回 `failed_authentication_no_retry`；不登录的发现另用 `authentication_path: missing|unknown` 检查，只能读取允许的非敏感引用。普通 1045 不自动升级成平台硬拒绝。已证实只能由本人完成原生认证时，用 `native_authentication` 返回 `native_authentication_step_only`，仅交该步骤，不新增用途授权。
 
@@ -164,7 +164,7 @@ rebuild 需要当前契约可重建、当前数据无需保留、重建来源、
 
 明确纠正可用同一原件引用 `supersedes_ref` 指向被纠正前提。检查器要求已给同对象直接用户原件与可核旧先新后顺序，旧前提及其派生转述不能继续作为依据；输出保留 `lineage_refs/superseding_refs`。跨来源顺序无法核实则保留具体缺口，不能自行拼造时间或用户原话。模型仍负责撤销错误依赖和向活跃任务传播、核实采用；检查器不发消息、不自动改计划，也不能发现未提供的纠正或省略的祖先。
 
-`read` 中的前提仅表示查证方向，返回 `inquiry_only`，不要求先证明问题才可在原权限内取证；资源范围和真实拒绝仍适用。`progress` 沿原有每步 `work_partition` 输出：需要该事实的步骤缺证，独立步骤仍可做。`progress` 的依赖沿上面的原件与消费者合同核对；执行者仍须解释原文的实际必要性、撤掉错误边，不能将程序关系检查当成业务判断。测试 `tests/test_orchestration_basis.py` 验证有限程序边界；还需用原失败委托、纠正接收/采用和集成后实际任务动作独立验收，不能把该测试或 `ready` 说成真实编排保障。
+`read` 中的前提仅表示查证方向，返回 `inquiry_only`，不要求先证明问题才可在原权限内取证；资源范围和真实拒绝仍适用。`progress` 沿原有每步 `work_partition` 输出：需要该事实的步骤缺证，独立步骤仍可做。`progress` 的依赖沿上面的原件与消费者合同核对；执行者仍须解释原文的实际必要性、撤掉错误边，不能将程序关系检查当成业务判断。临时案例仅验证指定条件下的有限程序边界；还需用原失败委托、纠正接收/采用和集成后实际任务动作独立验收，不能把测试结果或 `ready` 说成真实编排保障。
 
 
 ## 原生执行、恢复与核收
