@@ -45,7 +45,10 @@ def source_connection(path):
 
 
 def policy(path):
-    p = json.loads(Path(path).read_text())
+    return validate_policy(json.loads(Path(path).read_text()))
+
+
+def validate_policy(p):
     if not isinstance(p, dict) or p.get("schema") != SCHEMA:
         raise ValueError("unsupported usage policy")
     for key in ("source_db", "state_db", "timezone", "workload", "roots", "reviewed_days"):
@@ -57,11 +60,11 @@ def policy(path):
         raise ValueError("duplicate native roots")
     if Path(p["source_db"]).resolve() == Path(p["state_db"]).resolve():
         raise ValueError("meter state must not overwrite native source")
-    selectors = p.get("automation_selectors", [])
-    if not isinstance(selectors, list):
-        raise ValueError("automation_selectors must be a list")
+    active, retired = (p.get(k, []) for k in ("automation_selectors", "retired_automation_selectors"))
+    if not isinstance(active, list) or not isinstance(retired, list):
+        raise ValueError("automation selectors must be lists")
     identities = set()
-    for selector in selectors:
+    for selector in active + retired:
         if not isinstance(selector, dict) or set(selector) != {"automation_id", "codex_automations_db"}:
             raise ValueError("automation selector requires only automation_id and codex_automations_db")
         aid, path = selector["automation_id"], selector["codex_automations_db"]
@@ -173,11 +176,30 @@ def rollout_stream(value):
             process.stdout.close()
 
 
-def automation_scope(p, now):
+def selector_key(selector):
+    return digest({"automation_id": selector["automation_id"],
+                   "codex_automations_db": str(Path(selector["codex_automations_db"]).resolve())})
+
+
+def protection_scope(p):
+    scope = {k: p[k] for k in ("source_db", "state_db", "timezone", "workload")}
+    scope["roots"] = sorted(p["roots"])
+    for key in ("automation_selectors", "retired_automation_selectors"):
+        if p.get(key):
+            scope[key] = sorted(p[key], key=lambda row: row["automation_id"])
+    return scope
+
+
+def automation_scope(p, now, prior_scopes):
     """Read only native identity metadata, including failed and unfinished runs."""
     scopes, owners = [], {}
-    for selector in p.get("automation_selectors", []):
+    selectors = [(s, False) for s in p.get("automation_selectors", [])]
+    selectors += [(s, True) for s in p.get("retired_automation_selectors", [])]
+    for selector, retired in selectors:
         aid = selector["automation_id"]
+        saved = prior_scopes.get(selector_key(selector))
+        if retired and saved is None:
+            raise ValueError("retirement requires previously verified native coverage: " + aid)
         roots = set()
         with source_connection(selector["codex_automations_db"]) as source:
             source.execute("BEGIN")  # One registry snapshot, including a live WAL.
@@ -187,7 +209,10 @@ def automation_scope(p, now):
                 columns = {row[1] for row in source.execute("PRAGMA table_info(" + table + ")")}
                 if not kind or kind[0] != "table" or not required <= columns:
                     raise ValueError("native automation schema unavailable: " + table)
-            if len(source.execute("SELECT id FROM automations WHERE id=?", (aid,)).fetchall()) != 1:
+            definitions = len(source.execute("SELECT id FROM automations WHERE id=?", (aid,)).fetchall())
+            if retired and definitions:
+                raise ValueError("retired native automation definition still exists or reappeared: " + aid)
+            if not retired and definitions != 1:
                 raise ValueError("native automation identity missing or duplicate: " + aid)
             rows = source.execute("SELECT thread_id,status,created_at,updated_at FROM automation_runs WHERE automation_id=?", (aid,))
             for tid, status, created, updated in rows:
@@ -204,15 +229,26 @@ def automation_scope(p, now):
                     raise ValueError("ambiguous native automation run identity")
                 roots.add(tid)
                 owners[tid] = aid
+            if retired:
+                if not roots <= set(saved):
+                    raise ValueError("unreviewed run registered for retired automation: " + aid)
+                roots = set(saved)
+                for tid in roots:
+                    if tid in owners and owners[tid] != aid:
+                        raise ValueError("retired root reassigned to another automation")
+                    registered = source.execute("SELECT automation_id FROM automation_runs WHERE thread_id=?", (tid,)).fetchall()
+                    if len(registered) > 1 or any(row[0] != aid for row in registered):
+                        raise ValueError("retired root has conflicting native ownership")
+                    owners[tid] = aid
         scopes.append({**selector, "codex_automations_db": str(Path(selector["codex_automations_db"]).resolve()),
                        "root_thread_ids": sorted(roots), "run_count": len(roots),
-                       "coverage": "REGISTERED_ROOTS" if roots else "AWAITING_NATIVE_RUN"})
+                       "coverage": "RETIRED_VERIFIED_ROOTS" if retired else "REGISTERED_ROOTS" if roots else "AWAITING_NATIVE_RUN"})
     return scopes
 
 
-def native_scope(p, now):
+def native_scope(p, now, prior_scopes):
     """Resolve explicit roots and native registry roots without reading messages."""
-    automation_scopes = automation_scope(p, now)
+    automation_scopes = automation_scope(p, now, prior_scopes)
     with source_connection(p["source_db"]) as source:
         source.execute("BEGIN")
         source.row_factory = sqlite3.Row
@@ -259,10 +295,12 @@ def native_scope(p, now):
 
 def scan(db, p, now):
     """Incremental bounded-memory reads; one globally unique response per event."""
-    threads, selected, roots, automation_scopes = native_scope(p, now)
     prior_scopes = get(db, "automation_scopes") or {}
+    threads, selected, roots, automation_scopes = native_scope(p, now, prior_scopes)
+    if not set(get(db, "scope_threads") or []) <= selected:
+        raise ValueError("previously measured native threads are missing from protection scope")
     for scope in automation_scopes:
-        key = digest({k: scope[k] for k in ("automation_id", "codex_automations_db")})
+        key = selector_key(scope)
         if not set(prior_scopes.get(key, [])) <= set(scope["root_thread_ids"]):
             raise ValueError("previously measured native automation roots are missing")
         prior_scopes[key] = scope["root_thread_ids"]
@@ -543,7 +581,69 @@ def compare(db, p, now):
             "comparisons": comparisons, "anomalies": anomalies, "unassessed":unassessed}
 
 
-def evaluate(policy_path, *, now=None, release=None, history=False):
+def migrate_scope(db, p, lock, source, request, now):
+    """Reviewed selector lifecycle changes preserve coverage, never unlock."""
+    if not isinstance(request, dict) or not lock or request.get("lock_id") != lock["id"]:
+        raise ValueError("scope migration requires the exact existing lock")
+    before = validate_policy(request.get("from_policy"))
+    original_scope = get(db, "locked_scope")
+    if (digest(before) != get(db, "locked_policy")
+            or (original_scope is not None and protection_scope(before) != original_scope)
+            or request.get("to_policy_sha256") != digest(p)
+            or not isinstance(request.get("evidence"), str) or not request["evidence"].strip()):
+        raise ValueError("scope migration requires verified old policy, current fingerprint and review evidence")
+    lifecycle = {"automation_selectors", "retired_automation_selectors"}
+    if {k: v for k, v in before.items() if k not in lifecycle} != {k: v for k, v in p.items() if k not in lifecycle}:
+        raise ValueError("scope migration must preserve source, meter, roots, workload and comparison policy")
+    old_active = {selector_key(s) for s in before.get("automation_selectors", [])}
+    old_retired = {selector_key(s) for s in before.get("retired_automation_selectors", [])}
+    active = {selector_key(s) for s in p.get("automation_selectors", [])}
+    retired = {selector_key(s) for s in p.get("retired_automation_selectors", [])}
+    if not (old_retired <= retired and old_active | old_retired <= active | retired
+            and (old_active != active or old_retired != retired)):
+        raise ValueError("migration may add selectors or retire them, but cannot remove or reactivate coverage")
+    if source.get("status") == "UNAVAILABLE":
+        raise ValueError("scope migration requires complete current measurement")
+    # A pre-upgrade meter may have retained a policy hash but no scope. Only
+    # the supplied policy matching that saved hash reconstructs the old scope;
+    # the new policy (or a second check of it) cannot certify its own migration.
+    if original_scope is None:
+        put(db, "locked_scope", protection_scope(before))
+    receipt = {"lock_id": lock["id"], "from_policy_sha256": digest(before), "to_policy_sha256": digest(p),
+               "from_scope": protection_scope(before), "to_scope": protection_scope(p),
+               "retired_coverage": [s for s in source["automation_scopes"] if s["coverage"] == "RETIRED_VERIFIED_ROOTS"],
+               "evidence": request["evidence"], "at": now.isoformat()}
+    prior = get(db, "scope_migration")
+    # A duplicate request is harmless and must not multiply migration history.
+    if not prior or any(prior.get(k) != receipt[k] for k in receipt if k != "at"):
+        db.execute("INSERT INTO history(at,action,detail) VALUES (?,?,?)", (now.isoformat(), "SCOPE_MIGRATION", encoded(receipt)))
+        put(db, "scope_migration", receipt)
+
+
+def additive_scope(before, after):
+    """Preserve the existing explicit-release interface for added selectors."""
+    if not isinstance(before, dict):
+        return False
+    if {k: v for k, v in before.items() if k != "automation_selectors"} != {k: v for k, v in after.items() if k != "automation_selectors"}:
+        return False
+    return ({selector_key(s) for s in before.get("automation_selectors", [])}
+            < {selector_key(s) for s in after.get("automation_selectors", [])})
+
+
+def release_scope_verified(db, p, lock):
+    scope = protection_scope(p)
+    if get(db, "locked_scope") == scope:
+        return True
+    if additive_scope(get(db, "locked_scope"), scope):
+        return True
+    migration = get(db, "scope_migration") or {}
+    return bool(lock and migration.get("lock_id") == lock["id"]
+                and migration.get("from_policy_sha256") == get(db, "locked_policy")
+                and migration.get("from_scope") == get(db, "locked_scope")
+                and migration.get("to_policy_sha256") == digest(p) and migration.get("to_scope") == scope)
+
+
+def evaluate(policy_path, *, now=None, release=None, migration=None, history=False):
     now = now or datetime.now(timezone.utc)
     p = policy(policy_path)
     db = connect(p["state_db"])
@@ -552,6 +652,8 @@ def evaluate(policy_path, *, now=None, release=None, history=False):
         # process cannot clear/overwrite an earlier lock or count usage twice.
         db.execute("BEGIN IMMEDIATE")
         old_lock, old_policy = get(db, "lock"), get(db, "policy")
+        measured_scope, measured_policy = get(db, "measured_scope"), get(db, "measured_policy")
+        scope = protection_scope(p)
         previous_time = get(db, "last_checked")
         db.execute("SAVEPOINT native_scan")
         try:
@@ -559,6 +661,8 @@ def evaluate(policy_path, *, now=None, release=None, history=False):
                 raise ValueError("clock moved backwards")
             source = scan(db, p, now)
             assessment = compare(db, p, now)
+            put(db, "measured_scope", scope)
+            put(db, "measured_policy", digest(p))
             pending = [scope["automation_id"] for scope in source["automation_scopes"]
                        if scope["coverage"] == "AWAITING_NATIVE_RUN"]
             if pending and assessment["status"] in ADMISSIBLE:
@@ -573,18 +677,18 @@ def evaluate(policy_path, *, now=None, release=None, history=False):
         finally:
             db.execute("RELEASE native_scan")
         changed = old_policy is not None and old_policy != digest(p)
-        scope = {k:p[k] for k in ("source_db","state_db","timezone","workload")}
-        scope["roots"] = sorted(p["roots"])
-        if p.get("automation_selectors"):
-            scope["automation_selectors"] = sorted(p["automation_selectors"], key=lambda row: row["automation_id"])
         reasons = ([assessment["status"]] if assessment["status"] not in ADMISSIBLE else [])
         if changed:reasons.append("POLICY_CHANGED")
         lock = old_lock
         if not lock and reasons:
             reason = reasons[0]
             lock = {"id": digest({"at": now.isoformat(), "reason": reason, "policy": digest(p)}),
-                    "at": now.isoformat(), "reason": reason, "assessment": assessment}
+                    "at": now.isoformat(), "reason": reason, "assessment": assessment,
+                    "scope_binding_version": 1}
             put(db, "lock", lock)
+            put(db, "scope_migration", None)
+            put(db, "locked_scope", measured_scope if changed else scope)
+            put(db, "locked_policy", (measured_policy or old_policy) if changed else digest(p))
             db.execute("INSERT INTO history(at,action,detail) VALUES (?,?,?)", (now.isoformat(), "LOCK", encoded(lock)))
         findings = get(db,"lock_findings") or {}
         if lock:
@@ -595,7 +699,7 @@ def evaluate(policy_path, *, now=None, release=None, history=False):
                 # The last-checked policy hash alone is not that binding: it
                 # may already reflect a changed scope while the old lock held.
                 original_identity = digest({"at":lock.get("at"),"reason":lock["reason"],"policy":digest(p)})
-                if lock["id"]==original_identity:
+                if "scope_binding_version" not in lock and lock["id"]==original_identity:
                     put(db,"locked_scope",scope);put(db,"locked_policy",digest(p))
             for reason in set(reasons+[lock["reason"]]):
                 detail = ({"old_policy":old_policy,"new_policy":digest(p)} if reason == "POLICY_CHANGED"
@@ -615,9 +719,16 @@ def evaluate(policy_path, *, now=None, release=None, history=False):
             put(db,"lock_findings",findings)
         put(db,"policy",digest(p))
         put(db,"last_checked",max(previous_time or 0,now.timestamp()))
-        if release:
+        if migration is not None:
+            try:
+                migrate_scope(db, p, lock, source, migration, now)
+            except (ValueError, KeyError, TypeError) as exc:
+                put(db, "latest", {"allowed": False, "lock": lock, "assessment": assessment, "migration_rejected": True})
+                db.commit()  # Preserve newly observed faults even when review inputs are invalid.
+                raise ValueError("scope migration rejected: " + str(exc)) from exc
+        if release is not None:
             valid = bool(lock and release.get("lock_id")==lock["id"] and release.get("evidence")
-                         and assessment["status"] in ADMISSIBLE and get(db,"locked_scope")==scope
+                         and assessment["status"] in ADMISSIBLE and release_scope_verified(db, p, lock)
                          and release.get("policy_sha256")==digest(p) and set(release.get("reviewed_reasons",[]))==set(findings))
             # An anomaly cannot vanish merely by removing its comparison,
             # including when unrelated remaining normal references look valid.
@@ -628,16 +739,24 @@ def evaluate(policy_path, *, now=None, release=None, history=False):
                 put(db,"latest",{"allowed":False,"lock":lock,"assessment":assessment,"release_rejected":True})
                 db.commit()  # A rejected release must not erase a newly observed fault.
                 raise ValueError("release requires exact lock, verified original scope, review evidence, no current fault, current policy fingerprint and all recorded reasons")
+            migration_receipt = get(db, "scope_migration")
+            if additive_scope(get(db, "locked_scope"), scope):
+                migration_receipt = {"kind": "ADDITIVE_COVERAGE", "from_scope": get(db, "locked_scope"),
+                                     "to_scope": scope, "from_policy_sha256": get(db, "locked_policy"),
+                                     "to_policy_sha256": digest(p), "evidence": release["evidence"]}
             db.execute("INSERT INTO history(at,action,detail) VALUES (?,?,?)", (now.isoformat(), "MANUAL_RELEASE",
                        encoded({"lock":lock,"findings":findings,"evidence":release["evidence"],
-                                "old_policy":get(db,"locked_policy"),"new_policy":digest(p),"assessment_status":assessment["status"]})))
+                                "old_policy":get(db,"locked_policy"),"new_policy":digest(p),"assessment_status":assessment["status"],
+                                "scope_migration":migration_receipt})))
             lock, findings = None, {}
             put(db,"lock",None);put(db,"lock_findings",{});put(db,"locked_scope",None);put(db,"locked_policy",None)
+            put(db,"scope_migration",None)
         result = {"schema": SCHEMA, "allowed": lock is None, "lock": lock, "assessment": assessment,
                   "source": source, "measurement": "native responses and token categories; not account credits",
                   "scope": "configured local native roots, selected native automation runs and descendants; checked admission boundaries only",
                   "policy_sha256":digest(p), "lock_findings":findings,
                   "lock_scope_verified":bool(lock and get(db,"locked_scope")),
+                  "scope_migration":get(db,"scope_migration"),
                   "hard_account_spending_cap": False,
                   "inflight_limit": "Already running model responses and unguarded/cloud/other-host activity cannot be stopped here."}
         if history and source.get("status") != "UNAVAILABLE":
@@ -657,9 +776,12 @@ def dispatch():
     try:
         request = json.load(sys.stdin)
         action = request.get("action", "check")
-        if action not in ("check", "history", "release"):
-            raise ValueError("action must be check, history or explicit human release")
-        result = evaluate(request["policy"], release=request.get("release") if action == "release" else None, history=action == "history")
+        if action not in ("check", "history", "migrate", "release"):
+            raise ValueError("action must be check, history, reviewed scope migration or explicit release")
+        if action in ("migrate", "release") and not isinstance(request.get("migration" if action == "migrate" else "release"), dict):
+            raise ValueError("explicit review object required")
+        result = evaluate(request["policy"], release=request.get("release") if action == "release" else None,
+                          migration=request.get("migration") if action == "migrate" else None, history=action == "history")
         print(encoded(result))
         return 0 if result["allowed"] else 2
     except (OSError, ValueError, KeyError, TypeError, sqlite3.Error) as exc:
