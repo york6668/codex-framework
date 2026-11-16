@@ -253,7 +253,9 @@ def native_scope(p, now, prior_scopes):
         source.execute("BEGIN")
         source.row_factory = sqlite3.Row
         threads = {}
-        for row in source.execute("SELECT id,rollout_path,source FROM threads"):
+        columns = {row[1] for row in source.execute("PRAGMA table_info(threads)")}
+        created = "created_at" if "created_at" in columns else "NULL AS created_at"
+        for row in source.execute("SELECT id,rollout_path,source," + created + " FROM threads"):
             if row["id"] in threads:
                 raise ValueError("duplicate native thread identity")
             threads[row["id"]] = dict(row)
@@ -290,6 +292,23 @@ def native_scope(p, now, prior_scopes):
         selected |= children
     if not selected <= threads.keys():
         raise ValueError("native descendant metadata missing")
+    registered = {tid for scope in automation_scopes for tid in scope["root_thread_ids"]}
+    for tid in selected:
+        root, seen = tid, set()
+        while root not in roots:
+            if root in seen or root not in parents:
+                raise ValueError("native comparison ancestry is invalid")
+            seen.add(root)
+            root = parents[root]
+        created = threads[tid]["created_at"]
+        # Creation time is auxiliary comparison evidence. Its absence cannot
+        # turn complete telemetry into zero use or a false integrity failure.
+        if (type(created) not in (int, float) or not math.isfinite(created)
+                or created < 0 or created > now.timestamp() + 60):
+            created = None
+        threads[tid]["comparison_context"] = {
+            "origin": "registered_run" if root in registered else "persistent_root",
+            "role": "root" if tid == root else "descendant", "created_at": created}
     return threads, selected, sorted(roots), automation_scopes
 
 
@@ -350,6 +369,7 @@ def scan(db, p, now):
         else:
             db.execute("INSERT OR REPLACE INTO cursors VALUES (?,?,?,?,?)", (str(path), stat.st_dev, stat.st_ino, offset, model))
     put(db, "scope_threads", sorted(selected))
+    put(db, "scope_contexts", {tid: threads[tid]["comparison_context"] for tid in sorted(selected)})
     if automation_scopes:
         put(db, "automation_scopes", prior_scopes)
     return {"threads": len(selected), "records": db.execute("SELECT COUNT(*) FROM responses").fetchone()[0],
@@ -386,6 +406,82 @@ def baseline_candidates(db, p, now, *, leading_minutes=60):
     return result
 
 
+def reference_integrity(db, p):
+    """A comparison can expire without making its retained evidence mutable."""
+    zone = ZoneInfo(p["timezone"])
+    scope = set(get(db,"scope_threads") or p["roots"])
+    missing, changed = [], []
+    for entries,minutes in ((p["reviewed_days"],60),(p.get("change_reference_days",[]),120)):
+        for reference in entries:
+            day = datetime.fromisoformat(reference["date"]).date()
+            start = datetime.combine(day,datetime.min.time(),zone).timestamp()
+            end = datetime.combine(day+timedelta(days=1),datetime.min.time(),zone).timestamp()
+            rows = [tuple(row) for row in db.execute(
+                "SELECT id,thread,stamp,model,input,cached,output FROM responses WHERE stamp>=? AND stamp<? ORDER BY id",
+                (start-minutes*60,end)) if row["thread"] in scope]
+            if not any(row[2]>=start for row in rows):
+                missing.append(reference["date"])
+            elif digest(sorted(rows)) != reference["usage_fingerprint"]:
+                changed.append(reference["date"])
+    if missing:
+        return {"status":"INCOMPLETE_BASELINE_COVERAGE","missing_days":sorted(missing)}
+    if changed:
+        return {"status":"BASELINE_CHANGED","days":sorted(changed)}
+    return None
+
+
+def comparison_counts(db, p, now, spans, reference_days=(), *, include_end=False, hour_offset=timedelta(0)):
+    """Measure everything; project only observable necessary comparison conditions.
+
+    Matching metadata does not prove equal business work, cache behavior or
+    healthy use. Workload review remains necessary and is never inferred here.
+    """
+    zone = ZoneInfo(p["timezone"])
+    scope = set(get(db, "scope_threads") or p["roots"])
+    contexts = get(db, "scope_contexts") or {}
+    counts = defaultdict(lambda: defaultdict(int))
+    totals = defaultdict(lambda: defaultdict(int))
+    reference_totals = defaultdict(lambda: defaultdict(int))
+    reference_hours = defaultdict(lambda: defaultdict(int))
+    reference_days = set(reference_days)
+
+    def projection(row, left):
+        context = contexts.get(row["thread"], {})
+        created = context.get("created_at")
+        if (context.get("origin") not in {"registered_run", "persistent_root"}
+                or context.get("role") not in {"root", "descendant"}
+                or type(created) not in (int, float) or not math.isfinite(created)
+                or created < 0 or created > row["stamp"]):
+            return "UNVERIFIED_NATIVE_CONTEXT"
+        phase = "created_in_window" if created >= left else "existing_at_window_start"
+        return "/".join((context["origin"], context["role"], phase))
+
+    for row in db.execute("SELECT thread,stamp,model,input,cached,output FROM responses WHERE stamp>=? AND stamp<=?",
+                          (min(v[0] for v in spans.values()), now.timestamp())):
+        if row["thread"] not in scope:
+            continue
+        values = (1, row["input"] - row["cached"], row["cached"], row["output"])
+        stamp = datetime.fromtimestamp(row["stamp"], zone)
+        if stamp.date() in reference_days:
+            midnight = stamp.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+            hour_start = stamp.replace(minute=0, second=0, microsecond=0) + hour_offset
+            if hour_start > stamp:
+                hour_start -= timedelta(hours=1)
+            hour = hour_start.timestamp()
+            for metric, value in zip(METRICS, values):
+                name = row["model"] + ":" + metric
+                reference_totals[stamp.date()][(projection(row, midnight), name)] += value
+                reference_hours[(stamp.date(), stamp.hour)][(projection(row, hour), name)] += value
+        for key, (left, right) in spans.items():
+            if left <= row["stamp"] < right or include_end and row["stamp"] == right:
+                context = projection(row, left)
+                for metric, value in zip(METRICS, values):
+                    name = row["model"] + ":" + metric
+                    counts[key][(context, name)] += value
+                    totals[key][name] += value
+    return counts, reference_totals, reference_hours, totals
+
+
 def compare_change(db, p, now, normal_peers):
     """A frozen observed envelope detects sustained growth, not normality.
 
@@ -400,24 +496,28 @@ def compare_change(db, p, now, normal_peers):
             if day - timedelta(days=60) <= datetime.fromisoformat(r["date"]).date() < day
             and day_class(datetime.fromisoformat(r["date"]).date(), p) == day_class(day, p)]
     chosen = {r["date"] for r in refs}
-    # Even one reviewed day must be intact; a low sample count must not hide
-    # a missing or later changed reference.
-    for rows, minutes, selected in ((p["reviewed_days"], 60, {d.isoformat() for d in normal_peers}),
-                                     (refs, 120, chosen)):
-        if not selected:continue
-        current = {r["date"]:r["usage_fingerprint"] for r in baseline_candidates(db, p, now, leading_minutes=minutes)}
-        missing = sorted(selected - current.keys())
-        if missing:
-            return {"status":"INCOMPLETE_BASELINE_COVERAGE", "missing_days":missing}
-        changed = [r["date"] for r in rows if r["date"] in selected and current[r["date"]] != r["usage_fingerprint"]]
-        if changed:
-            return {"status":"BASELINE_CHANGED", "days":changed}
+    # Selection limits comparison authority, not integrity of retained evidence.
+    integrity = reference_integrity(db,p)
+    if integrity:
+        return integrity
     result = {"status":MONITORED, "day":day.isoformat(), "timezone":p["timezone"],
               "day_class":day_class(day,p), "workload":p["workload"],
               "normal_reference_days":len(normal_peers), "peer_days":[d.isoformat() for d in normal_peers],
               "change_reference_days":sorted(chosen), "reference_quality":"OBSERVED_NOT_NORMAL",
               "comparisons":[], "warnings":[], "anomalies":[], "unassessed":[],
               "limitation":"Normal daily use is unconfirmed; only covered observed growth is assessed. Not account credits."}
+    end = local.replace(minute=0,second=0,microsecond=0)
+    windows = {"day":(local.replace(hour=0,minute=0,second=0,microsecond=0),local),
+               "hour_previous":(end-timedelta(hours=2),end-timedelta(hours=1)),
+               "hour_latest":(end-timedelta(hours=1),end)}
+    current_spans = {(day,name):(left.timestamp(),right.timestamp()) for name,(left,right) in windows.items()}
+    current, _, _, totals = comparison_counts(db, p, now, current_spans)
+    result["measured_totals"] = {window:dict(totals[(day,window)]) for window in windows}
+    result["reference_window_totals"] = {}
+    result["unassessed_comparisons"] = [
+        {"window":window,"context":context,"metric":metric,"actual":value,
+         "reason":"No applicable reviewed comparison window"}
+        for window in windows for (context,metric),value in sorted(current[(day,window)].items()) if value]
     if not refs:
         result["unassessed"].append("No frozen comparable change reference; relative anomaly detection is unavailable.")
         return result
@@ -427,41 +527,22 @@ def compare_change(db, p, now, normal_peers):
            datetime.combine(d+timedelta(days=1),datetime.min.time(),zone).utcoffset() for d in days+[day]):
         result["unassessed"].append("Local timezone offset changes: same-clock growth not compared.")
         return result
-    end = local.replace(minute=0,second=0,microsecond=0)
-    windows = {"day":(local.replace(hour=0,minute=0,second=0,microsecond=0),local),
-               "hour_previous":(end-timedelta(hours=2),end-timedelta(hours=1)),
-               "hour_latest":(end-timedelta(hours=1),end)}
     spans = {}
     for anchor in days+[day]:
         shift = anchor-day
         for name,(left,right) in windows.items():
             spans[(anchor,name)] = ((left+shift).timestamp(),(right+shift).timestamp())
-    counts = defaultdict(lambda:defaultdict(int))
-    reference_totals = defaultdict(lambda:defaultdict(int))
-    reference_hours = defaultdict(lambda:defaultdict(int))
-    reference_dates = set(days)
-    scope = set(get(db,"scope_threads") or p["roots"])
-    for row in db.execute("SELECT thread,stamp,model,input,cached,output FROM responses WHERE stamp>=? AND stamp<?",
-                          (min(v[0] for v in spans.values()),now.timestamp())):
-        if row["thread"] not in scope:
-            continue
-        values = (1,row["input"]-row["cached"],row["cached"],row["output"])
-        stamp = datetime.fromtimestamp(row["stamp"],zone)
-        if stamp.date() in reference_dates:
-            for metric,value in zip(METRICS,values):
-                key = row["model"]+":"+metric
-                reference_totals[stamp.date()][key] += value
-                reference_hours[(stamp.date(),stamp.hour)][key] += value
-        for key,(left,right) in spans.items():
-            if left <= row["stamp"] < right:
-                for metric,value in zip(METRICS,values):
-                    counts[key][row["model"]+":"+metric] += value
+    counts, reference_totals, reference_hours, totals = comparison_counts(db, p, now, spans, days)
+    result["measured_totals"] = {window: dict(totals[(day, window)]) for window in windows}
+    result["reference_window_totals"] = {window: [dict(totals[(d, window)]) for d in days] for window in windows}
+    result["unassessed_comparisons"] = []
     exceeded = defaultdict(dict)
     for window in windows:
         actual = counts[(day,window)]
         metrics = set(actual).union(*(counts[(d,window)] for d in days), *reference_totals.values())
-        for metric in sorted(metrics):
-            samples = [counts[(d,window)].get(metric,0) for d in days]
+        for key in sorted(metrics):
+            context, metric = key
+            samples = [counts[(d,window)].get(key,0) for d in days]
             clock_samples = samples
             basis = "same_clock"
             if len(samples)>=2 and any(v<=0 for v in samples):
@@ -469,19 +550,24 @@ def compare_change(db, p, now, normal_peers):
                 # Its known activity at other hours is a conservative bound;
                 # a new model/category with no positive history stays unknown.
                 if window=="day":
-                    samples = [reference_totals[d].get(metric,0) for d in days]
+                    samples = [reference_totals[d].get(key,0) for d in days]
                     basis = "observed_full_day_envelope"
                 else:
                     # Cross-midnight same-clock windows may lie in the
                     # fingerprinted leading period. Never discard that higher
                     # known observation when using the whole-day peak.
-                    samples = [max(clock, max(reference_hours[(d,h)].get(metric,0) for h in range(24)))
+                    samples = [max(clock, max(reference_hours[(d,h)].get(key,0) for h in range(24)))
                                for d,clock in zip(days,clock_samples)]
                     basis = "observed_hourly_peak_envelope"
-            if len(samples)<2 or max(samples)<=0:
-                if actual.get(metric,0):result["unassessed"].append(window+":"+metric)
+            if context == "UNVERIFIED_NATIVE_CONTEXT" or len(samples)<2 or max(samples)<=0:
+                if actual.get(key,0):
+                    result["unassessed"].append(window+":"+metric)
+                    result["unassessed_comparisons"].append({"window":window, "metric":metric,
+                        "context":context, "actual":actual[key], "same_clock_samples":clock_samples,
+                        "reason":"Native context unavailable" if context == "UNVERIFIED_NATIVE_CONTEXT"
+                                 else "No applicable frozen reference for this execution context and metric"})
                 continue
-            item = {"window":window, "metric":metric, "actual":actual.get(metric,0),
+            item = {"window":window, "metric":metric, "context":context, "actual":actual.get(key,0),
                     "samples":samples, "threshold":2*max(samples), "reference_quality":"OBSERVED_NOT_NORMAL",
                     "comparison_basis":basis, "same_clock_samples":clock_samples,
                     "positive_reference_days":sum(v>0 for v in samples),
@@ -489,17 +575,18 @@ def compare_change(db, p, now, normal_peers):
             result["comparisons"].append(item)
             if item["actual"]>item["threshold"]:
                 result["warnings"].append(item)
-                exceeded[metric][window] = item
-    for metric,signals in exceeded.items():
+                exceeded[key][window] = item
+    for (context,metric),signals in exceeded.items():
         if {"hour_previous","hour_latest"} <= signals.keys():
-            result["anomalies"].append({"rule":"SUSTAINED_OBSERVED_GROWTH", "metric":metric,
+            result["anomalies"].append({"rule":"SUSTAINED_OBSERVED_GROWTH", "metric":metric, "context":context,
                 "evidence":[signals["hour_previous"],signals["hour_latest"]],
                 "meaning":"Two successive complete hours exceed twice their applicable frozen observed bounds; sparse profiles use hourly peaks. Cause and billing impact unknown."})
         response_metric = metric.rsplit(":",1)[0]+":responses"
-        if metric!=response_metric and "day" in signals and "day" in exceeded.get(response_metric,{}):
-            for key in (response_metric,metric):
-                result["anomalies"].append({"rule":"DAILY_RESPONSE_AND_TOKEN_GROWTH", "metric":key,
-                    "evidence":[exceeded[response_metric]["day"],signals["day"]],
+        response_key = (context,response_metric)
+        if metric!=response_metric and "day" in signals and "day" in exceeded.get(response_key,{}):
+            for name in (response_metric,metric):
+                result["anomalies"].append({"rule":"DAILY_RESPONSE_AND_TOKEN_GROWTH", "metric":name, "context":context,
+                    "evidence":[exceeded[response_key]["day"],signals["day"]],
                     "meaning":"Daily response count and a token category both exceed twice their observed bounds; sparse profiles use complete reference-day totals. Not a fixed daily cap."})
     if result["anomalies"]:
         result["status"] = "ANOMALOUS"
@@ -520,9 +607,8 @@ def compare(db, p, now):
     # A repeated/skipped local hour is not a comparable same-clock window.
     if any(datetime.combine(d, datetime.min.time(), zone).utcoffset() !=
            datetime.combine(d + timedelta(days=1), datetime.min.time(), zone).utcoffset() for d in peers + [day]):
-        return {"status": "INCOMPARABLE_LOCAL_DAY", "reason": "timezone offset changes within a selected day"}
+        return {**change, "status": "INCOMPARABLE_LOCAL_DAY", "reason": "timezone offset changes within a selected day"}
     selected = set(peers + [day])
-    counts = defaultdict(lambda: defaultdict(int))
     scope_threads = set(get(db, "scope_threads") or p["roots"])
     zone = ZoneInfo(p["timezone"])
     start = datetime.combine(min(selected), datetime.min.time(), zone).timestamp()
@@ -531,22 +617,16 @@ def compare(db, p, now):
         end = datetime.combine(d, local.time(), zone).timestamp()
         windows[(d, "day")] = (datetime.combine(d, datetime.min.time(), zone).timestamp(), end)
         windows[(d, "hour")] = (end - 3600, end)
-    for row in db.execute("SELECT thread,stamp,model,input,cached,output FROM responses WHERE stamp>=? AND stamp<=?", (start - 3600, now.timestamp())):
-        if row["thread"] not in scope_threads:
-            continue
-        values = (1, row["input"] - row["cached"], row["cached"], row["output"])
-        for key, (left, right) in windows.items():
-            if left <= row["stamp"] <= right:
-                for metric, value in zip(METRICS, values):
-                    counts[key][row["model"] + ":" + metric] += value
+    counts, reference_totals, reference_hours, totals = comparison_counts(
+        db, p, now, windows, peers, include_end=True,
+        hour_offset=timedelta(minutes=local.minute,seconds=local.second,microseconds=local.microsecond))
     # Zero activity cannot establish a measured full normal day. This also
     # catches absent/rotated history instead of silently making tiny baselines.
-    covered, known_models = set(), set()
+    covered = set()
     for row in db.execute("SELECT thread,stamp,model FROM responses WHERE stamp>=? AND stamp<?", (start, datetime.combine(day, datetime.min.time(), zone).timestamp())):
         if row["thread"] in scope_threads:
             recorded_day = datetime.fromtimestamp(row["stamp"], zone).date()
             covered.add(recorded_day)
-            if recorded_day in peers:known_models.add(row["model"])
     if not set(peers) <= covered:
         return {"status": "INCOMPLETE_BASELINE_COVERAGE", "missing_days": sorted(d.isoformat() for d in set(peers) - covered)}
     fingerprints = {r["date"]: r["usage_fingerprint"] for r in baseline_candidates(db, p, now)}
@@ -554,15 +634,26 @@ def compare(db, p, now):
                and fingerprints.get(r["date"]) != r["usage_fingerprint"]]
     if changed:
         return {"status": "BASELINE_CHANGED", "days": changed}
-    comparisons, anomalies, unassessed = [], [], []
+    comparisons, anomalies, unassessed, unassessed_comparisons = [], [], [], []
     for window in ("day", "hour"):
         current = counts[(day, window)]
-        metrics = set(current) | {model+":"+metric for model in known_models for metric in METRICS}
-        for metric in sorted(metrics):
-            actual = current.get(metric,0)
-            samples = [counts[(d, window)].get(metric, 0) for d in peers]
-            if actual and metric.rsplit(":",1)[0] not in known_models:
-                unassessed.append(window+":"+metric)
+        # Reviewed normal days can establish that a known comparable profile
+        # is idle at this clock time. An unseen execution context cannot.
+        known_profiles = (set().union(*(reference_totals[d] for d in peers)) if window == "day"
+                          else set().union(*(reference_hours[(d,h)] for d in peers for h in range(24))))
+        known_profiles.update(set().union(*(counts[(d,window)] for d in peers)))
+        metrics = set(current).union(*(counts[(d, window)] for d in peers), known_profiles)
+        for key in sorted(metrics):
+            context, metric = key
+            actual = current.get(key,0)
+            samples = [counts[(d, window)].get(key, 0) for d in peers]
+            if context == "UNVERIFIED_NATIVE_CONTEXT" or key not in known_profiles:
+                if actual:
+                    unassessed.append(window+":"+metric)
+                    unassessed_comparisons.append({"window":window, "metric":metric,
+                        "context":context, "actual":actual, "same_clock_samples":samples,
+                        "reason":"Native context unavailable" if context == "UNVERIFIED_NATIVE_CONTEXT"
+                                 else "No applicable reviewed normal reference for this execution context and metric"})
                 continue
             med = median(samples)
             mad = median(abs(v - med) for v in samples)
@@ -570,7 +661,7 @@ def compare(db, p, now):
             # Conservative robust comparison, not a fixed daily allowance or
             # a probabilistic promise with this small historical sample.
             threshold = max(p95, med + 6 * 1.4826 * mad) * 1.5
-            item = {"window": window, "metric": metric, "actual": actual, "median": med,
+            item = {"window": window, "metric": metric, "context": context, "actual": actual, "median": med,
                     "mad": mad, "p95": p95, "threshold": threshold, "samples": len(samples)}
             comparisons.append(item)
             if actual > threshold:
@@ -578,7 +669,10 @@ def compare(db, p, now):
     return {"status": "ANOMALOUS" if anomalies else MONITORED if unassessed else "NORMAL", "day": day.isoformat(),
             "timezone": p["timezone"], "day_class": day_class(day, p), "workload": p["workload"],
             "same_day_elapsed_seconds": seconds, "peer_days": [d.isoformat() for d in peers],
-            "comparisons": comparisons, "anomalies": anomalies, "unassessed":unassessed}
+            "comparisons": comparisons, "anomalies": anomalies, "unassessed":unassessed,
+            "unassessed_comparisons":unassessed_comparisons,
+            "measured_totals":{window:dict(totals[(day,window)]) for window in ("day","hour")},
+            "reference_window_totals":{window:[dict(totals[(d,window)]) for d in peers] for window in ("day","hour")}}
 
 
 def migrate_scope(db, p, lock, source, request, now):
@@ -641,6 +735,58 @@ def release_scope_verified(db, p, lock):
                 and migration.get("from_policy_sha256") == get(db, "locked_policy")
                 and migration.get("from_scope") == get(db, "locked_scope")
                 and migration.get("to_policy_sha256") == digest(p) and migration.get("to_scope") == scope)
+
+
+def anomaly_review_coverage(db, p, lock, findings, assessment, source, now):
+    """Evidence for explicit review, not an automatic unlock or new baseline.
+
+    An inapplicable historical comparison need not be perpetuated. Its metric
+    must remain fully measurable, and this route cannot remove/change the
+    reviewed policy or references to make an anomaly disappear.
+    """
+    required = {(row.get("context"), row["metric"])
+                for row in findings.get("ANOMALOUS",{}).get("detail",{}).get("anomalies",[])}
+    comparisons = {(row.get("context"),row["metric"]) for row in assessment.get("comparisons",[])}
+    migration = get(db,"scope_migration") or {}
+    same_review = (get(db,"locked_policy") == digest(p)
+                   or migration.get("lock_id") == lock["id"]
+                   and migration.get("from_policy_sha256") == get(db,"locked_policy")
+                   and migration.get("to_policy_sha256") == digest(p)
+                   and release_scope_verified(db,p,lock))
+    complete = source.get("status") != "UNAVAILABLE" and type(source.get("records")) is int
+    scope = set(get(db,"scope_threads") or [])
+    midnight = now.astimezone(ZoneInfo(p["timezone"])).replace(hour=0,minute=0,second=0,microsecond=0).timestamp()
+    coverage = []
+    for context,metric in sorted(required,key=lambda key:(key[0] or "",key[1])):
+        if ((context,metric) in comparisons or context is None and any(name==metric for _,name in comparisons)):
+            coverage.append({"metric":metric,"context":context,"covered":True,"basis":"CURRENT_APPLICABLE_COMPARISON"})
+            continue
+        model,separator,category = metric.rpartition(":")
+        item = {"metric":metric,"context":context,"covered":False,
+                "basis":"RETAINED_MEASUREMENT_WITH_INAPPLICABLE_COMPARISON",
+                "reviewed_policy_and_references_preserved":same_review,
+                "source_records":source.get("records"),"measurement_scope":"complete protected scope; historical context attribution is not inferred"}
+        if not complete or not same_review or not separator or category not in METRICS:
+            item["reason"] = "Current complete measurement and unchanged reviewed comparison policy are required"
+        else:
+            historical, today, value = 0, 0, 0
+            for row in db.execute("SELECT thread,stamp,input,cached,output FROM responses WHERE model=? AND stamp<=?", (model,now.timestamp())):
+                if row["thread"] not in scope:
+                    continue
+                historical += 1
+                if row["stamp"] >= midnight:
+                    today += 1
+                    value += {"responses":1,"uncached_input":row["input"]-row["cached"],
+                              "cached_input":row["cached"],"output":row["output"]}[category]
+            item.update({"covered":historical>0,"retained_response_records":historical,
+                         "current_day_response_records":today,"current_day_value":value,
+                         "current_day_start":datetime.fromtimestamp(midnight,ZoneInfo(p["timezone"])).isoformat(),
+                         "observed_through":now.isoformat(),
+                         "current_comparison_limitations":[row for row in assessment.get("unassessed_comparisons",[]) if row["metric"] == metric],
+                         "reference_window_limitations":assessment.get("unassessed",[]),
+                         "reason":"Original metric remains measured; execution-context evidence or applicable reference window is unavailable. Explicit anomaly review remains required."})
+        coverage.append(item)
+    return coverage
 
 
 def evaluate(policy_path, *, now=None, release=None, migration=None, history=False):
@@ -710,12 +856,13 @@ def evaluate(policy_path, *, now=None, release=None, migration=None, history=Fal
                                (now.isoformat(),"LOCK_FINDING",encoded({"reason":reason,"detail":detail})))
                 elif reason=="ANOMALOUS" and assessment["status"]=="ANOMALOUS":
                     saved = findings[reason]["detail"]
-                    metrics = {r["metric"]:r for r in saved.get("anomalies",[])}
-                    added = {r["metric"]:r for r in assessment.get("anomalies",[]) if r["metric"] not in metrics}
+                    metrics = {(r.get("context"),r["metric"]):r for r in saved.get("anomalies",[])}
+                    added = {(r.get("context"),r["metric"]):r for r in assessment.get("anomalies",[])
+                             if (r.get("context"),r["metric"]) not in metrics}
                     if added:
                         metrics.update(added);saved["anomalies"] = list(metrics.values())
                         db.execute("INSERT INTO history(at,action,detail) VALUES (?,?,?)",
-                                   (now.isoformat(),"LOCK_FINDING",encoded({"reason":reason,"additional_metrics":added})))
+                                   (now.isoformat(),"LOCK_FINDING",encoded({"reason":reason,"additional_metrics":list(added.values())})))
             put(db,"lock_findings",findings)
         put(db,"policy",digest(p))
         put(db,"last_checked",max(previous_time or 0,now.timestamp()))
@@ -730,13 +877,11 @@ def evaluate(policy_path, *, now=None, release=None, migration=None, history=Fal
             valid = bool(lock and release.get("lock_id")==lock["id"] and release.get("evidence")
                          and assessment["status"] in ADMISSIBLE and release_scope_verified(db, p, lock)
                          and release.get("policy_sha256")==digest(p) and set(release.get("reviewed_reasons",[]))==set(findings))
-            # An anomaly cannot vanish merely by removing its comparison,
-            # including when unrelated remaining normal references look valid.
-            metrics = {r["metric"] for r in findings.get("ANOMALOUS",{}).get("detail",{}).get("anomalies",[])}
-            compared = {r["metric"] for r in assessment.get("comparisons",[])}
-            valid = valid and metrics <= compared
+            anomaly_coverage = anomaly_review_coverage(db,p,lock,findings,assessment,source,now) if lock else []
+            valid = valid and all(row["covered"] for row in anomaly_coverage)
             if not valid:
-                put(db,"latest",{"allowed":False,"lock":lock,"assessment":assessment,"release_rejected":True})
+                put(db,"latest",{"allowed":False,"lock":lock,"assessment":assessment,
+                                 "anomaly_review_coverage":anomaly_coverage,"release_rejected":True})
                 db.commit()  # A rejected release must not erase a newly observed fault.
                 raise ValueError("release requires exact lock, verified original scope, review evidence, no current fault, current policy fingerprint and all recorded reasons")
             migration_receipt = get(db, "scope_migration")
@@ -747,7 +892,8 @@ def evaluate(policy_path, *, now=None, release=None, migration=None, history=Fal
             db.execute("INSERT INTO history(at,action,detail) VALUES (?,?,?)", (now.isoformat(), "MANUAL_RELEASE",
                        encoded({"lock":lock,"findings":findings,"evidence":release["evidence"],
                                 "old_policy":get(db,"locked_policy"),"new_policy":digest(p),"assessment_status":assessment["status"],
-                                "scope_migration":migration_receipt})))
+                                "scope_migration":migration_receipt,"assessment":assessment,
+                                "anomaly_review_coverage":anomaly_coverage})))
             lock, findings = None, {}
             put(db,"lock",None);put(db,"lock_findings",{});put(db,"locked_scope",None);put(db,"locked_policy",None)
             put(db,"scope_migration",None)
