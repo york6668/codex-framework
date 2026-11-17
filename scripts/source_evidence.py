@@ -251,7 +251,10 @@ def verify(context, project, record):
     still interprets goals, diagnoses causes and observes downstream effects.
     """
     source = record.get("source")
-    if record.get("kind") == "goal" and source != "codex":
+    # Saved bytes can substantiate an observation, not the identity of the
+    # user who gave a goal, authorization or confirmation. Check that source
+    # boundary before a node file's matching digest can accept its wrapper.
+    if record.get("kind") in ("goal", "authorization", "confirmation") and source != "codex":
         return False
     if source == "codex":
         item = _native_item(context, record)
